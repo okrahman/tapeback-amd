@@ -7,7 +7,7 @@ on:
 
 jobs:
   publish:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     environment: pypi
     permissions:
       id-token: write   # trusted publishing (PyPI)
@@ -61,6 +61,16 @@ jobs:
 
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e  # v1.13.0
+
+      - name: Install nfpm
+        run: |
+          NFPM_VERSION=2.39.0
+          curl -sSL -o /tmp/nfpm.deb \
+            "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/nfpm_${NFPM_VERSION}_amd64.deb"
+          sudo dpkg -i /tmp/nfpm.deb
+
+      - name: Build .deb packages
+        run: ./scripts/build-deb.sh dist/tapeback-*.whl
 
       - name: Extract changelog for this version
         id: changelog

@@ -1,6 +1,7 @@
 """System tray icon for tapeback — start/stop recording without a terminal."""
 
 import logging
+import sys
 import threading
 from enum import Enum, auto
 
@@ -8,6 +9,7 @@ import pystray
 from PIL import Image, ImageDraw
 
 from tapeback import const
+from tapeback._tray_env import detect_tray_env
 from tapeback.pipeline import stop_and_process
 from tapeback.recorder import Recorder, detect_devices
 from tapeback.settings import Settings, get_settings
@@ -196,5 +198,9 @@ def run_tray() -> None:
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
     settings = get_settings()
+    env = detect_tray_env()
+    if env.needs_appindicator_hint:
+        logger.warning("%s", env.hint_message)
+        print(env.hint_message, file=sys.stderr)
     app = TrayApp(settings)
     app.run()
