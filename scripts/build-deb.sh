@@ -2,8 +2,8 @@
 # Build Debian/Ubuntu .deb packages for tapeback via nfpm.
 #
 # The .deb bundles a standalone Python interpreter (from astral-sh's
-# python-build-standalone, downloaded via `uv python install`) so the package
-# does NOT depend on the target system having any specific Python version.
+# python-build-standalone, downloaded directly by tag) so the package does
+# NOT depend on the target system having any specific Python version.
 # This avoids the python3.13 / python3.14 minor-version coupling that bites us
 # because faster-whisper / ctranslate2 / pyav wheels include compiled .so files
 # tagged for a specific cpython minor.
@@ -32,16 +32,19 @@ if [ -z "$VERSION" ]; then
 fi
 export VERSION
 
-PY_MINOR="3.13"
+# Pinned python-build-standalone release. Bump deliberately when a new release
+# brings security fixes or a desired patch level. Lives outside any external
+# resolver so the build is byte-deterministic.
+# Browse: https://github.com/astral-sh/python-build-standalone/releases
+PYBS_DATE="${PYBS_DATE:-20260510}"
+PYBS_VERSION="${PYBS_VERSION:-3.13.13}"
+PYBS_TARBALL="cpython-${PYBS_VERSION}+${PYBS_DATE}-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz"
+PYBS_URL="https://github.com/astral-sh/python-build-standalone/releases/download/${PYBS_DATE}/${PYBS_TARBALL}"
+
 BUILD_ROOT="$REPO_ROOT/build/opt/tapeback"
 PY_DEST="$BUILD_ROOT/python"
 VENV_DEST="$BUILD_ROOT/venv"
 DIST_DIR="$REPO_ROOT/dist"
-
-if ! command -v uv >/dev/null 2>&1; then
-    echo "Error: uv is not installed. https://docs.astral.sh/uv/getting-started/installation/" >&2
-    exit 1
-fi
 
 if ! command -v nfpm >/dev/null 2>&1; then
     echo "Error: nfpm is not installed. See https://nfpm.goreleaser.com/install/" >&2
@@ -51,23 +54,26 @@ fi
 WHEEL_SPEC="${1:-tapeback==$VERSION}"
 
 echo "==> Building tapeback $VERSION .deb packages"
+echo "    Python:     cpython-${PYBS_VERSION}+${PYBS_DATE} (python-build-standalone)"
 echo "    Wheel/spec: $WHEEL_SPEC"
-
-# Resolve uv-managed standalone Python (downloads on first run).
-uv python install "$PY_MINOR" >/dev/null
-SYSTEM_PY="$(uv python find "$PY_MINOR")"
-SYSTEM_PY_ROOT="$(dirname "$(dirname "$SYSTEM_PY")")"
-echo "    Python:     $("$SYSTEM_PY" --version) (from $SYSTEM_PY_ROOT)"
 
 # Clean previous venv build but keep dist/ (wheel artifact may live there)
 rm -rf "$REPO_ROOT/build"
 mkdir -p "$BUILD_ROOT" "$DIST_DIR"
 
-echo "==> Bundling standalone Python into $PY_DEST"
-cp -a "$SYSTEM_PY_ROOT" "$PY_DEST"
+echo "==> Downloading and extracting standalone Python"
+# Tarball extracts to ./python/{bin,lib,include,share} — directly into BUILD_ROOT.
+curl -fsSL "$PYBS_URL" | tar -xz -C "$BUILD_ROOT"
+if [ ! -x "$PY_DEST/bin/python3.13" ]; then
+    echo "Error: $PY_DEST/bin/python3.13 missing after extract." >&2
+    echo "       Tarball $PYBS_TARBALL may have unexpected layout." >&2
+    ls -la "$BUILD_ROOT" || true
+    exit 1
+fi
+echo "    Extracted: $("$PY_DEST/bin/python3.13" --version) at $PY_DEST"
 
-# Trim build artifacts we don't need at runtime (headers + a few caches).
-# Stdlib + libpython stay — they're what makes this self-contained.
+# Trim headers — not needed at runtime, ~5 MB. Stdlib + libpython stay
+# (they're what makes this self-contained).
 rm -rf "$PY_DEST/include"
 find "$PY_DEST" -type d -name __pycache__ -prune -exec rm -rf {} +
 
