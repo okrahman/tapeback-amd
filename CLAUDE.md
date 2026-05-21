@@ -113,3 +113,4 @@ Before completing any change, verify:
 ## Gotchas
 
 - Comments and logs in English
+- В конце каждой нетривиальной сессии предложи 1–3 пункта в .claude/insights-inbox.md

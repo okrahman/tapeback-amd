@@ -58,7 +58,9 @@ class StatusNotifierItem(ServiceInterface):
         return self._status
 
     @dbus_property(access=PropertyAccess.READ)
-    def WindowId(self) -> "u":  # type: ignore[name-defined]  # ty:ignore[unresolved-reference]
+    def WindowId(self) -> "i":  # type: ignore[name-defined]  # ty:ignore[unresolved-reference]
+        # SNI spec says signed int. GNOME Shell rejects `u` with
+        # "type u does not match expected type i" and silently hides the icon.
         return 0
 
     @dbus_property(access=PropertyAccess.READ)
@@ -87,6 +89,21 @@ class StatusNotifierItem(ServiceInterface):
 
     @dbus_property(access=PropertyAccess.READ)
     def AttentionMovieName(self) -> "s":  # type: ignore[name-defined]  # ty:ignore[unresolved-reference]
+        return ""
+
+    # AppIndicator accessibility-description extensions to SNI. Newer GNOME
+    # hosts query these and raise DBusError(UNKNOWN_PROPERTY) if missing.
+
+    @dbus_property(access=PropertyAccess.READ)
+    def IconAccessibleDesc(self) -> "s":  # type: ignore[name-defined]  # ty:ignore[unresolved-reference]
+        return ""
+
+    @dbus_property(access=PropertyAccess.READ)
+    def AttentionAccessibleDesc(self) -> "s":  # type: ignore[name-defined]  # ty:ignore[unresolved-reference]
+        return ""
+
+    @dbus_property(access=PropertyAccess.READ)
+    def OverlayIconAccessibleDesc(self) -> "s":  # type: ignore[name-defined]  # ty:ignore[unresolved-reference]
         return ""
 
     @dbus_property(access=PropertyAccess.READ)
