@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.4] — 2026-05-21
+
+### Fixed
+- `tapeback tray` on modern desktops (GNOME, KDE Plasma): rewrote the tray icon on top of [dbus-next](https://github.com/altdesktop/python-dbus-next) and a custom StatusNotifierItem / DBusMenu implementation. The previous pystray-based path defaulted to the legacy XEmbed protocol, which GNOME/KDE no longer provide on Wayland — the icon either failed to dock at all (`AssertionError: _systray_manager is None`) or appeared as a dead grey circle whose menu didn't open. pystray's AppIndicator backend needs system PyGObject (`gi`), which the bundled `.deb` Python can't access. The new SNI-direct implementation works in the bundled venv with no system C extensions. KDE Plasma works out of the box; GNOME still needs the AppIndicator Support extension installed (one-time, GNOME-side limitation, not ours).
+- `.deb` build: switched from `uv python install` + `cp -a` to direct download of [python-build-standalone](https://github.com/astral-sh/python-build-standalone) by pinned date/version. The previous approach depended on `uv python find`'s layout, which differed between local and CI environments — the CI-built `.deb` had a broken bundled Python tree and `tapeback --version` failed with `exec: not found`. Direct download is byte-deterministic and fails fast if the tarball layout changes.
+
+### Changed
+- `tapeback-tray` optional-dependency now pulls in `dbus-next` instead of `pystray` + `Pillow`. The tray .deb's postinstall hook reflects the same.
+- README install snippet for `.deb`: replaced the dynamic-version `curl | grep` snippet with a plain `VERSION=X.Y.Z` + `wget` + `apt install` form. Simpler to read, simpler to copy-paste.
+
+### Added
+- `.github/workflows/deb-e2e.yml` — PR-time end-to-end .deb smoke on a 5-image matrix (Ubuntu 22.04 / 24.04 / 26.04, Debian 12 / 13). Catches packaging regressions before they reach a release tag.
+- `scripts/check-workflow-pins.py` + new CI step — validates every SHA-pinned GitHub Action against the GitHub API. Prevents a hallucinated 40-char hex from quietly slipping through to a release runner.
+- `docs/release-testing.md` — layered checklist (local docker smoke → CI PR gate → optional `v0.9.X-rcN` tag → manual acceptance) so the .deb path is gated before every release.
+
 ## [0.9.3] — 2026-05-20
 
 ### Fixed

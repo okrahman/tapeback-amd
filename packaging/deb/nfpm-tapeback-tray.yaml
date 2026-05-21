@@ -7,10 +7,11 @@ priority: optional
 maintainer: "Yast <yastcher@gmail.com>"
 description: |
   System tray icon for tapeback — start/stop recording from the tray.
-  Meta-package: pystray + Pillow are installed into /opt/tapeback/'s
-  virtualenv by the post-install hook.
-  On GNOME Wayland, also install gnome-shell-extension-appindicator
-  (recommended below) — without it the tray menu will not respond.
+  Meta-package: dbus-next is installed into /opt/tapeback/'s virtualenv
+  by the post-install hook. The tray uses StatusNotifierItem directly
+  over D-Bus (no PyGObject / pystray needed). On GNOME, also install
+  gnome-shell-extension-appindicator (recommended below) — GNOME Shell
+  does not display SNI items without it.
 homepage: https://github.com/yastcher/tapeback
 license: Apache-2.0
 

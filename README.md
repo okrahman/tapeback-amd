@@ -41,27 +41,18 @@ All system dependencies (ffmpeg, PipeWire) are installed automatically.
 ### Ubuntu / Debian (.deb)
 
 Pre-built `.deb` packages are attached to every
-[GitHub Release](https://github.com/yastcher/tapeback/releases/latest).
-Resolve the latest version, then download and install:
+[GitHub Release](https://github.com/yastcher/tapeback/releases). Pick a version
+(see the releases page for the current one), download, install:
 
 ```bash
-VERSION=$(curl -fsSL https://api.github.com/repos/yastcher/tapeback/releases/latest \
-    | grep -Po '"tag_name": "v\K[^"]+')
-BASE=https://github.com/yastcher/tapeback/releases/download/v${VERSION}
+wget https://github.com/yastcher/tapeback/releases/download/v0.9.4/tapeback_0.9.4_amd64.deb
+sudo apt install ./tapeback_0.9.4_amd64.deb
 
-# Base package (recording + transcription)
-wget "${BASE}/tapeback_${VERSION}_amd64.deb"
-sudo apt install "./tapeback_${VERSION}_amd64.deb"
-
-# Optional extras (install base first)
-wget "${BASE}/tapeback-tray_${VERSION}_all.deb"     && sudo apt install "./tapeback-tray_${VERSION}_all.deb"
-wget "${BASE}/tapeback-llm_${VERSION}_all.deb"      && sudo apt install "./tapeback-llm_${VERSION}_all.deb"
-wget "${BASE}/tapeback-diarize_${VERSION}_all.deb"  && sudo apt install "./tapeback-diarize_${VERSION}_all.deb"
+# Optional extras:
+sudo apt install ./tapeback-tray_0.9.4_all.deb       # tray icon
+sudo apt install ./tapeback-llm_0.9.4_all.deb        # LLM summaries
+sudo apt install ./tapeback-diarize_0.9.4_all.deb    # speaker diarization
 ```
-
-Or just download the `.deb` files manually from the
-[latest release page](https://github.com/yastcher/tapeback/releases/latest)
-and run `sudo apt install ./tapeback_*.deb`.
 
 The base package bundles its own Python interpreter (from
 [python-build-standalone](https://github.com/astral-sh/python-build-standalone))
@@ -145,25 +136,28 @@ Type=Application
 X-GNOME-Autostart-enabled=true
 ```
 
-Works on any XDG-compatible desktop (KDE, GNOME, Hyprland, Sway, etc.).
+tapeback's tray speaks the StatusNotifierItem D-Bus protocol directly — no
+pystray, no GTK, no XEmbed. KDE Plasma, Hyprland (with waybar), and Sway
+(with waybar/eww) display it out of the box on both X11 and Wayland.
 
-### GNOME on Wayland
+### GNOME
 
-GNOME 45+ on Wayland removed the legacy tray protocol — the icon will appear
-but right-click does nothing until you install the AppIndicator extension:
+GNOME Shell does not display SNI items natively. Install the
+**AppIndicator Support** extension (one-time setup, also needed by Slack,
+Dropbox, etc.):
 
 ```bash
-# Ubuntu / Debian:
+# Ubuntu / Debian
 sudo apt install gnome-shell-extension-appindicator
-# Fedora:
+# Fedora
 sudo dnf install gnome-shell-extension-appindicator
 ```
 
-Then open the **Extensions** app, enable **Ubuntu AppIndicators** (or
-**AppIndicator and KStatusNotifierItem Support**), and log out + back in.
+Open the **Extensions** app, enable **Ubuntu AppIndicators** (or
+**AppIndicator and KStatusNotifierItem Support**), log out + back in.
 `tapeback tray` prints this hint to stderr on startup if it detects an
 affected session. See [issue #3](https://github.com/yastcher/tapeback/issues/3)
-for background. KDE Plasma Wayland works out of the box.
+for background.
 
 ## Speaker diarization
 

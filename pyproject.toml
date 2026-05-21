@@ -1,6 +1,6 @@
 [project]
 name = "tapeback"
-version = "0.9.3"
+version = "0.9.4"
 description = "Local meeting recorder with transcription and speaker diarization for Obsidian"
 readme = "README.md"
 authors = [{ name = "Yast", email = "yastcher@gmail.com" }]
@@ -34,8 +34,7 @@ llm = [
     "openai>=1.50.0,<3",
 ]
 tray = [
-    "pystray>=0.19.0,<1",
-    "Pillow>=10.0.0,<13",
+    "dbus-next>=0.2.3,<1",
 ]
 
 [project.scripts]
@@ -65,8 +64,7 @@ dev = [
     "torchaudio>=2.0.0",
     "anthropic>=0.40.0",
     "openai>=1.50.0",
-    "pystray>=0.19.0",
-    "Pillow>=10.0.0",
+    "dbus-next>=0.2.3",
 ]
 
 [tool.ruff]
@@ -99,6 +97,11 @@ max-args = 6  # Settings + 5 domain args is a common shape in this codebase
 "src/tapeback/diarizer.py" = ["PLC0415"]
 # anthropic/openai are `[llm]` extras — same lazy-import rationale as diarizer.
 "src/tapeback/summarizer.py" = ["PLC0415"]
+# D-Bus method/signal signatures live in string annotations (e.g. `-> "u(ia{sv}av)"`)
+# that dbus-next reads at runtime. ruff F821/F722 cannot tell these strings apart
+# from broken forward refs, so we silence them in the SNI/DBusMenu modules.
+"src/tapeback/_sni.py" = ["F821", "F722"]
+"src/tapeback/_dbusmenu.py" = ["F821", "F722"]
 
 [tool.ruff.lint.isort]
 known-local-folder = ["tapeback", "tests"]

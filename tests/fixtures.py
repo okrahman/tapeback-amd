@@ -28,19 +28,18 @@ requires_pyannote = pytest.mark.skipif(
 )
 
 
-def _pystray_available() -> bool:
+def _dbus_next_available() -> bool:
     try:
-        import pystray  # noqa: F401, PLC0415
+        import dbus_next  # noqa: F401, PLC0415
 
         return True
-    except Exception:
-        # ImportError when not installed; Xlib.error.DisplayNameError on headless CI
+    except ImportError:
         return False
 
 
-requires_pystray = pytest.mark.skipif(
-    not _pystray_available(),
-    reason="pystray not installed (install tapeback[tray])",
+requires_dbus_next = pytest.mark.skipif(
+    not _dbus_next_available(),
+    reason="dbus-next not installed (install tapeback[tray])",
 )
 
 # --- pytest fixtures ---
@@ -141,11 +140,13 @@ def summarize_settings(tmp_vault):
 
 @pytest.fixture
 def tray_app(settings):
-    """TrayApp with mocked pystray icon and recorder for testing state transitions."""
+    """TrayApp with mocked SNI / DBusMenu / recorder — exercises state machine
+    without ever touching the session bus."""
     from tapeback.tray import TrayApp  # noqa: PLC0415 — optional dep
 
     app = TrayApp(settings)
-    app._icon = MagicMock()
+    app._sni = MagicMock()
+    app._menu = MagicMock()
     app._recorder = MagicMock()
     app._recorder.is_recording.return_value = False
     app._recorder.get_session_info.return_value = None
