@@ -110,7 +110,10 @@ def test_on_start_ignored_when_processing(tray_app):
 def test_do_start_success(tray_app):
     tray_app._state = TrayState.RECORDING
     tray_app._recorder.start.return_value = "2026-05-21_10-00-00"
-    tray_app._do_start()
+    # detect_devices probes pactl on the host; mock it so the test is hermetic
+    # (CI runners and minimal containers don't ship pulseaudio-utils).
+    with patch("tapeback.tray.detect_devices"):
+        tray_app._do_start()
     tray_app._recorder.start.assert_called_once_with(tray_app._settings)
     assert tray_app._state == TrayState.RECORDING
 
@@ -120,7 +123,8 @@ def test_do_start_failure_resets_to_idle_via_threadsafe(tray_app):
     tray_app._state = TrayState.RECORDING
     tray_app._loop = MagicMock()  # pretend an asyncio loop is running
     tray_app._recorder.start.side_effect = RuntimeError("parecord not found")
-    tray_app._do_start()
+    with patch("tapeback.tray.detect_devices"):
+        tray_app._do_start()
     tray_app._loop.call_soon_threadsafe.assert_called_once()
     args = tray_app._loop.call_soon_threadsafe.call_args.args
     assert args[1] == TrayState.IDLE
