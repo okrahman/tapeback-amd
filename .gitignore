@@ -22,6 +22,7 @@ cover/
 .agents
 *.session
 .claude/tasks
+# .claude/plans/archive
 .claude/settings.local.json
 data
 mongo_data

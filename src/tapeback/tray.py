@@ -2,7 +2,6 @@
 
 import asyncio
 import logging
-import sys
 import threading
 from collections.abc import Callable
 from enum import Enum, auto
@@ -13,7 +12,7 @@ from dbus_next.aio import MessageBus
 from tapeback import const
 from tapeback._dbusmenu import MENU_OBJECT_PATH, DBusMenu, MenuItem
 from tapeback._sni import SNI_OBJECT_PATH, StatusNotifierItem, register_with_watcher
-from tapeback._tray_env import detect_tray_env
+from tapeback._tray_env import TrayEnv, detect_tray_env
 from tapeback.pipeline import stop_and_process
 from tapeback.recorder import Recorder, detect_devices
 from tapeback.settings import Settings, get_settings
@@ -242,6 +241,16 @@ class TrayApp:
             self._loop.call_soon_threadsafe(self._stopped.set)
 
 
+def _warn_if_tray_host_missing(env: TrayEnv) -> None:
+    """Emit the AppIndicator hint exactly once via the logger.
+
+    Extracted so that v0.9.5 doesn't double-print like v0.9.4 did (both
+    `print(...)` and `logger.warning(...)` ended up in user logs).
+    """
+    if env.needs_appindicator_hint:
+        logger.warning("%s", env.hint_message)
+
+
 def run_tray() -> None:
     """Entry point for the `tapeback tray` command."""
     logging.basicConfig(
@@ -249,8 +258,5 @@ def run_tray() -> None:
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
     settings = get_settings()
-    env = detect_tray_env()
-    if env.needs_appindicator_hint:
-        logger.warning("%s", env.hint_message)
-        print(env.hint_message, file=sys.stderr)
+    _warn_if_tray_host_missing(detect_tray_env())
     TrayApp(settings).run()

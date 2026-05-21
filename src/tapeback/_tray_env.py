@@ -15,11 +15,13 @@ from dataclasses import dataclass
 _GNOME_LIKE_DESKTOPS = frozenset({"gnome", "gnome-classic", "unity", "pantheon", "ubuntu"})
 
 _APPINDICATOR_HINT = (
-    "Tray on GNOME Wayland requires the AppIndicator Support extension.\n"
-    "Install:  sudo apt install gnome-shell-extension-appindicator\n"
-    'Then open the "Extensions" app, enable "Ubuntu AppIndicators" (or\n'
-    '"AppIndicator and KStatusNotifierItem Support"), and re-login.\n'
-    "Without it the tray icon will appear but the menu will not respond.\n"
+    "GNOME Shell does not display StatusNotifierItem tray icons natively —\n"
+    "install and enable the AppIndicator extension:\n"
+    "  Ubuntu/Debian: sudo apt install gnome-shell-extension-appindicator\n"
+    "  Fedora/RHEL:   sudo dnf install gnome-shell-extension-appindicator\n"
+    "  Arch:          yay -S gnome-shell-extension-appindicator\n"
+    'Then open the "Extensions" app, enable AppIndicator / '
+    "KStatusNotifierItem support, and re-login.\n"
     "Alternative: use the CLI — `tapeback start` / `tapeback stop`."
 )
 

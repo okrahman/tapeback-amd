@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.5] — 2026-05-21
+
+### Fixed
+- Tray icon now actually appears on GNOME Wayland (with the AppIndicator extension installed).
+v0.9.4 registered with the watcher but the icon stayed invisible because our `WindowId` property was exposed as `u` (unsigned int) — the SNI spec mandates `i` (signed int), and GNOME Shell silently rejects mismatched signatures (`type u does not match expected type i`).
+Fixed to `i`; regression test locks the signature so it can't regress.
+- Added the AppIndicator accessibility-description SNI extensions (`IconAccessibleDesc`, `AttentionAccessibleDesc`, `OverlayIconAccessibleDesc`). Newer hosts query these and dbus-next raised `DBusError(UNKNOWN_PROPERTY)` when we didn't implement them; the error is gone now.
+- `tapeback tray` no longer prints the AppIndicator hint twice. v0.9.4 both logged the message and printed it to stderr; the duplicate is removed (only the logger.warning remains).
+
+### Changed
+- AppIndicator hint message is now distro-neutral: lists install commands for Ubuntu/Debian (`apt`), Fedora/RHEL (`dnf`), and Arch (`yay`) instead of only Ubuntu.
+
 ## [0.9.4] — 2026-05-21
 
 ### Fixed
