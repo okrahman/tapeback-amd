@@ -41,18 +41,27 @@ All system dependencies (ffmpeg, PipeWire) are installed automatically.
 ### Ubuntu / Debian (.deb)
 
 Pre-built `.deb` packages are attached to every
-[GitHub Release](https://github.com/yastcher/tapeback/releases/latest):
+[GitHub Release](https://github.com/yastcher/tapeback/releases/latest).
+Resolve the latest version, then download and install:
 
 ```bash
-# Replace X.Y.Z with the latest version
-wget https://github.com/yastcher/tapeback/releases/latest/download/tapeback_X.Y.Z_amd64.deb
-sudo apt install ./tapeback_*.deb
+VERSION=$(curl -fsSL https://api.github.com/repos/yastcher/tapeback/releases/latest \
+    | grep -Po '"tag_name": "v\K[^"]+')
+BASE=https://github.com/yastcher/tapeback/releases/download/v${VERSION}
 
-# Optional extras (install the base package first):
-sudo apt install ./tapeback-tray_*.deb       # system tray icon
-sudo apt install ./tapeback-llm_*.deb        # LLM summaries
-sudo apt install ./tapeback-diarize_*.deb    # speaker diarization
+# Base package (recording + transcription)
+wget "${BASE}/tapeback_${VERSION}_amd64.deb"
+sudo apt install "./tapeback_${VERSION}_amd64.deb"
+
+# Optional extras (install base first)
+wget "${BASE}/tapeback-tray_${VERSION}_all.deb"     && sudo apt install "./tapeback-tray_${VERSION}_all.deb"
+wget "${BASE}/tapeback-llm_${VERSION}_all.deb"      && sudo apt install "./tapeback-llm_${VERSION}_all.deb"
+wget "${BASE}/tapeback-diarize_${VERSION}_all.deb"  && sudo apt install "./tapeback-diarize_${VERSION}_all.deb"
 ```
+
+Or just download the `.deb` files manually from the
+[latest release page](https://github.com/yastcher/tapeback/releases/latest)
+and run `sudo apt install ./tapeback_*.deb`.
 
 The base package bundles its own Python interpreter (from
 [python-build-standalone](https://github.com/astral-sh/python-build-standalone))
