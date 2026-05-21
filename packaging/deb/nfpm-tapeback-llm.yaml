@@ -1,0 +1,20 @@
+name: tapeback-llm
+arch: all
+platform: linux
+version: ${VERSION}
+section: sound
+priority: optional
+maintainer: "Yast <yastcher@gmail.com>"
+description: |
+  LLM summarization support for tapeback (Anthropic, OpenAI, Gemini).
+  Meta-package: pip dependencies are installed into /opt/tapeback/'s
+  virtualenv by the post-install hook.
+homepage: https://github.com/yastcher/tapeback
+license: Apache-2.0
+
+depends:
+  - tapeback (= ${VERSION})
+
+scripts:
+  postinstall: ./packaging/deb/postinst/tapeback-llm.sh
+  preremove: ./packaging/deb/prerm/tapeback-llm.sh

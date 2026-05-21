@@ -1,0 +1,20 @@
+name: tapeback-diarize
+arch: all
+platform: linux
+version: ${VERSION}
+section: sound
+priority: optional
+maintainer: "Yast <yastcher@gmail.com>"
+description: |
+  Speaker diarization support for tapeback (pyannote-audio + PyTorch).
+  Meta-package: PyTorch wheels are ~2 GB and pulled in by the post-install
+  hook into /opt/tapeback/'s virtualenv.
+homepage: https://github.com/yastcher/tapeback
+license: Apache-2.0
+
+depends:
+  - tapeback (= ${VERSION})
+
+scripts:
+  postinstall: ./packaging/deb/postinst/tapeback-diarize.sh
+  preremove: ./packaging/deb/prerm/tapeback-diarize.sh

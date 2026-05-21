@@ -1,6 +1,7 @@
 import shutil
 import subprocess
 import time
+from importlib.metadata import version as _pkg_version
 from pathlib import Path
 
 import click
@@ -16,6 +17,7 @@ def _echo_status(msg: str) -> None:
 
 
 @click.group()
+@click.version_option(_pkg_version("tapeback"), prog_name="tapeback")
 def cli() -> None:
     """tapeback — local meeting recorder for Obsidian.
 

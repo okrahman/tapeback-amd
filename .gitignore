@@ -32,3 +32,6 @@ __pycache__/
 packaging/src
 packaging/pkg
 packaging/tapeback-0*
+# .deb build artifacts
+/build/
+/dist/

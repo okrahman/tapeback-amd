@@ -1,0 +1,31 @@
+name: tapeback
+arch: amd64
+platform: linux
+version: ${VERSION}
+section: sound
+priority: optional
+maintainer: "Yast <yastcher@gmail.com>"
+description: |
+  Local meeting recorder with transcription and speaker diarization.
+  CLI tool for recording meeting audio (Google Meet, Zoom, Teams, Telegram)
+  on Linux via PulseAudio/PipeWire system audio capture. Transcribes locally
+  with faster-whisper and saves markdown notes to an Obsidian vault.
+homepage: https://github.com/yastcher/tapeback
+license: Apache-2.0
+
+depends:
+  - ffmpeg
+  - pulseaudio-utils
+
+recommends:
+  - nvidia-utils-560
+
+contents:
+  - src: ./build/opt/tapeback
+    dst: /opt/tapeback
+  - src: ./packaging/deb/tapeback.wrapper
+    dst: /usr/bin/tapeback
+    file_info:
+      mode: 0755
+  - src: ./LICENSE
+    dst: /usr/share/doc/tapeback/LICENSE

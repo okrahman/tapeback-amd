@@ -38,6 +38,28 @@ yay -S tapeback tapeback-tray tapeback-llm tapeback-diarize  # everything
 
 All system dependencies (ffmpeg, PipeWire) are installed automatically.
 
+### Ubuntu / Debian (.deb)
+
+Pre-built `.deb` packages are attached to every
+[GitHub Release](https://github.com/yastcher/tapeback/releases/latest):
+
+```bash
+# Replace X.Y.Z with the latest version
+wget https://github.com/yastcher/tapeback/releases/latest/download/tapeback_X.Y.Z_amd64.deb
+sudo apt install ./tapeback_*.deb
+
+# Optional extras (install the base package first):
+sudo apt install ./tapeback-tray_*.deb       # system tray icon
+sudo apt install ./tapeback-llm_*.deb        # LLM summaries
+sudo apt install ./tapeback-diarize_*.deb    # speaker diarization
+```
+
+The base package bundles its own Python interpreter (from
+[python-build-standalone](https://github.com/astral-sh/python-build-standalone))
+so it works on any modern Ubuntu or Debian regardless of the system Python
+version. Only system dependencies are `ffmpeg` and `pulseaudio-utils` (for
+`parecord` / `pactl`).
+
 ### pip / uv
 
 Install system dependencies first:
@@ -63,8 +85,7 @@ uv tool install "tapeback[diarize]"               # + speaker diarization
 uv tool install "tapeback[tray,llm,diarize]"      # everything
 ```
 
-<details>
-<summary>pipx or Nix</summary>
+### pipx or Nix
 
 ```bash
 # pipx
@@ -78,8 +99,6 @@ nix run github:yastcher/tapeback#llm              # + LLM summaries
 nix run github:yastcher/tapeback#diarize          # + speaker diarization
 nix run github:yastcher/tapeback#full             # everything
 ```
-
-</details>
 
 ## Quick start
 
@@ -118,6 +137,24 @@ X-GNOME-Autostart-enabled=true
 ```
 
 Works on any XDG-compatible desktop (KDE, GNOME, Hyprland, Sway, etc.).
+
+### GNOME on Wayland
+
+GNOME 45+ on Wayland removed the legacy tray protocol — the icon will appear
+but right-click does nothing until you install the AppIndicator extension:
+
+```bash
+# Ubuntu / Debian:
+sudo apt install gnome-shell-extension-appindicator
+# Fedora:
+sudo dnf install gnome-shell-extension-appindicator
+```
+
+Then open the **Extensions** app, enable **Ubuntu AppIndicators** (or
+**AppIndicator and KStatusNotifierItem Support**), and log out + back in.
+`tapeback tray` prints this hint to stderr on startup if it detects an
+affected session. See [issue #3](https://github.com/yastcher/tapeback/issues/3)
+for background. KDE Plasma Wayland works out of the box.
 
 ## Speaker diarization
 

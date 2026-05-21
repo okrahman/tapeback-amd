@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.3] — 2026-05-20
+
+### Fixed
+- Tray on GNOME Wayland: when `tapeback tray` starts on a GNOME-family Wayland session, it now prints an actionable warning explaining that the AppIndicator Support extension is required (the legacy XDG StatusNotifier protocol was removed upstream in GNOME 45+, so without the extension the icon appears but the menu does not respond). KDE Plasma Wayland is unaffected. Closes [#3](https://github.com/yastcher/tapeback/issues/3).
+
+### Added
+- Debian/Ubuntu `.deb` packages: built in CI via [nfpm](https://nfpm.goreleaser.com/) and attached to every GitHub Release. Mirrors the Arch split: `tapeback`, `tapeback-tray`, `tapeback-llm`, `tapeback-diarize`. Install with `sudo apt install ./tapeback_*.deb`. The base `.deb` bundles a standalone Python 3.13 (~75 MB extracted) from [python-build-standalone](https://github.com/astral-sh/python-build-standalone), so it works on any modern Ubuntu/Debian regardless of the system Python — including Ubuntu 26.04 LTS, which ships only Python 3.14 and would otherwise break our 3.13-tagged compiled wheels (faster-whisper, ctranslate2, pyav).
+- `tapeback --version` flag — reads the installed package version via `importlib.metadata`.
+
 ## [0.9.2] — 2026-05-04
 
 ### Fixed
