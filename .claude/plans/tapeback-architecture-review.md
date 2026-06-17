@@ -89,7 +89,7 @@ fallback-цепочка LLM, покрытие ≥85%, лимит 500 строк/
 
 1. ✅ **Тайминги стадий (P1)** — `_timing.py` + обёртки в pipeline (0.9.6).
 2. ✅ Убрать мёртвый `mono_16k`-проход в `merge_channels` (§1.2) — `merge_channels` теперь возвращает только stereo (0.9.6).
-3. Сузить CPU-fallback в `transcriber.py` до реальных CUDA-ошибок (P0).
+3. ✅ Сузить CPU-fallback до реальных CUDA/OOM-ошибок (P0) — общий `is_cuda_error` в `_gpu.py`, применён в `transcriber.py` и `diarizer.py` (0.9.6).
 4. `local_files_only` после первой загрузки + тёплая модель для трея (§1.3).
 5. `BatchedInferencePipeline` и/или дефолт `beam_size` (§1.4–1.5) — после замеров из №1.
 6. Раздельные тайминги mic/monitor + (опц.) пропуск near-silent mic-прохода (§1.1).

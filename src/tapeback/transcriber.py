@@ -8,6 +8,7 @@ from typing import Any
 from faster_whisper import WhisperModel
 
 from tapeback import const
+from tapeback._gpu import is_cuda_error
 from tapeback.models import Segment, Word
 from tapeback.settings import Settings
 
@@ -57,8 +58,8 @@ class Transcriber:
                 device=device,
                 compute_type=compute_type,
             )
-        except RuntimeError:
-            if device == "cuda":
+        except RuntimeError as exc:
+            if device == "cuda" and is_cuda_error(exc):
                 print(
                     "Warning: CUDA not available at load time, falling back to CPU",
                     file=sys.stderr,
@@ -99,8 +100,8 @@ class Transcriber:
         try:
             segments_iter, info = self._invoke_transcribe(audio_path, language)
             segments = self._collect_segments(segments_iter)
-        except RuntimeError:
-            if self._device != "cuda":
+        except RuntimeError as exc:
+            if self._device != "cuda" or not is_cuda_error(exc):
                 raise
             self._fallback_to_cpu()
             segments_iter, info = self._invoke_transcribe(audio_path, language)

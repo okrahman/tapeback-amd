@@ -8,6 +8,7 @@ from typing import Any
 import numpy as np
 
 from tapeback import const
+from tapeback._gpu import is_cuda_error
 from tapeback.channel import classify_segment_by_channel, load_stereo_channels
 from tapeback.models import DiarizationSegment, Segment
 from tapeback.settings import Settings
@@ -127,7 +128,7 @@ class Diarizer:
         try:
             diarization = self._run_pipeline(audio_path)
         except RuntimeError as exc:
-            if "CUDA" not in str(exc) and "out of memory" not in str(exc):
+            if not is_cuda_error(exc):
                 raise
             print(
                 f"Warning: CUDA out of memory during diarization, falling back to CPU: {exc}",

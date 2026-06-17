@@ -110,6 +110,53 @@ def test_diarize_returns_segments(tmp_vault):
     assert result[1].speaker == "SPEAKER_01"
 
 
+@requires_pyannote
+def test_diarize_falls_back_to_cpu_on_cublas_error(tmp_vault):
+    """cuBLAS load failure must trigger CPU fallback.
+
+    Regression: the old substring check (`"CUDA" not in str(exc)`) missed
+    cuBLAS/cuDNN library errors and re-raised instead of falling back.
+    """
+    settings = Settings(vault_path=tmp_vault, hf_token=SecretStr("hf_fake"), device="cpu")
+
+    mock_turn = MagicMock()
+    mock_turn.start = 0.0
+    mock_turn.end = 1.0
+    mock_annotation = MagicMock()
+    mock_annotation.itertracks.return_value = [(mock_turn, None, "SPEAKER_00")]
+
+    with patch("pyannote.audio.Pipeline") as mock_cls:
+        mock_pipeline = MagicMock()
+        mock_cls.from_pretrained.return_value = mock_pipeline
+        mock_pipeline.side_effect = [
+            RuntimeError("libcublas.so.11: cannot open shared object file"),
+            mock_annotation,
+        ]
+
+        diarizer = Diarizer(settings)
+        result = diarizer.diarize(Path("/fake/audio.wav"))
+
+    assert mock_pipeline.call_count == 2  # retried on CPU after fallback
+    assert result[0].speaker == "SPEAKER_00"
+
+
+@requires_pyannote
+def test_diarize_propagates_non_cuda_error(tmp_vault):
+    """A non-CUDA RuntimeError must propagate, not silently retry on CPU."""
+    settings = Settings(vault_path=tmp_vault, hf_token=SecretStr("hf_fake"), device="cpu")
+
+    with patch("pyannote.audio.Pipeline") as mock_cls:
+        mock_pipeline = MagicMock()
+        mock_cls.from_pretrained.return_value = mock_pipeline
+        mock_pipeline.side_effect = RuntimeError("corrupt audio frame")
+
+        diarizer = Diarizer(settings)
+        with pytest.raises(RuntimeError, match="corrupt audio frame"):
+            diarizer.diarize(Path("/fake/audio.wav"))
+
+        assert mock_pipeline.call_count == 1
+
+
 # --- identify_user_speaker ---
 
 
