@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from faster_whisper import WhisperModel
+from huggingface_hub.errors import LocalEntryNotFoundError
 
 from tapeback import const
 from tapeback._gpu import is_cuda_error
@@ -50,14 +51,32 @@ class Transcriber:
         compute_type = _resolve_compute_type(settings.compute_type, settings.device)
         self._model = self._load_model(settings.device, compute_type)
 
-    def _load_model(self, device: str, compute_type: str) -> WhisperModel:
-        """Load WhisperModel, falling back to CPU on CUDA errors."""
+    def _new_model(self, device: str, compute_type: str) -> WhisperModel:
+        """Instantiate WhisperModel, preferring the local cache.
+
+        faster-whisper otherwise queries HuggingFace for model metadata on every
+        start, adding latency and hanging when offline. Try the cache first and
+        download only when the model isn't present yet (first run).
+        """
         try:
             return WhisperModel(
                 self._settings.whisper_model,
                 device=device,
                 compute_type=compute_type,
+                local_files_only=True,
             )
+        except LocalEntryNotFoundError:
+            return WhisperModel(
+                self._settings.whisper_model,
+                device=device,
+                compute_type=compute_type,
+                local_files_only=False,
+            )
+
+    def _load_model(self, device: str, compute_type: str) -> WhisperModel:
+        """Load WhisperModel, falling back to CPU on CUDA errors."""
+        try:
+            return self._new_model(device, compute_type)
         except RuntimeError as exc:
             if device == "cuda" and is_cuda_error(exc):
                 print(
@@ -65,11 +84,7 @@ class Transcriber:
                     file=sys.stderr,
                 )
                 self._device = "cpu"
-                return WhisperModel(
-                    self._settings.whisper_model,
-                    device="cpu",
-                    compute_type="int8",
-                )
+                return self._new_model("cpu", "int8")
             raise
 
     def _fallback_to_cpu(self) -> None:
@@ -79,11 +94,7 @@ class Transcriber:
             file=sys.stderr,
         )
         self._device = "cpu"
-        self._model = WhisperModel(
-            self._settings.whisper_model,
-            device="cpu",
-            compute_type="int8",
-        )
+        self._model = self._new_model("cpu", "int8")
 
     def transcribe(self, audio_path: Path) -> tuple[list[Segment], dict[str, str | float]]:
         """Transcribe audio file.

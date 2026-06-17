@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
+from huggingface_hub.errors import LocalEntryNotFoundError
 
 from tapeback.transcriber import Transcriber, _resolve_compute_type
 
@@ -98,3 +99,25 @@ def test_transcribe_stereo_pipeline(settings):
     # Info dict
     assert info["language"] == "en"
     assert info["duration"] == 5.0
+
+
+def test_load_model_prefers_local_cache(settings):
+    """Model load tries the local cache first — no HuggingFace round-trip per start."""
+    with patch("tapeback.transcriber.WhisperModel") as mock_model_cls:
+        Transcriber(settings)
+
+    assert mock_model_cls.call_count == 1
+    assert mock_model_cls.call_args_list[0].kwargs["local_files_only"] is True
+
+
+def test_load_model_downloads_when_not_cached(settings):
+    """If the model isn't cached, fall back to a network download (local_files_only=False)."""
+    instance = MagicMock()
+    with patch("tapeback.transcriber.WhisperModel") as mock_model_cls:
+        mock_model_cls.side_effect = [LocalEntryNotFoundError("not cached"), instance]
+        transcriber = Transcriber(settings)
+
+    assert mock_model_cls.call_count == 2
+    assert mock_model_cls.call_args_list[0].kwargs["local_files_only"] is True
+    assert mock_model_cls.call_args_list[1].kwargs["local_files_only"] is False
+    assert transcriber._model is instance
