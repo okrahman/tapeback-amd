@@ -114,3 +114,4 @@ Before completing any change, verify:
 
 - Comments and logs in English
 - В конце каждой нетривиальной сессии предложи 1–3 пункта в .claude/insights-inbox.md
+  - также подойдут замечания к переносу разрешений из .claude/settings.local.json в .claude/settings.json

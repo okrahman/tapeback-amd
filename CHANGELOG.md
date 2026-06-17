@@ -5,6 +5,11 @@ All notable changes to this project will be documented in this file.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.6] — 2026-06-17
+
+### Added
+- Per-stage timing in processing output — merge, split, load model, transcribe, diarize, and summarize each report how long they took.
+
 ## [0.9.5] — 2026-05-21
 
 ### Fixed
