@@ -113,5 +113,5 @@ Before completing any change, verify:
 ## Gotchas
 
 - Comments and logs in English
-- В конце каждой нетривиальной сессии предложи 1–3 пункта в .claude/insights-inbox.md
-  - также подойдут замечания к переносу разрешений из .claude/settings.local.json в .claude/settings.json
+- At the end of each non-trivial session, suggest 1–3 items for .claude/insights-inbox.md
+  Notes regarding the migration of permissions from .claude/settings.local.json to .claude/settings.json are also welcome

@@ -37,13 +37,14 @@ def _get_wav_duration(path: Path) -> float | None:
         return None
 
 
-def merge_channels(monitor_wav: Path, mic_wav: Path, output_dir: Path) -> tuple[Path, Path]:
-    """Merge two mono WAVs into stereo + create 16kHz mono for Whisper.
+def merge_channels(monitor_wav: Path, mic_wav: Path, output_dir: Path) -> Path:
+    """Merge two mono WAVs into a stereo WAV (left=mic, right=monitor).
 
-    Stereo (left=mic, right=monitor) — for archive and future diarization.
-    Mono 16kHz — input for Whisper.
+    The stereo file is the vault archive and the source for per-channel RMS
+    analysis. The dual-channel pipeline derives its 16 kHz Whisper inputs
+    separately via split_channels_16k(), so no mixed-down mono is produced here.
 
-    Returns (stereo_path, mono_16k_path).
+    Returns the stereo WAV path.
     """
     _check_ffmpeg()
     _check_audio_file(monitor_wav)
@@ -65,7 +66,6 @@ def merge_channels(monitor_wav: Path, mic_wav: Path, output_dir: Path) -> tuple[
 
     output_dir.mkdir(parents=True, exist_ok=True)
     stereo_path = output_dir / const.FILE_STEREO
-    mono_16k_path = output_dir / const.FILE_MONO_16K
 
     # Merge to stereo (left=mic, right=monitor)
     merge_cmd = [
@@ -86,31 +86,7 @@ def merge_channels(monitor_wav: Path, mic_wav: Path, output_dir: Path) -> tuple[
 
     subprocess.run(merge_cmd, capture_output=True, check=True)
 
-    # Convert to 16kHz mono for Whisper
-    # Normalize each channel independently before mixing so quiet mic
-    # is not drowned out by loud monitor audio
-    subprocess.run(
-        [
-            "ffmpeg",
-            "-y",
-            "-i",
-            str(stereo_path),
-            "-filter_complex",
-            "channelsplit=channel_layout=stereo[mic][monitor];"
-            f"[mic]loudnorm={const.LOUDNORM_PARAMS}[mic_n];"
-            f"[monitor]loudnorm={const.LOUDNORM_PARAMS}[mon_n];"
-            "[mic_n][mon_n]amix=inputs=2:duration=longest[mix]",
-            "-map",
-            "[mix]",
-            "-ar",
-            str(const.SAMPLE_RATE_16K),
-            str(mono_16k_path),
-        ],
-        capture_output=True,
-        check=True,
-    )
-
-    return stereo_path, mono_16k_path
+    return stereo_path
 
 
 def split_channels_16k(stereo_wav: Path, output_dir: Path) -> tuple[Path, Path]:

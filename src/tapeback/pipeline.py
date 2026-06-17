@@ -70,7 +70,7 @@ def stop_and_process(
     on_status("Merging audio channels...")
     output_dir = monitor_path.parent
     with stage_timer("merge", on_status):
-        stereo_path, _mono_16k_path = merge_channels(monitor_path, mic_path, output_dir)
+        stereo_path = merge_channels(monitor_path, mic_path, output_dir)
 
     session_name = monitor_path.parent.name
 

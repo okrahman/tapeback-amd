@@ -10,7 +10,7 @@ from tests.fixtures import create_silent_wav, create_stereo_wav
 
 @pytest.mark.skipif(not shutil.which("ffmpeg"), reason="ffmpeg required")
 def test_merge_channels(tmp_path):
-    """Merge two mono WAVs into stereo + 16kHz mono."""
+    """Merge two mono WAVs into a stereo archive WAV."""
 
     monitor = tmp_path / "monitor.wav"
     mic = tmp_path / "mic.wav"
@@ -19,19 +19,13 @@ def test_merge_channels(tmp_path):
     create_silent_wav(monitor)
     create_silent_wav(mic)
 
-    stereo_path, mono_16k_path = merge_channels(monitor, mic, output_dir)
+    stereo_path = merge_channels(monitor, mic, output_dir)
 
     assert stereo_path.exists()
-    assert mono_16k_path.exists()
 
     # Verify stereo is 2 channels
     with wave.open(str(stereo_path), "rb") as wf:
         assert wf.getnchannels() == 2
-
-    # Verify mono_16k is 1 channel at 16kHz
-    with wave.open(str(mono_16k_path), "rb") as wf:
-        assert wf.getnchannels() == 1
-        assert wf.getframerate() == 16000
 
 
 @pytest.mark.skipif(not shutil.which("ffmpeg"), reason="ffmpeg required")
