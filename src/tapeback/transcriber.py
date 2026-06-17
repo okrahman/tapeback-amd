@@ -85,17 +85,21 @@ class Transcriber:
         except RuntimeError as exc:
             if device == "cuda" and is_cuda_error(exc):
                 print(
-                    "Warning: CUDA not available at load time, falling back to CPU",
+                    f"Warning: CUDA not available at load time, falling back to CPU: {exc}",
                     file=sys.stderr,
                 )
                 self._device = "cpu"
                 return self._new_model("cpu", "int8")
             raise
 
-    def _fallback_to_cpu(self) -> None:
-        """Recreate model on CPU after a CUDA runtime failure."""
+    def _fallback_to_cpu(self, exc: Exception) -> None:
+        """Recreate model on CPU after a CUDA runtime failure.
+
+        The real error is printed (not just "CUDA runtime error") so the user can
+        tell an out-of-memory failure from a cuDNN/driver problem.
+        """
         print(
-            "Warning: CUDA runtime error, falling back to CPU",
+            f"Warning: CUDA runtime error, falling back to CPU: {exc}",
             file=sys.stderr,
         )
         self._device = "cpu"
@@ -119,7 +123,7 @@ class Transcriber:
         except RuntimeError as exc:
             if self._device != "cuda" or not is_cuda_error(exc):
                 raise
-            self._fallback_to_cpu()
+            self._fallback_to_cpu(exc)
             segments_iter, info = self._invoke_transcribe(audio_path, language)
             segments = self._collect_segments(segments_iter)
 

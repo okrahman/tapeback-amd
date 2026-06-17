@@ -58,3 +58,26 @@ def test_cuda_oom_falls_back_to_cpu_and_retries(settings):
         assert instance.transcribe.call_count == 2  # retried after CPU fallback
         assert transcriber._device == "cpu"
         assert segments[0].text == "hi"
+
+
+def test_cuda_inference_error_message_is_surfaced(settings, capsys):
+    """The real CUDA error must be shown, not hidden behind a generic message.
+
+    Without it, a CUDA OOM and a cuDNN/driver failure look identical in the
+    log, leaving the user unable to tell why transcription dropped to slow CPU.
+    """
+    cuda_settings = settings.model_copy(update={"device": "cuda"})
+    good_seg = MagicMock()
+    good_seg.start, good_seg.end, good_seg.text, good_seg.words = 0.0, 1.0, "ok", []
+
+    with patch("tapeback.transcriber.WhisperModel") as mock_model_cls:
+        instance = mock_model_cls.return_value
+        instance.transcribe.side_effect = [
+            RuntimeError("CUDA failed with error out of memory"),
+            (iter([good_seg]), _whisper_info()),
+        ]
+        transcriber = Transcriber(cuda_settings)
+        transcriber.transcribe(Path("/fake/audio.wav"))
+
+    captured = capsys.readouterr()
+    assert "out of memory" in captured.err

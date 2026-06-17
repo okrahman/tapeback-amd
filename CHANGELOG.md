@@ -16,6 +16,7 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 - CPU fallback during transcription and diarization now triggers only on real CUDA / out-of-memory / cuBLAS errors; unrelated failures surface instead of being masked by a slow CPU retry.
+- The CUDA error that triggers a CPU fallback is now printed in full, so an out-of-memory failure can be told apart from a cuDNN/driver problem.
 
 ## [0.9.5] — 2026-05-21
 
