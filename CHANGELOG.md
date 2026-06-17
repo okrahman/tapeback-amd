@@ -8,7 +8,7 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [0.9.6] — 2026-06-17
 
 ### Added
-- Per-stage timing in processing output — merge, split, load model, transcribe, diarize, and summarize each report how long they took.
+- Per-stage timing in processing output — merge, split, load model, transcribe (mic and monitor separately), diarize, and summarize each report how long they took.
 
 ### Changed
 - Faster post-recording processing: dropped a redundant ffmpeg pass that mixed both channels into a mono file the dual-channel pipeline never used.

@@ -121,3 +121,31 @@ def test_load_model_downloads_when_not_cached(settings):
     assert mock_model_cls.call_args_list[0].kwargs["local_files_only"] is True
     assert mock_model_cls.call_args_list[1].kwargs["local_files_only"] is False
     assert transcriber._model is instance
+
+
+def test_transcribe_stereo_reports_per_channel_timings(settings):
+    """transcribe_stereo emits separate timing lines for the mic and monitor channels."""
+    mock_info = MagicMock()
+    mock_info.language = "en"
+    mock_info.language_probability = 0.99
+    mock_info.duration = 5.0
+
+    mic_seg = MagicMock()
+    mic_seg.start, mic_seg.end, mic_seg.text, mic_seg.words = 0.0, 3.0, "mine", []
+    mon_seg = MagicMock()
+    mon_seg.start, mon_seg.end, mon_seg.text, mon_seg.words = 0.0, 2.0, "theirs", []
+
+    messages: list[str] = []
+    with patch("tapeback.transcriber.WhisperModel") as mock_model_cls:
+        instance = mock_model_cls.return_value
+        instance.transcribe.side_effect = [
+            (iter([mic_seg]), mock_info),
+            (iter([mon_seg]), mock_info),
+        ]
+        transcriber = Transcriber(settings)
+        transcriber.transcribe_stereo(
+            Path("/fake/mic.wav"), Path("/fake/monitor.wav"), on_status=messages.append
+        )
+
+    assert any(m.startswith("Stage 'transcribe mic'") for m in messages)
+    assert any(m.startswith("Stage 'transcribe monitor'") for m in messages)

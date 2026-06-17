@@ -120,7 +120,7 @@ omit = ["src/tapeback/tray.py"]  # GUI module, requires X display — tested loc
 
 [tool.coverage.report]
 show_missing = true
-fail_under = 85
+fail_under = 90
 exclude_lines = [
     "if TYPE_CHECKING:",
     "pragma: no cover",

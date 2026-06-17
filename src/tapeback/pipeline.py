@@ -186,8 +186,9 @@ def process_stereo_file(
     on_status("Transcribing (this may take a few minutes)...")
     with stage_timer("load model", on_status):
         transcriber = load_transcriber(settings)
-    with stage_timer("transcribe", on_status):
-        mic_segments, monitor_segments, info = transcriber.transcribe_stereo(mic_16k, monitor_16k)
+    mic_segments, monitor_segments, info = transcriber.transcribe_stereo(
+        mic_16k, monitor_16k, on_status=on_status
+    )
 
     mic_segments = split_on_silence(
         mic_segments,

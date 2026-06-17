@@ -1,7 +1,7 @@
 import locale
 import os
 import sys
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from pathlib import Path
 from typing import Any
 
@@ -10,6 +10,7 @@ from huggingface_hub.errors import LocalEntryNotFoundError
 
 from tapeback import const
 from tapeback._gpu import is_cuda_error
+from tapeback._timing import stage_timer
 from tapeback.models import Segment, Word
 from tapeback.settings import Settings
 
@@ -37,6 +38,10 @@ def _resolve_compute_type(compute_type: str, device: str) -> str:
     if device == "cuda":
         return "float16"
     return "int8"
+
+
+def _noop_status(_message: str) -> None:
+    """Default status sink — used when transcribe_stereo gets no reporter."""
 
 
 class Transcriber:
@@ -143,16 +148,25 @@ class Transcriber:
         )
 
     def transcribe_stereo(
-        self, mic_16k: Path, monitor_16k: Path
+        self,
+        mic_16k: Path,
+        monitor_16k: Path,
+        *,
+        on_status: Callable[[str], None] = _noop_status,
     ) -> tuple[list[Segment], list[Segment], dict[str, str | float]]:
         """Transcribe both channels separately.
 
         Returns (mic_segments, monitor_segments, info).
         mic_segments get speaker="You" automatically.
         info from the channel with more total speech duration.
+
+        Each channel is timed separately via on_status so the cost of the mic
+        pass (mostly silence while the user listens) is visible on its own.
         """
-        mic_segments, mic_info = self.transcribe(mic_16k)
-        monitor_segments, monitor_info = self.transcribe(monitor_16k)
+        with stage_timer("transcribe mic", on_status):
+            mic_segments, mic_info = self.transcribe(mic_16k)
+        with stage_timer("transcribe monitor", on_status):
+            monitor_segments, monitor_info = self.transcribe(monitor_16k)
 
         # Assign speaker="You" to mic segments
         mic_segments = [

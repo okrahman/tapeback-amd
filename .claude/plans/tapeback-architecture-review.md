@@ -92,7 +92,7 @@ fallback-цепочка LLM, покрытие ≥85%, лимит 500 строк/
 3. ✅ Сузить CPU-fallback до реальных CUDA/OOM-ошибок (P0) — общий `is_cuda_error` в `_gpu.py`, применён в `transcriber.py` и `diarizer.py` (0.9.6).
 4. ✅ `local_files_only` (offline-first, fallback на скачивание) в `transcriber._new_model` (0.9.6). Тёплая модель для трея НЕ делается — конфликт с выгрузкой Whisper перед diarize на 4 GB VRAM; возможна как opt-in позже.
 5. `BatchedInferencePipeline` и/или дефолт `beam_size` (§1.4–1.5) — после замеров из №1.
-6. Раздельные тайминги mic/monitor + (опц.) пропуск near-silent mic-прохода (§1.1).
+6. ✅ Раздельные тайминги mic/monitor — `transcribe_stereo(on_status=...)` мерит каналы отдельно (0.9.6). Пропуск near-silent mic-прохода НЕ делается — меняет качество (риск проглотить тихую речь); решать после реальных замеров.
 
 Каждый пункт — отдельный коммит, под свой failing-тест (bug-fix workflow проекта).
 

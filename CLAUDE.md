@@ -34,7 +34,7 @@ No web servers, databases, Docker.
 - Lint: `uv run ruff check --fix`
 - Format: `uv run ruff format`
 - Type check: `uv run ty check`
-- Test: `uv run pytest` (coverage ≥85% enforced via pyproject.toml)
+- Test: `uv run pytest` (coverage ≥90% enforced via pyproject.toml)
 
 ## Code quality
 
