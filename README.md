@@ -115,6 +115,14 @@ mkdir -p ~/.config/tapeback
 echo 'TAPEBACK_VAULT_PATH=~/Documents/obsidian/vault' > ~/.config/tapeback/.env
 ```
 
+**Tip:** if you always meet in one language, pin it — auto-detection can misfire on a
+channel that starts silent (and even hallucinate). English terms inside another language
+still transcribe fine:
+
+```bash
+TAPEBACK_LANGUAGE=en tapeback start          # or add TAPEBACK_LANGUAGE=en to .env
+```
+
 ## System tray
 
 Run without a terminal — right-click the tray icon to start/stop recording:
@@ -303,10 +311,16 @@ All settings via environment variables (prefix `TAPEBACK_`) or
 | `TAPEBACK_LANGUAGE` | `auto` | Language code (`auto` for auto-detection, or `en`, `ru`, `fr`, etc.) |
 | `TAPEBACK_DEVICE` | `cuda` | `cuda` or `cpu` |
 | `TAPEBACK_COMPUTE_TYPE` | `auto` | `auto`, `float16`, `int8`, or `float32` (`auto` → `float16` on CUDA, `int8` on CPU; pin `int8` if your GPU is memory-tight) |
-| `TAPEBACK_BEAM_SIZE` | `5` | Whisper beam search width |
+| `TAPEBACK_BEAM_SIZE` | `4` | Whisper beam search width (lower = faster, slightly less accurate) |
+| `TAPEBACK_TEMPERATURE` | `[0.0, 0.2, 0.4, 0.6, 0.8, 1.0]` | Temperature fallback ladder. The high steps break Whisper out of hallucination loops on noisy audio — don't shorten unless your input is clean (shortening can cause repeat loops: slower *and* worse) |
+| `TAPEBACK_BATCH_SIZE` | `0` | Batched inference (faster-whisper `BatchedInferencePipeline`) — processes VAD segments in parallel, several× faster on GPU. `0` = off; try `8`. On small GPUs (≤4 GB) it may OOM even at `4` — use `2`, pair with `TAPEBACK_COMPUTE_TYPE=int8`, or keep `0`. OOM falls back to CPU automatically |
 | `TAPEBACK_CHUNK_LENGTH` | `7` | Max VAD chunk (seconds) before splitting for Whisper; prevents lost speech after long pauses |
 | `TAPEBACK_NO_SPEECH_THRESHOLD` | `0.4` | Whisper silence-rejection threshold (lower = more aggressive; suppresses training-data hallucinations on pauses) |
+| `TAPEBACK_LANGUAGE_DETECTION_SEGMENTS` | `1` | Segments probed before deciding the language; raise (e.g. `4`) if a channel that starts silent gets the wrong language |
+| `TAPEBACK_MULTILINGUAL` | `false` | Per-segment language detection for mixed-language recordings (code-switching). Less stable than a fixed `TAPEBACK_LANGUAGE` |
+| `TAPEBACK_HALLUCINATION_SILENCE_THRESHOLD` | *(off)* | Seconds; skip silent gaps when a hallucination is detected. ⚠ Triggers per-segment re-processing — can be **much slower** on pause-heavy channels (e.g. the mic). Leave off unless it measurably helps your audio |
 | `TAPEBACK_PAUSE_THRESHOLD` | `1.0` | Seconds; split segments on silence gaps >= this |
+| `TAPEBACK_GATE_MIC_SILENCE` | `true` | Silence the mic channel where you're only listening (mic quiet / monitor dominant) before transcription, so Whisper doesn't loop on the pauses. Dual-channel pipeline only |
 
 ### Live transcription
 
@@ -344,6 +358,41 @@ All settings via environment variables (prefix `TAPEBACK_`) or
 | `TAPEBACK_LLM_MODEL` | *(provider default)* | Override model name |
 
 </details>
+
+## Troubleshooting
+
+### GPU transcription falls back to CPU on CUDA 13 systems
+
+If the log shows `Warning: CUDA runtime error, falling back to CPU: Library libcublas.so.12 is not found`,
+your system has CUDA 13 (e.g. recent Arch) but faster-whisper's ctranslate2 backend is
+built against CUDA 12 and can't find `libcublas.so.12` / `libcudnn.so.9`. Diarization
+(PyTorch) still uses the GPU, but transcription drops to slow CPU.
+
+Install the CUDA 12 runtime libraries — tapeback preloads them automatically:
+
+```bash
+uv pip install nvidia-cublas-cu12 nvidia-cudnn-cu12
+```
+
+They install alongside the CUDA 13 libraries without conflict. No `LD_LIBRARY_PATH`
+needed: when `TAPEBACK_DEVICE=cuda` (the default), tapeback finds and preloads them
+on startup. If they're not installed, transcription falls back to CPU with the message
+above.
+
+### Wrong language or repeated/garbled text on the "You" channel
+
+If the note's `language:` is wrong (e.g. `ja` for an English meeting) or the **You**
+channel is full of repeats (`Do you hear me? Do you hear me?…`) or foreign script, the
+mic channel started with silence while you were listening, and Whisper guessed the
+language from that silence and hallucinated.
+
+Fixes, in order of reliability:
+
+- **Pin the language** if you know it: `TAPEBACK_LANGUAGE=ru` (or `en`, …). English
+  terms inside another language still transcribe fine.
+- **Probe more speech** before deciding: `TAPEBACK_LANGUAGE_DETECTION_SEGMENTS=4`.
+- **Mixed-language meetings** (real code-switching): `TAPEBACK_MULTILINGUAL=true`.
+- **Suppress silence hallucinations**: `TAPEBACK_HALLUCINATION_SILENCE_THRESHOLD=2.0`.
 
 ## Uninstall
 

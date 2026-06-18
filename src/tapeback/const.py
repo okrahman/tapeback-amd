@@ -36,6 +36,8 @@ CHANNEL_EPSILON = 1e-10
 SILENCE_WINDOW_SEC = 0.1
 SILENCE_ADAPTIVE_FACTOR = 0.4
 SILENCE_MONITOR_FACTOR = 0.3
+# RMS energy floor (raw int16 scale) below which audio counts as silence
+SILENCE_RMS_THRESHOLD = 200.0
 
 # Spectral analysis
 SPECTRAL_FFT_SIZE = 2048

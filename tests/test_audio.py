@@ -2,15 +2,21 @@ import shutil
 import wave
 from unittest.mock import patch
 
+import numpy as np
 import pytest
 
-from tapeback.audio import convert_to_mono16k, merge_channels, split_channels_16k
+from tapeback.audio import (
+    convert_to_mono16k,
+    gate_wav_inactive,
+    merge_channels,
+    split_channels_16k,
+)
 from tests.fixtures import create_silent_wav, create_stereo_wav
 
 
 @pytest.mark.skipif(not shutil.which("ffmpeg"), reason="ffmpeg required")
 def test_merge_channels(tmp_path):
-    """Merge two mono WAVs into stereo + 16kHz mono."""
+    """Merge two mono WAVs into a stereo archive WAV."""
 
     monitor = tmp_path / "monitor.wav"
     mic = tmp_path / "mic.wav"
@@ -19,19 +25,13 @@ def test_merge_channels(tmp_path):
     create_silent_wav(monitor)
     create_silent_wav(mic)
 
-    stereo_path, mono_16k_path = merge_channels(monitor, mic, output_dir)
+    stereo_path = merge_channels(monitor, mic, output_dir)
 
     assert stereo_path.exists()
-    assert mono_16k_path.exists()
 
     # Verify stereo is 2 channels
     with wave.open(str(stereo_path), "rb") as wf:
         assert wf.getnchannels() == 2
-
-    # Verify mono_16k is 1 channel at 16kHz
-    with wave.open(str(mono_16k_path), "rb") as wf:
-        assert wf.getnchannels() == 1
-        assert wf.getframerate() == 16000
 
 
 @pytest.mark.skipif(not shutil.which("ffmpeg"), reason="ffmpeg required")
@@ -75,6 +75,30 @@ def test_split_channels_16k(tmp_path):
     with wave.open(str(monitor_16k), "rb") as wf:
         assert wf.getnchannels() == 1
         assert wf.getframerate() == 16000
+
+
+def test_gate_wav_inactive_silences_listening_region(tmp_path):
+    """gate_wav_inactive zeroes the listening half of a 16k mic WAV in place."""
+    sr_16k = 16000
+    raw_sr = 48000
+    mic_path = tmp_path / "mic_16k.wav"
+    samples = np.full(2 * sr_16k, 8000, dtype=np.int16)
+    with wave.open(str(mic_path), "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sr_16k)
+        wf.writeframes(samples.tobytes())
+
+    # User speaks the first second, listens the second (mic quiet, monitor loud).
+    mic_raw = np.concatenate([np.full(raw_sr, 5000.0), np.zeros(raw_sr)]).astype(np.float32)
+    monitor_raw = np.concatenate([np.zeros(raw_sr), np.full(raw_sr, 5000.0)]).astype(np.float32)
+
+    gate_wav_inactive(mic_path, mic_raw, monitor_raw, raw_sr)
+
+    with wave.open(str(mic_path), "rb") as wf:
+        out = np.frombuffer(wf.readframes(wf.getnframes()), dtype=np.int16)
+    assert np.any(out[:sr_16k] != 0)
+    assert np.all(out[sr_16k:] == 0)
 
 
 def test_empty_file_raises(tmp_path):

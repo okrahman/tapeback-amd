@@ -205,23 +205,18 @@ def test_identify_and_assign_with_real_stereo(stereo_wav):
 
 
 @pytest.mark.skipif(not shutil.which("ffmpeg"), reason="ffmpeg required")
-def test_merge_channels_produces_stereo_and_mono(tmp_path):
-    """merge_channels: two mono WAVs → stereo (2ch) + mono 16kHz for Whisper."""
+def test_merge_channels_produces_stereo(tmp_path):
+    """merge_channels: two mono WAVs → stereo (2ch) archive WAV."""
     monitor = tmp_path / "monitor.wav"
     mic = tmp_path / "mic.wav"
     create_mono_wav(monitor, duration=2.0, sample_rate=48000, amplitude=0.5)
     create_mono_wav(mic, duration=2.0, sample_rate=48000, amplitude=0.5)
 
-    stereo_path, mono_16k_path = merge_channels(monitor, mic, tmp_path / "output")
+    stereo_path = merge_channels(monitor, mic, tmp_path / "output")
 
     # Stereo: 2 channels
     with wave.open(str(stereo_path), "rb") as wf:
         assert wf.getnchannels() == 2
-
-    # Mono 16kHz: 1 channel, correct sample rate
-    with wave.open(str(mono_16k_path), "rb") as wf:
-        assert wf.getnchannels() == 1
-        assert wf.getframerate() == 16000
 
     # Stereo can be loaded for channel analysis
     mic_raw, monitor_raw, _sr = load_stereo_channels(stereo_path)

@@ -14,7 +14,14 @@ if TYPE_CHECKING:
 from tapeback import const
 from tapeback._gpu import free_gpu_memory
 from tapeback._lazy import load_transcriber
-from tapeback.audio import convert_to_mono16k, get_channel_count, merge_channels, split_channels_16k
+from tapeback._timing import stage_timer
+from tapeback.audio import (
+    convert_to_mono16k,
+    gate_wav_inactive,
+    get_channel_count,
+    merge_channels,
+    split_channels_16k,
+)
 from tapeback.channel import (
     classify_segment_by_channel,
     filter_silent_segments,
@@ -68,7 +75,8 @@ def stop_and_process(
 
     on_status("Merging audio channels...")
     output_dir = monitor_path.parent
-    stereo_path, _mono_16k_path = merge_channels(monitor_path, mic_path, output_dir)
+    with stage_timer("merge", on_status):
+        stereo_path = merge_channels(monitor_path, mic_path, output_dir)
 
     session_name = monitor_path.parent.name
 
@@ -178,11 +186,19 @@ def process_stereo_file(
     mic_raw, monitor_raw, raw_sr = load_stereo_channels(stereo_path)
 
     on_status("Splitting channels...")
-    mic_16k, monitor_16k = split_channels_16k(stereo_path, output_dir)
+    with stage_timer("split", on_status):
+        mic_16k, monitor_16k = split_channels_16k(stereo_path, output_dir)
+
+    if settings.gate_mic_silence:
+        # Silence the mic where the user only listens, so Whisper doesn't loop on it.
+        gate_wav_inactive(mic_16k, mic_raw, monitor_raw, raw_sr)
 
     on_status("Transcribing (this may take a few minutes)...")
-    transcriber = load_transcriber(settings)
-    mic_segments, monitor_segments, info = transcriber.transcribe_stereo(mic_16k, monitor_16k)
+    with stage_timer("load model", on_status):
+        transcriber = load_transcriber(settings)
+    mic_segments, monitor_segments, info = transcriber.transcribe_stereo(
+        mic_16k, monitor_16k, on_status=on_status
+    )
 
     mic_segments = split_on_silence(
         mic_segments,
@@ -221,16 +237,17 @@ def process_stereo_file(
             )
         else:
             on_status("Diarizing speakers...")
-            diarizer = Diarizer(settings)
-            diarization_segments = diarizer.diarize(monitor_16k)
-            if settings.spectral_merge_threshold > 0:
-                diarization_segments = merge_similar_speakers(
-                    diarization_segments,
-                    monitor_raw,
-                    raw_sr,
-                    similarity_threshold=settings.spectral_merge_threshold,
-                )
-            monitor_segments = assign_speakers(monitor_segments, diarization_segments)
+            with stage_timer("diarize", on_status):
+                diarizer = Diarizer(settings)
+                diarization_segments = diarizer.diarize(monitor_16k)
+                if settings.spectral_merge_threshold > 0:
+                    diarization_segments = merge_similar_speakers(
+                        diarization_segments,
+                        monitor_raw,
+                        raw_sr,
+                        similarity_threshold=settings.spectral_merge_threshold,
+                    )
+                monitor_segments = assign_speakers(monitor_segments, diarization_segments)
             diarized = True
 
     if not diarized and monitor_segments and monitor_segments[0].speaker is None:
@@ -263,11 +280,14 @@ def process_mono_file(
     Returns (diarized_segments, info, raw_segments).
     """
     on_status("Converting audio...")
-    mono_16k_path = convert_to_mono16k(audio_path, output_dir)
+    with stage_timer("convert", on_status):
+        mono_16k_path = convert_to_mono16k(audio_path, output_dir)
 
     on_status("Transcribing (this may take a few minutes)...")
-    transcriber = load_transcriber(settings)
-    segments, info = transcriber.transcribe(mono_16k_path)
+    with stage_timer("load model", on_status):
+        transcriber = load_transcriber(settings)
+    with stage_timer("transcribe", on_status):
+        segments, info = transcriber.transcribe(mono_16k_path)
 
     # Raw transcript before diarization
     raw_segments = list(segments)
@@ -320,14 +340,16 @@ def _maybe_diarize_segments(
         return segments
 
     on_status("Diarizing speakers...")
-    diarizer = Diarizer(settings)
-    diarization_segments = diarizer.diarize(mono_16k_path)
+    with stage_timer("diarize", on_status):
+        diarizer = Diarizer(settings)
+        diarization_segments = diarizer.diarize(mono_16k_path)
 
-    user_speaker = None
-    if stereo_path is not None:
-        user_speaker = identify_user_speaker(diarization_segments, stereo_path)
+        user_speaker = None
+        if stereo_path is not None:
+            user_speaker = identify_user_speaker(diarization_segments, stereo_path)
 
-    return assign_speakers(segments, diarization_segments, user_speaker, stereo_path)
+        result = assign_speakers(segments, diarization_segments, user_speaker, stereo_path)
+    return result
 
 
 def _get_stereo_source(audio_path: Path) -> Path | None:
@@ -343,4 +365,5 @@ def _get_stereo_source(audio_path: Path) -> Path | None:
 def _maybe_summarize(md_path: Path, settings: Settings, on_status: StatusCallback) -> None:
     """Run summarization if available."""
     on_status("Summarizing...")
-    maybe_summarize(md_path, settings)
+    with stage_timer("summarize", on_status):
+        maybe_summarize(md_path, settings)

@@ -46,13 +46,35 @@ class Settings(BaseSettings):
     language: str = "auto"
     device: str = "cuda"
     compute_type: str = "auto"  # "int8"/"float16"
-    beam_size: int = 5
+    beam_size: int = 4
+    # Temperature fallback ladder. Decoding starts at 0.0 (deterministic, best
+    # quality) and steps up only when a segment decodes poorly. The HIGH steps are
+    # what break Whisper out of hallucination loops on noisy/quiet input — keep the
+    # full ladder. Shortening it makes the model get STUCK in repeat loops, which is
+    # both slower (it generates tokens up to the limit) and worse (repeats in text).
+    temperature: tuple[float, ...] = (0.0, 0.2, 0.4, 0.6, 0.8, 1.0)
+    # Batched inference (faster-whisper BatchedInferencePipeline): processes VAD
+    # segments in parallel batches — several times faster on GPU. Off by default
+    # (0) since it can OOM small GPUs; set e.g. TAPEBACK_BATCH_SIZE=8 to enable.
+    batch_size: int = Field(default=0, ge=0)
     vad_filter: bool = True
     chunk_length: int = 7  # seconds — max VAD chunk before splitting for Whisper
     condition_on_previous_text: bool = False
     # Lower = more aggressive silence rejection (helps suppress Whisper training-data
     # hallucinations like "Субтитры DimaTorzok" on long pauses). Default in Whisper is 0.6.
     no_speech_threshold: float = Field(default=0.4, ge=0.0, le=1.0)
+    # Number of segments probed before deciding the language. faster-whisper's default
+    # of 1 picks the language from the first segment, which misfires when a channel
+    # starts with silence (e.g. mic while the user only listens — it can guess Japanese
+    # and hallucinate). Raise it to probe more speech before committing.
+    language_detection_segments: int = Field(default=1, ge=1)
+    # Per-segment language detection — allows mixed languages in one recording
+    # (code-switching, e.g. Russian speech with English terms). Less stable than a
+    # fixed language; opt-in.
+    multilingual: bool = False
+    # Skip silent gaps longer than this many seconds when a hallucination is detected
+    # (uses word timestamps, which are always on). None disables it.
+    hallucination_silence_threshold: float | None = Field(default=None, ge=0.0)
 
     # Audio
     monitor_source: str = "auto"
@@ -71,6 +93,10 @@ class Settings(BaseSettings):
 
     # Post-processing
     pause_threshold: float = Field(default=1.0, ge=0.0)  # split on word gaps >= this
+    # Silence the mic channel where the user is listening (mic quiet or monitor
+    # dominant) before transcription, so Whisper doesn't hallucinate loops on the
+    # pauses (slow + garbage). Dual-channel (stereo) pipeline only.
+    gate_mic_silence: bool = True
 
     # Live transcription — opt-in. Off by default because mid-recording GPU
     # contention with the post-recording pipeline causes long stalls on small

@@ -4,7 +4,10 @@ import sys
 import wave
 from pathlib import Path
 
+import numpy as np
+
 from tapeback import const
+from tapeback.channel import gate_inactive_regions
 
 
 def _check_ffmpeg() -> None:
@@ -37,13 +40,14 @@ def _get_wav_duration(path: Path) -> float | None:
         return None
 
 
-def merge_channels(monitor_wav: Path, mic_wav: Path, output_dir: Path) -> tuple[Path, Path]:
-    """Merge two mono WAVs into stereo + create 16kHz mono for Whisper.
+def merge_channels(monitor_wav: Path, mic_wav: Path, output_dir: Path) -> Path:
+    """Merge two mono WAVs into a stereo WAV (left=mic, right=monitor).
 
-    Stereo (left=mic, right=monitor) — for archive and future diarization.
-    Mono 16kHz — input for Whisper.
+    The stereo file is the vault archive and the source for per-channel RMS
+    analysis. The dual-channel pipeline derives its 16 kHz Whisper inputs
+    separately via split_channels_16k(), so no mixed-down mono is produced here.
 
-    Returns (stereo_path, mono_16k_path).
+    Returns the stereo WAV path.
     """
     _check_ffmpeg()
     _check_audio_file(monitor_wav)
@@ -65,7 +69,6 @@ def merge_channels(monitor_wav: Path, mic_wav: Path, output_dir: Path) -> tuple[
 
     output_dir.mkdir(parents=True, exist_ok=True)
     stereo_path = output_dir / const.FILE_STEREO
-    mono_16k_path = output_dir / const.FILE_MONO_16K
 
     # Merge to stereo (left=mic, right=monitor)
     merge_cmd = [
@@ -86,31 +89,7 @@ def merge_channels(monitor_wav: Path, mic_wav: Path, output_dir: Path) -> tuple[
 
     subprocess.run(merge_cmd, capture_output=True, check=True)
 
-    # Convert to 16kHz mono for Whisper
-    # Normalize each channel independently before mixing so quiet mic
-    # is not drowned out by loud monitor audio
-    subprocess.run(
-        [
-            "ffmpeg",
-            "-y",
-            "-i",
-            str(stereo_path),
-            "-filter_complex",
-            "channelsplit=channel_layout=stereo[mic][monitor];"
-            f"[mic]loudnorm={const.LOUDNORM_PARAMS}[mic_n];"
-            f"[monitor]loudnorm={const.LOUDNORM_PARAMS}[mon_n];"
-            "[mic_n][mon_n]amix=inputs=2:duration=longest[mix]",
-            "-map",
-            "[mix]",
-            "-ar",
-            str(const.SAMPLE_RATE_16K),
-            str(mono_16k_path),
-        ],
-        capture_output=True,
-        check=True,
-    )
-
-    return stereo_path, mono_16k_path
+    return stereo_path
 
 
 def split_channels_16k(stereo_wav: Path, output_dir: Path) -> tuple[Path, Path]:
@@ -187,3 +166,29 @@ def convert_to_mono16k(input_file: Path, output_dir: Path) -> Path:
     )
 
     return output_path
+
+
+def gate_wav_inactive(
+    wav_path: Path,
+    target_raw: np.ndarray,
+    other_raw: np.ndarray,
+    raw_sr: int,
+) -> None:
+    """Silence the listening regions of a 16 kHz mono WAV in place.
+
+    Reads the WAV, zeroes windows where the speaker is inactive (see
+    channel.gate_inactive_regions), and writes it back — so Whisper never sees the
+    mic channel's pauses and can't hallucinate loops on them.
+    """
+    with wave.open(str(wav_path), "rb") as wf:
+        sample_rate = wf.getframerate()
+        frames = wf.readframes(wf.getnframes())
+
+    samples = np.frombuffer(frames, dtype=np.int16).astype(np.float32)
+    gated = gate_inactive_regions(samples, target_raw, other_raw, raw_sr)
+
+    with wave.open(str(wav_path), "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sample_rate)
+        wf.writeframes(gated.astype(np.int16).tobytes())

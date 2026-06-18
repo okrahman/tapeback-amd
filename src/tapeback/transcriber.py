@@ -1,13 +1,16 @@
 import locale
 import os
 import sys
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from pathlib import Path
 from typing import Any
 
-from faster_whisper import WhisperModel
+from faster_whisper import BatchedInferencePipeline, WhisperModel
+from huggingface_hub.errors import LocalEntryNotFoundError
 
 from tapeback import const
+from tapeback._gpu import is_cuda_error, preload_cuda_libs
+from tapeback._timing import stage_timer
 from tapeback.models import Segment, Word
 from tapeback.settings import Settings
 
@@ -37,6 +40,10 @@ def _resolve_compute_type(compute_type: str, device: str) -> str:
     return "int8"
 
 
+def _noop_status(_message: str) -> None:
+    """Default status sink — used when transcribe_stereo gets no reporter."""
+
+
 class Transcriber:
     def __init__(self, settings: Settings) -> None:
         """Initialize faster-whisper model.
@@ -46,43 +53,68 @@ class Transcriber:
         """
         self._settings = settings
         self._device = settings.device
+        if settings.device == "cuda":
+            # Make ctranslate2 (CUDA 12) find cuBLAS/cuDNN on CUDA 13 systems.
+            preload_cuda_libs()
         compute_type = _resolve_compute_type(settings.compute_type, settings.device)
         self._model = self._load_model(settings.device, compute_type)
+        self._batched = self._wrap_batched(self._model)
 
-    def _load_model(self, device: str, compute_type: str) -> WhisperModel:
-        """Load WhisperModel, falling back to CPU on CUDA errors."""
+    def _wrap_batched(self, model: WhisperModel) -> BatchedInferencePipeline | None:
+        """Wrap the model for batched inference when batch_size > 0 (faster on GPU)."""
+        if self._settings.batch_size > 0:
+            return BatchedInferencePipeline(model=model)
+        return None
+
+    def _new_model(self, device: str, compute_type: str) -> WhisperModel:
+        """Instantiate WhisperModel, preferring the local cache.
+
+        faster-whisper otherwise queries HuggingFace for model metadata on every
+        start, adding latency and hanging when offline. Try the cache first and
+        download only when the model isn't present yet (first run).
+        """
         try:
             return WhisperModel(
                 self._settings.whisper_model,
                 device=device,
                 compute_type=compute_type,
+                local_files_only=True,
             )
-        except RuntimeError:
-            if device == "cuda":
+        except LocalEntryNotFoundError:
+            return WhisperModel(
+                self._settings.whisper_model,
+                device=device,
+                compute_type=compute_type,
+                local_files_only=False,
+            )
+
+    def _load_model(self, device: str, compute_type: str) -> WhisperModel:
+        """Load WhisperModel, falling back to CPU on CUDA errors."""
+        try:
+            return self._new_model(device, compute_type)
+        except RuntimeError as exc:
+            if device == "cuda" and is_cuda_error(exc):
                 print(
-                    "Warning: CUDA not available at load time, falling back to CPU",
+                    f"Warning: CUDA not available at load time, falling back to CPU: {exc}",
                     file=sys.stderr,
                 )
                 self._device = "cpu"
-                return WhisperModel(
-                    self._settings.whisper_model,
-                    device="cpu",
-                    compute_type="int8",
-                )
+                return self._new_model("cpu", "int8")
             raise
 
-    def _fallback_to_cpu(self) -> None:
-        """Recreate model on CPU after a CUDA runtime failure."""
+    def _fallback_to_cpu(self, exc: Exception) -> None:
+        """Recreate model on CPU after a CUDA runtime failure.
+
+        The real error is printed (not just "CUDA runtime error") so the user can
+        tell an out-of-memory failure from a cuDNN/driver problem.
+        """
         print(
-            "Warning: CUDA runtime error, falling back to CPU",
+            f"Warning: CUDA runtime error, falling back to CPU: {exc}",
             file=sys.stderr,
         )
         self._device = "cpu"
-        self._model = WhisperModel(
-            self._settings.whisper_model,
-            device="cpu",
-            compute_type="int8",
-        )
+        self._model = self._new_model("cpu", "int8")
+        self._batched = self._wrap_batched(self._model)
 
     def transcribe(self, audio_path: Path) -> tuple[list[Segment], dict[str, str | float]]:
         """Transcribe audio file.
@@ -99,10 +131,10 @@ class Transcriber:
         try:
             segments_iter, info = self._invoke_transcribe(audio_path, language)
             segments = self._collect_segments(segments_iter)
-        except RuntimeError:
-            if self._device != "cuda":
+        except RuntimeError as exc:
+            if self._device != "cuda" or not is_cuda_error(exc):
                 raise
-            self._fallback_to_cpu()
+            self._fallback_to_cpu(exc)
             segments_iter, info = self._invoke_transcribe(audio_path, language)
             segments = self._collect_segments(segments_iter)
 
@@ -118,29 +150,48 @@ class Transcriber:
         return segments, info_dict
 
     def _invoke_transcribe(self, audio_path: Path, language: str | None) -> tuple[Any, Any]:
-        """Single point that calls into faster-whisper with the configured args."""
-        return self._model.transcribe(
-            str(audio_path),
-            language=language,
-            beam_size=self._settings.beam_size,
-            vad_filter=self._settings.vad_filter,
-            chunk_length=self._settings.chunk_length,
-            word_timestamps=True,
-            condition_on_previous_text=self._settings.condition_on_previous_text,
-            no_speech_threshold=self._settings.no_speech_threshold,
-        )
+        """Single point that calls into faster-whisper with the configured args.
+
+        Uses the batched pipeline when batch_size > 0, otherwise the plain model.
+        """
+        kwargs: dict[str, Any] = {
+            "language": language,
+            "beam_size": self._settings.beam_size,
+            "temperature": self._settings.temperature,
+            "vad_filter": self._settings.vad_filter,
+            "chunk_length": self._settings.chunk_length,
+            "word_timestamps": True,
+            "condition_on_previous_text": self._settings.condition_on_previous_text,
+            "no_speech_threshold": self._settings.no_speech_threshold,
+            "multilingual": self._settings.multilingual,
+            "language_detection_segments": self._settings.language_detection_segments,
+            "hallucination_silence_threshold": self._settings.hallucination_silence_threshold,
+        }
+        if self._batched is not None:
+            kwargs["batch_size"] = self._settings.batch_size
+            return self._batched.transcribe(str(audio_path), **kwargs)
+        return self._model.transcribe(str(audio_path), **kwargs)
 
     def transcribe_stereo(
-        self, mic_16k: Path, monitor_16k: Path
+        self,
+        mic_16k: Path,
+        monitor_16k: Path,
+        *,
+        on_status: Callable[[str], None] = _noop_status,
     ) -> tuple[list[Segment], list[Segment], dict[str, str | float]]:
         """Transcribe both channels separately.
 
         Returns (mic_segments, monitor_segments, info).
         mic_segments get speaker="You" automatically.
         info from the channel with more total speech duration.
+
+        Each channel is timed separately via on_status so the cost of the mic
+        pass (mostly silence while the user listens) is visible on its own.
         """
-        mic_segments, mic_info = self.transcribe(mic_16k)
-        monitor_segments, monitor_info = self.transcribe(monitor_16k)
+        with stage_timer("transcribe mic", on_status):
+            mic_segments, mic_info = self.transcribe(mic_16k)
+        with stage_timer("transcribe monitor", on_status):
+            monitor_segments, monitor_info = self.transcribe(monitor_16k)
 
         # Assign speaker="You" to mic segments
         mic_segments = [

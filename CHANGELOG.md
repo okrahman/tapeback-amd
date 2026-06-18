@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.6] — 2026-06-18
+
+### Added
+- Per-stage timing in processing output — merge, split, load model, transcribe (mic and monitor separately), diarize, and summarize each report how long they took.
+- Settings to tame wrong-language detection and hallucinations on quiet channels: `TAPEBACK_LANGUAGE_DETECTION_SEGMENTS`, `TAPEBACK_MULTILINGUAL` (per-segment detection for code-switching), and `TAPEBACK_HALLUCINATION_SILENCE_THRESHOLD`.
+- Optional batched inference (`TAPEBACK_BATCH_SIZE`, off by default) — faster-whisper's `BatchedInferencePipeline`, several× faster transcription on GPU.
+
+### Changed
+- Faster post-recording processing: dropped a redundant ffmpeg pass that mixed both channels into a mono file the dual-channel pipeline never used.
+- Faster transcription: default beam size lowered 5→4. The temperature fallback ladder is now exposed via `TAPEBACK_TEMPERATURE` (default keeps the full ladder, which breaks Whisper out of hallucination loops on noisy audio).
+- Cleaner, faster mic channel: the mic is now silenced where you're only listening (mic quiet / monitor dominant) before transcription, so Whisper no longer hallucinates repeat loops on the pauses. Toggle with `TAPEBACK_GATE_MIC_SILENCE`.
+- Whisper model loads from the local cache without contacting HuggingFace on every start — faster startup and no hang when offline (after the first download).
+
+### Fixed
+- CPU fallback during transcription and diarization now triggers only on real CUDA / out-of-memory / cuBLAS errors; unrelated failures surface instead of being masked by a slow CPU retry.
+- The CUDA error that triggers a CPU fallback is now printed in full, so an out-of-memory failure can be told apart from a cuDNN/driver problem.
+- GPU transcription now works on CUDA 13 systems: tapeback preloads the CUDA 12 cuBLAS/cuDNN libraries (nvidia-cublas-cu12, nvidia-cudnn-cu12) on startup so ctranslate2 finds them — no manual LD_LIBRARY_PATH needed.
+
 ## [0.9.5] — 2026-05-21
 
 ### Fixed

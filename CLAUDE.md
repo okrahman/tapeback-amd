@@ -34,7 +34,7 @@ No web servers, databases, Docker.
 - Lint: `uv run ruff check --fix`
 - Format: `uv run ruff format`
 - Type check: `uv run ty check`
-- Test: `uv run pytest` (coverage ≥85% enforced via pyproject.toml)
+- Test: `uv run pytest` (coverage ≥90% enforced via pyproject.toml)
 
 ## Code quality
 
@@ -113,4 +113,5 @@ Before completing any change, verify:
 ## Gotchas
 
 - Comments and logs in English
-- В конце каждой нетривиальной сессии предложи 1–3 пункта в .claude/insights-inbox.md
+- At the end of each non-trivial session, suggest 1–3 items for .claude/insights-inbox.md
+  Notes regarding the migration of permissions from .claude/settings.local.json to .claude/settings.json are also welcome
