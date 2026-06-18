@@ -46,7 +46,12 @@ class Settings(BaseSettings):
     language: str = "auto"
     device: str = "cuda"
     compute_type: str = "auto"  # "int8"/"float16"
-    beam_size: int = 5
+    beam_size: int = 3
+    # Temperature fallback ladder. Decoding starts at 0.0 (deterministic, best
+    # quality) and steps up only when a segment decodes poorly. Upstream goes to
+    # 1.0 in six steps; we stop at 0.4 — high-temperature retries rarely help and
+    # slow down noisy/quiet channels (e.g. the mic).
+    temperature: tuple[float, ...] = (0.0, 0.2, 0.4)
     vad_filter: bool = True
     chunk_length: int = 7  # seconds — max VAD chunk before splitting for Whisper
     condition_on_previous_text: bool = False

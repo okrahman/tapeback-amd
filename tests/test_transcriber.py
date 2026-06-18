@@ -174,3 +174,20 @@ def test_transcribe_passes_language_and_hallucination_settings(settings):
     assert kwargs["multilingual"] is True
     assert kwargs["language_detection_segments"] == 4
     assert kwargs["hallucination_silence_threshold"] == 2.0
+
+
+def test_transcribe_passes_beam_size_and_temperature(settings):
+    """beam_size and the temperature fallback ladder reach Whisper."""
+    s = settings.model_copy(update={"device": "cpu", "beam_size": 3, "temperature": (0.0, 0.2)})
+    info = MagicMock()
+    info.language, info.language_probability, info.duration = "en", 0.9, 1.0
+
+    with patch("tapeback.transcriber.WhisperModel") as mock_model_cls:
+        instance = mock_model_cls.return_value
+        instance.transcribe.return_value = (iter([]), info)
+
+        Transcriber(s).transcribe(Path("/fake/audio.wav"))
+        kwargs = instance.transcribe.call_args.kwargs
+
+    assert kwargs["beam_size"] == 3
+    assert kwargs["temperature"] == (0.0, 0.2)

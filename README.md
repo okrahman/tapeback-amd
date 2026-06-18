@@ -303,7 +303,8 @@ All settings via environment variables (prefix `TAPEBACK_`) or
 | `TAPEBACK_LANGUAGE` | `auto` | Language code (`auto` for auto-detection, or `en`, `ru`, `fr`, etc.) |
 | `TAPEBACK_DEVICE` | `cuda` | `cuda` or `cpu` |
 | `TAPEBACK_COMPUTE_TYPE` | `auto` | `auto`, `float16`, `int8`, or `float32` (`auto` → `float16` on CUDA, `int8` on CPU; pin `int8` if your GPU is memory-tight) |
-| `TAPEBACK_BEAM_SIZE` | `5` | Whisper beam search width |
+| `TAPEBACK_BEAM_SIZE` | `3` | Whisper beam search width (lower = faster, slightly less accurate) |
+| `TAPEBACK_TEMPERATURE` | `[0.0, 0.2, 0.4]` | Temperature fallback ladder; decoding starts at `0.0` and steps up only on poorly-decoded segments. Shorten (e.g. `[0.0]`) for more speed |
 | `TAPEBACK_CHUNK_LENGTH` | `7` | Max VAD chunk (seconds) before splitting for Whisper; prevents lost speech after long pauses |
 | `TAPEBACK_NO_SPEECH_THRESHOLD` | `0.4` | Whisper silence-rejection threshold (lower = more aggressive; suppresses training-data hallucinations on pauses) |
 | `TAPEBACK_LANGUAGE_DETECTION_SEGMENTS` | `1` | Segments probed before deciding the language; raise (e.g. `4`) if a channel that starts silent gets the wrong language |

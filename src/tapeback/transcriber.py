@@ -147,6 +147,7 @@ class Transcriber:
             str(audio_path),
             language=language,
             beam_size=self._settings.beam_size,
+            temperature=self._settings.temperature,
             vad_filter=self._settings.vad_filter,
             chunk_length=self._settings.chunk_length,
             word_timestamps=True,

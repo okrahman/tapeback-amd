@@ -13,6 +13,7 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 - Faster post-recording processing: dropped a redundant ffmpeg pass that mixed both channels into a mono file the dual-channel pipeline never used.
+- Faster transcription: default beam size lowered 5→3 and the temperature fallback ladder shortened to `[0.0, 0.2, 0.4]` (the high-temperature retries rarely helped and slowed quiet channels). Configurable via `TAPEBACK_BEAM_SIZE` / `TAPEBACK_TEMPERATURE`.
 - Whisper model loads from the local cache without contacting HuggingFace on every start — faster startup and no hang when offline (after the first download).
 
 ### Fixed
