@@ -33,7 +33,8 @@ yay -S tapeback                              # recording + transcription
 yay -S tapeback tapeback-tray                # + system tray icon
 yay -S tapeback tapeback-llm                 # + LLM summaries
 yay -S tapeback tapeback-diarize             # + speaker diarization
-yay -S tapeback tapeback-tray tapeback-llm tapeback-diarize  # everything
+yay -S tapeback tapeback-cuda                # + GPU transcription on CUDA 13 systems
+yay -S tapeback tapeback-tray tapeback-llm tapeback-diarize tapeback-cuda  # everything
 ```
 
 All system dependencies (ffmpeg, PipeWire) are installed automatically.
@@ -52,6 +53,7 @@ sudo apt install ./tapeback_0.9.5_amd64.deb
 sudo apt install ./tapeback-tray_0.9.5_all.deb       # tray icon
 sudo apt install ./tapeback-llm_0.9.5_all.deb        # LLM summaries
 sudo apt install ./tapeback-diarize_0.9.5_all.deb    # speaker diarization
+sudo apt install ./tapeback-cuda_0.9.5_all.deb       # GPU transcription on CUDA 13
 ```
 
 The base package bundles its own Python interpreter (from
@@ -371,7 +373,17 @@ built against CUDA 12 and can't find `libcublas.so.12` / `libcudnn.so.9`. Diariz
 Install the CUDA 12 runtime libraries — tapeback preloads them automatically:
 
 ```bash
+# Arch (AUR) — recommended:
+yay -S tapeback-cuda
+
+# Ubuntu/Debian (.deb): install the matching tapeback-cuda_*.deb
+
+# pip / uv install (your own environment):
 uv pip install nvidia-cublas-cu12 nvidia-cudnn-cu12
+
+# AUR/.deb done manually (bundled venv): for Arch use /opt/tapeback/bin/pip,
+# for .deb use /opt/tapeback/venv/bin/pip
+sudo /opt/tapeback/bin/pip install nvidia-cublas-cu12 nvidia-cudnn-cu12
 ```
 
 They install alongside the CUDA 13 libraries without conflict. No `LD_LIBRARY_PATH`
@@ -398,7 +410,7 @@ Fixes, in order of reliability:
 
 ```bash
 # Arch Linux
-yay -R tapeback tapeback-tray tapeback-diarize tapeback-llm
+yay -R tapeback tapeback-tray tapeback-diarize tapeback-llm tapeback-cuda
 
 # pip / uv
 uv tool uninstall tapeback

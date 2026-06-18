@@ -103,6 +103,7 @@ echo "==> Running nfpm"
 for cfg in \
     packaging/deb/nfpm-tapeback.yaml \
     packaging/deb/nfpm-tapeback-diarize.yaml \
+    packaging/deb/nfpm-tapeback-cuda.yaml \
     packaging/deb/nfpm-tapeback-llm.yaml \
     packaging/deb/nfpm-tapeback-tray.yaml
 do

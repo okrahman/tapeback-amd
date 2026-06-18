@@ -1,0 +1,21 @@
+name: tapeback-cuda
+arch: all
+platform: linux
+version: ${VERSION}
+section: sound
+priority: optional
+maintainer: "Yast <yastcher@gmail.com>"
+description: |
+  CUDA 12 cuBLAS/cuDNN runtime for GPU-accelerated transcription in tapeback.
+  Meta-package: the CUDA 12 wheels (~700 MB) are pulled in by the post-install
+  hook into /opt/tapeback/'s virtualenv. faster-whisper's ctranslate2 needs
+  libcublas.so.12 / libcudnn.so.9, which are absent on CUDA 13 systems.
+homepage: https://github.com/yastcher/tapeback
+license: Apache-2.0
+
+depends:
+  - tapeback (= ${VERSION})
+
+scripts:
+  postinstall: ./packaging/deb/postinst/tapeback-cuda.sh
+  preremove: ./packaging/deb/prerm/tapeback-cuda.sh
