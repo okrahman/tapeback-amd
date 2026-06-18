@@ -9,6 +9,7 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 - Per-stage timing in processing output — merge, split, load model, transcribe (mic and monitor separately), diarize, and summarize each report how long they took.
+- Settings to tame wrong-language detection and hallucinations on quiet channels: `TAPEBACK_LANGUAGE_DETECTION_SEGMENTS`, `TAPEBACK_MULTILINGUAL` (per-segment detection for code-switching), and `TAPEBACK_HALLUCINATION_SILENCE_THRESHOLD`.
 
 ### Changed
 - Faster post-recording processing: dropped a redundant ffmpeg pass that mixed both channels into a mono file the dual-channel pipeline never used.
@@ -17,6 +18,7 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Fixed
 - CPU fallback during transcription and diarization now triggers only on real CUDA / out-of-memory / cuBLAS errors; unrelated failures surface instead of being masked by a slow CPU retry.
 - The CUDA error that triggers a CPU fallback is now printed in full, so an out-of-memory failure can be told apart from a cuDNN/driver problem.
+- GPU transcription now works on CUDA 13 systems: tapeback preloads the CUDA 12 cuBLAS/cuDNN libraries (nvidia-cublas-cu12, nvidia-cudnn-cu12) on startup so ctranslate2 finds them — no manual LD_LIBRARY_PATH needed.
 
 ## [0.9.5] — 2026-05-21
 

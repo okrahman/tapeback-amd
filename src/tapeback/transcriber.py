@@ -9,7 +9,7 @@ from faster_whisper import WhisperModel
 from huggingface_hub.errors import LocalEntryNotFoundError
 
 from tapeback import const
-from tapeback._gpu import is_cuda_error
+from tapeback._gpu import is_cuda_error, preload_cuda_libs
 from tapeback._timing import stage_timer
 from tapeback.models import Segment, Word
 from tapeback.settings import Settings
@@ -53,6 +53,9 @@ class Transcriber:
         """
         self._settings = settings
         self._device = settings.device
+        if settings.device == "cuda":
+            # Make ctranslate2 (CUDA 12) find cuBLAS/cuDNN on CUDA 13 systems.
+            preload_cuda_libs()
         compute_type = _resolve_compute_type(settings.compute_type, settings.device)
         self._model = self._load_model(settings.device, compute_type)
 
@@ -149,6 +152,9 @@ class Transcriber:
             word_timestamps=True,
             condition_on_previous_text=self._settings.condition_on_previous_text,
             no_speech_threshold=self._settings.no_speech_threshold,
+            multilingual=self._settings.multilingual,
+            language_detection_segments=self._settings.language_detection_segments,
+            hallucination_silence_threshold=self._settings.hallucination_silence_threshold,
         )
 
     def transcribe_stereo(

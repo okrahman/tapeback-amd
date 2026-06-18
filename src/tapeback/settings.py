@@ -53,6 +53,18 @@ class Settings(BaseSettings):
     # Lower = more aggressive silence rejection (helps suppress Whisper training-data
     # hallucinations like "Субтитры DimaTorzok" on long pauses). Default in Whisper is 0.6.
     no_speech_threshold: float = Field(default=0.4, ge=0.0, le=1.0)
+    # Number of segments probed before deciding the language. faster-whisper's default
+    # of 1 picks the language from the first segment, which misfires when a channel
+    # starts with silence (e.g. mic while the user only listens — it can guess Japanese
+    # and hallucinate). Raise it to probe more speech before committing.
+    language_detection_segments: int = Field(default=1, ge=1)
+    # Per-segment language detection — allows mixed languages in one recording
+    # (code-switching, e.g. Russian speech with English terms). Less stable than a
+    # fixed language; opt-in.
+    multilingual: bool = False
+    # Skip silent gaps longer than this many seconds when a hallucination is detected
+    # (uses word timestamps, which are always on). None disables it.
+    hallucination_silence_threshold: float | None = Field(default=None, ge=0.0)
 
     # Audio
     monitor_source: str = "auto"

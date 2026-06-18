@@ -149,3 +149,28 @@ def test_transcribe_stereo_reports_per_channel_timings(settings):
 
     assert any(m.startswith("Stage 'transcribe mic'") for m in messages)
     assert any(m.startswith("Stage 'transcribe monitor'") for m in messages)
+
+
+def test_transcribe_passes_language_and_hallucination_settings(settings):
+    """multilingual / language_detection_segments / hallucination threshold reach Whisper."""
+    s = settings.model_copy(
+        update={
+            "device": "cpu",
+            "multilingual": True,
+            "language_detection_segments": 4,
+            "hallucination_silence_threshold": 2.0,
+        }
+    )
+    info = MagicMock()
+    info.language, info.language_probability, info.duration = "en", 0.9, 1.0
+
+    with patch("tapeback.transcriber.WhisperModel") as mock_model_cls:
+        instance = mock_model_cls.return_value
+        instance.transcribe.return_value = (iter([]), info)
+
+        Transcriber(s).transcribe(Path("/fake/audio.wav"))
+        kwargs = instance.transcribe.call_args.kwargs
+
+    assert kwargs["multilingual"] is True
+    assert kwargs["language_detection_segments"] == 4
+    assert kwargs["hallucination_silence_threshold"] == 2.0
