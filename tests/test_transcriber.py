@@ -191,3 +191,41 @@ def test_transcribe_passes_beam_size_and_temperature(settings):
 
     assert kwargs["beam_size"] == 3
     assert kwargs["temperature"] == (0.0, 0.2)
+
+
+def test_batched_inference_used_when_batch_size_positive(settings):
+    """batch_size > 0 routes transcription through BatchedInferencePipeline."""
+    s = settings.model_copy(update={"device": "cpu", "batch_size": 8})
+    info = MagicMock()
+    info.language, info.language_probability, info.duration = "en", 0.9, 1.0
+
+    with (
+        patch("tapeback.transcriber.WhisperModel") as mock_model_cls,
+        patch("tapeback.transcriber.BatchedInferencePipeline") as mock_batched_cls,
+    ):
+        batched = mock_batched_cls.return_value
+        batched.transcribe.return_value = (iter([]), info)
+
+        Transcriber(s).transcribe(Path("/fake/audio.wav"))
+
+    assert batched.transcribe.call_args.kwargs["batch_size"] == 8
+    mock_model_cls.return_value.transcribe.assert_not_called()
+
+
+def test_plain_inference_when_batch_size_zero(settings):
+    """batch_size == 0 keeps the plain (non-batched) path."""
+    s = settings.model_copy(update={"device": "cpu", "batch_size": 0})
+    info = MagicMock()
+    info.language, info.language_probability, info.duration = "en", 0.9, 1.0
+
+    with (
+        patch("tapeback.transcriber.WhisperModel") as mock_model_cls,
+        patch("tapeback.transcriber.BatchedInferencePipeline") as mock_batched_cls,
+    ):
+        instance = mock_model_cls.return_value
+        instance.transcribe.return_value = (iter([]), info)
+
+        Transcriber(s).transcribe(Path("/fake/audio.wav"))
+
+    instance.transcribe.assert_called_once()
+    mock_batched_cls.assert_not_called()

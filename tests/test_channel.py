@@ -6,6 +6,7 @@ import pytest
 from tapeback.channel import (
     classify_segment_by_channel,
     filter_silent_segments,
+    gate_inactive_regions,
     identify_user_speaker,
     load_stereo_channels,
     split_on_silence,
@@ -103,6 +104,24 @@ def test_classify_segment_by_channel_empty_range_is_none():
     monitor = np.zeros(sr, dtype=np.float32)
 
     assert classify_segment_by_channel(0.5, 0.5, mic, monitor, sr) is None
+
+
+def test_gate_inactive_regions_silences_listening_windows():
+    """Windows where the user listens (mic quiet / monitor dominant) are zeroed;
+    windows where the user speaks are preserved — so Whisper never sees the silence.
+    """
+    raw_sr = 48000
+    out_sr = 16000
+    # 0-1s: user speaks (mic loud, monitor quiet). 1-2s: user listens (mic quiet, monitor loud).
+    mic_raw = np.concatenate([np.full(raw_sr, 5000.0), np.zeros(raw_sr)]).astype(np.float32)
+    monitor_raw = np.concatenate([np.zeros(raw_sr), np.full(raw_sr, 5000.0)]).astype(np.float32)
+    target_16k = np.full(2 * out_sr, 1000.0, dtype=np.float32)
+
+    gated = gate_inactive_regions(target_16k, mic_raw, monitor_raw, raw_sr)
+
+    assert np.any(gated[:out_sr] != 0)  # speech region preserved
+    assert np.all(gated[out_sr:] == 0)  # listening region silenced
+    assert target_16k[out_sr] == 1000.0  # input not mutated
 
 
 def test_load_stereo_channels_rejects_mono(tmp_path):

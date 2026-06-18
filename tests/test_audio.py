@@ -2,9 +2,15 @@ import shutil
 import wave
 from unittest.mock import patch
 
+import numpy as np
 import pytest
 
-from tapeback.audio import convert_to_mono16k, merge_channels, split_channels_16k
+from tapeback.audio import (
+    convert_to_mono16k,
+    gate_wav_inactive,
+    merge_channels,
+    split_channels_16k,
+)
 from tests.fixtures import create_silent_wav, create_stereo_wav
 
 
@@ -69,6 +75,30 @@ def test_split_channels_16k(tmp_path):
     with wave.open(str(monitor_16k), "rb") as wf:
         assert wf.getnchannels() == 1
         assert wf.getframerate() == 16000
+
+
+def test_gate_wav_inactive_silences_listening_region(tmp_path):
+    """gate_wav_inactive zeroes the listening half of a 16k mic WAV in place."""
+    sr_16k = 16000
+    raw_sr = 48000
+    mic_path = tmp_path / "mic_16k.wav"
+    samples = np.full(2 * sr_16k, 8000, dtype=np.int16)
+    with wave.open(str(mic_path), "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sr_16k)
+        wf.writeframes(samples.tobytes())
+
+    # User speaks the first second, listens the second (mic quiet, monitor loud).
+    mic_raw = np.concatenate([np.full(raw_sr, 5000.0), np.zeros(raw_sr)]).astype(np.float32)
+    monitor_raw = np.concatenate([np.zeros(raw_sr), np.full(raw_sr, 5000.0)]).astype(np.float32)
+
+    gate_wav_inactive(mic_path, mic_raw, monitor_raw, raw_sr)
+
+    with wave.open(str(mic_path), "rb") as wf:
+        out = np.frombuffer(wf.readframes(wf.getnframes()), dtype=np.int16)
+    assert np.any(out[:sr_16k] != 0)
+    assert np.all(out[sr_16k:] == 0)
 
 
 def test_empty_file_raises(tmp_path):

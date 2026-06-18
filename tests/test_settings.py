@@ -34,8 +34,8 @@ def test_settings_defaults(tmp_vault):
     assert s.language == "auto"
     assert s.device == "cuda"
     assert s.compute_type == "auto"
-    assert s.beam_size == 3
-    assert s.temperature == (0.0, 0.2, 0.4)
+    assert s.beam_size == 4
+    assert s.temperature == (0.0, 0.2, 0.4, 0.6, 0.8, 1.0)
     assert s.vad_filter is True
     assert s.monitor_source == "auto"
     assert s.mic_source == "auto"

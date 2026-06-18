@@ -4,7 +4,10 @@ import sys
 import wave
 from pathlib import Path
 
+import numpy as np
+
 from tapeback import const
+from tapeback.channel import gate_inactive_regions
 
 
 def _check_ffmpeg() -> None:
@@ -163,3 +166,29 @@ def convert_to_mono16k(input_file: Path, output_dir: Path) -> Path:
     )
 
     return output_path
+
+
+def gate_wav_inactive(
+    wav_path: Path,
+    target_raw: np.ndarray,
+    other_raw: np.ndarray,
+    raw_sr: int,
+) -> None:
+    """Silence the listening regions of a 16 kHz mono WAV in place.
+
+    Reads the WAV, zeroes windows where the speaker is inactive (see
+    channel.gate_inactive_regions), and writes it back — so Whisper never sees the
+    mic channel's pauses and can't hallucinate loops on them.
+    """
+    with wave.open(str(wav_path), "rb") as wf:
+        sample_rate = wf.getframerate()
+        frames = wf.readframes(wf.getnframes())
+
+    samples = np.frombuffer(frames, dtype=np.int16).astype(np.float32)
+    gated = gate_inactive_regions(samples, target_raw, other_raw, raw_sr)
+
+    with wave.open(str(wav_path), "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sample_rate)
+        wf.writeframes(gated.astype(np.int16).tobytes())

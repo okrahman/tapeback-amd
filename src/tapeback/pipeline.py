@@ -15,7 +15,13 @@ from tapeback import const
 from tapeback._gpu import free_gpu_memory
 from tapeback._lazy import load_transcriber
 from tapeback._timing import stage_timer
-from tapeback.audio import convert_to_mono16k, get_channel_count, merge_channels, split_channels_16k
+from tapeback.audio import (
+    convert_to_mono16k,
+    gate_wav_inactive,
+    get_channel_count,
+    merge_channels,
+    split_channels_16k,
+)
 from tapeback.channel import (
     classify_segment_by_channel,
     filter_silent_segments,
@@ -182,6 +188,10 @@ def process_stereo_file(
     on_status("Splitting channels...")
     with stage_timer("split", on_status):
         mic_16k, monitor_16k = split_channels_16k(stereo_path, output_dir)
+
+    if settings.gate_mic_silence:
+        # Silence the mic where the user only listens, so Whisper doesn't loop on it.
+        gate_wav_inactive(mic_16k, mic_raw, monitor_raw, raw_sr)
 
     on_status("Transcribing (this may take a few minutes)...")
     with stage_timer("load model", on_status):

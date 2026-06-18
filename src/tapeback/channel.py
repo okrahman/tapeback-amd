@@ -68,6 +68,38 @@ def filter_silent_segments(
     return result
 
 
+def gate_inactive_regions(
+    target_16k: np.ndarray,
+    target_raw: np.ndarray,
+    other_raw: np.ndarray,
+    raw_sr: int,
+    rms_threshold: float = 200.0,
+) -> np.ndarray:
+    """Zero windows of target_16k where the speaker is inactive.
+
+    A window is inactive when the target channel is quiet (RMS below threshold)
+    or the other channel dominates it (target_rms < other_rms * factor) — i.e.
+    the user is listening, not speaking. Silencing these regions before Whisper
+    stops it hallucinating repeat loops on them (which is both slow and garbage).
+
+    Windows are mapped by time: target_16k is 16 kHz, the raw channels may be a
+    different rate. Energy is measured on the raw (pre-loudnorm) channels so
+    normalization doesn't inflate background noise. Input is not mutated.
+    """
+    out = target_16k.copy()
+    out_sr = const.SAMPLE_RATE_16K
+    window_samples = max(1, int(const.SILENCE_WINDOW_SEC * out_sr))
+    for start in range(0, len(out), window_samples):
+        t0 = start / out_sr
+        t1 = (start + window_samples) / out_sr
+        target_rms = _rms_for_range(t0, t1, target_raw, raw_sr)
+        other_rms = _rms_for_range(t0, t1, other_raw, raw_sr)
+        listening = other_rms > 0 and target_rms < other_rms * const.SILENCE_MONITOR_FACTOR
+        if target_rms < rms_threshold or listening:
+            out[start : start + window_samples] = 0.0
+    return out
+
+
 def _compute_window_rms(
     mic_samples: np.ndarray,
     monitor_samples: np.ndarray | None,

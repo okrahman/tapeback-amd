@@ -5,7 +5,7 @@ from collections.abc import Callable, Iterable
 from pathlib import Path
 from typing import Any
 
-from faster_whisper import WhisperModel
+from faster_whisper import BatchedInferencePipeline, WhisperModel
 from huggingface_hub.errors import LocalEntryNotFoundError
 
 from tapeback import const
@@ -58,6 +58,13 @@ class Transcriber:
             preload_cuda_libs()
         compute_type = _resolve_compute_type(settings.compute_type, settings.device)
         self._model = self._load_model(settings.device, compute_type)
+        self._batched = self._wrap_batched(self._model)
+
+    def _wrap_batched(self, model: WhisperModel) -> BatchedInferencePipeline | None:
+        """Wrap the model for batched inference when batch_size > 0 (faster on GPU)."""
+        if self._settings.batch_size > 0:
+            return BatchedInferencePipeline(model=model)
+        return None
 
     def _new_model(self, device: str, compute_type: str) -> WhisperModel:
         """Instantiate WhisperModel, preferring the local cache.
@@ -107,6 +114,7 @@ class Transcriber:
         )
         self._device = "cpu"
         self._model = self._new_model("cpu", "int8")
+        self._batched = self._wrap_batched(self._model)
 
     def transcribe(self, audio_path: Path) -> tuple[list[Segment], dict[str, str | float]]:
         """Transcribe audio file.
@@ -142,21 +150,27 @@ class Transcriber:
         return segments, info_dict
 
     def _invoke_transcribe(self, audio_path: Path, language: str | None) -> tuple[Any, Any]:
-        """Single point that calls into faster-whisper with the configured args."""
-        return self._model.transcribe(
-            str(audio_path),
-            language=language,
-            beam_size=self._settings.beam_size,
-            temperature=self._settings.temperature,
-            vad_filter=self._settings.vad_filter,
-            chunk_length=self._settings.chunk_length,
-            word_timestamps=True,
-            condition_on_previous_text=self._settings.condition_on_previous_text,
-            no_speech_threshold=self._settings.no_speech_threshold,
-            multilingual=self._settings.multilingual,
-            language_detection_segments=self._settings.language_detection_segments,
-            hallucination_silence_threshold=self._settings.hallucination_silence_threshold,
-        )
+        """Single point that calls into faster-whisper with the configured args.
+
+        Uses the batched pipeline when batch_size > 0, otherwise the plain model.
+        """
+        kwargs: dict[str, Any] = {
+            "language": language,
+            "beam_size": self._settings.beam_size,
+            "temperature": self._settings.temperature,
+            "vad_filter": self._settings.vad_filter,
+            "chunk_length": self._settings.chunk_length,
+            "word_timestamps": True,
+            "condition_on_previous_text": self._settings.condition_on_previous_text,
+            "no_speech_threshold": self._settings.no_speech_threshold,
+            "multilingual": self._settings.multilingual,
+            "language_detection_segments": self._settings.language_detection_segments,
+            "hallucination_silence_threshold": self._settings.hallucination_silence_threshold,
+        }
+        if self._batched is not None:
+            kwargs["batch_size"] = self._settings.batch_size
+            return self._batched.transcribe(str(audio_path), **kwargs)
+        return self._model.transcribe(str(audio_path), **kwargs)
 
     def transcribe_stereo(
         self,

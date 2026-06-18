@@ -5,15 +5,17 @@ All notable changes to this project will be documented in this file.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.9.6] — 2026-06-17
+## [0.9.6] — 2026-06-18
 
 ### Added
 - Per-stage timing in processing output — merge, split, load model, transcribe (mic and monitor separately), diarize, and summarize each report how long they took.
 - Settings to tame wrong-language detection and hallucinations on quiet channels: `TAPEBACK_LANGUAGE_DETECTION_SEGMENTS`, `TAPEBACK_MULTILINGUAL` (per-segment detection for code-switching), and `TAPEBACK_HALLUCINATION_SILENCE_THRESHOLD`.
+- Optional batched inference (`TAPEBACK_BATCH_SIZE`, off by default) — faster-whisper's `BatchedInferencePipeline`, several× faster transcription on GPU.
 
 ### Changed
 - Faster post-recording processing: dropped a redundant ffmpeg pass that mixed both channels into a mono file the dual-channel pipeline never used.
-- Faster transcription: default beam size lowered 5→3 and the temperature fallback ladder shortened to `[0.0, 0.2, 0.4]` (the high-temperature retries rarely helped and slowed quiet channels). Configurable via `TAPEBACK_BEAM_SIZE` / `TAPEBACK_TEMPERATURE`.
+- Faster transcription: default beam size lowered 5→4. The temperature fallback ladder is now exposed via `TAPEBACK_TEMPERATURE` (default keeps the full ladder, which breaks Whisper out of hallucination loops on noisy audio).
+- Cleaner, faster mic channel: the mic is now silenced where you're only listening (mic quiet / monitor dominant) before transcription, so Whisper no longer hallucinates repeat loops on the pauses. Toggle with `TAPEBACK_GATE_MIC_SILENCE`.
 - Whisper model loads from the local cache without contacting HuggingFace on every start — faster startup and no hang when offline (after the first download).
 
 ### Fixed

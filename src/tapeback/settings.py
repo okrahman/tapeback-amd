@@ -46,12 +46,17 @@ class Settings(BaseSettings):
     language: str = "auto"
     device: str = "cuda"
     compute_type: str = "auto"  # "int8"/"float16"
-    beam_size: int = 3
+    beam_size: int = 4
     # Temperature fallback ladder. Decoding starts at 0.0 (deterministic, best
-    # quality) and steps up only when a segment decodes poorly. Upstream goes to
-    # 1.0 in six steps; we stop at 0.4 — high-temperature retries rarely help and
-    # slow down noisy/quiet channels (e.g. the mic).
-    temperature: tuple[float, ...] = (0.0, 0.2, 0.4)
+    # quality) and steps up only when a segment decodes poorly. The HIGH steps are
+    # what break Whisper out of hallucination loops on noisy/quiet input — keep the
+    # full ladder. Shortening it makes the model get STUCK in repeat loops, which is
+    # both slower (it generates tokens up to the limit) and worse (repeats in text).
+    temperature: tuple[float, ...] = (0.0, 0.2, 0.4, 0.6, 0.8, 1.0)
+    # Batched inference (faster-whisper BatchedInferencePipeline): processes VAD
+    # segments in parallel batches — several times faster on GPU. Off by default
+    # (0) since it can OOM small GPUs; set e.g. TAPEBACK_BATCH_SIZE=8 to enable.
+    batch_size: int = Field(default=0, ge=0)
     vad_filter: bool = True
     chunk_length: int = 7  # seconds — max VAD chunk before splitting for Whisper
     condition_on_previous_text: bool = False
@@ -88,6 +93,10 @@ class Settings(BaseSettings):
 
     # Post-processing
     pause_threshold: float = Field(default=1.0, ge=0.0)  # split on word gaps >= this
+    # Silence the mic channel where the user is listening (mic quiet or monitor
+    # dominant) before transcription, so Whisper doesn't hallucinate loops on the
+    # pauses (slow + garbage). Dual-channel (stereo) pipeline only.
+    gate_mic_silence: bool = True
 
     # Live transcription — opt-in. Off by default because mid-recording GPU
     # contention with the post-recording pipeline causes long stalls on small
