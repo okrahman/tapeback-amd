@@ -27,7 +27,7 @@ def filter_silent_segments(
     segments: list[Segment],
     channel_samples: np.ndarray,
     sample_rate: int,
-    rms_threshold: float = 200.0,
+    rms_threshold: float = const.SILENCE_RMS_THRESHOLD,
 ) -> list[Segment]:
     """Remove segments (or parts of segments) where channel RMS is below threshold.
 
@@ -73,7 +73,7 @@ def gate_inactive_regions(
     target_raw: np.ndarray,
     other_raw: np.ndarray,
     raw_sr: int,
-    rms_threshold: float = 200.0,
+    rms_threshold: float = const.SILENCE_RMS_THRESHOLD,
 ) -> np.ndarray:
     """Zero windows of target_16k where the speaker is inactive.
 

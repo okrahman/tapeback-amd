@@ -46,8 +46,9 @@ jobs:
               return;
             }
 
+            const MAX_DIFF_CHARS = 30000;  // keep the prompt within model limits
             const fs = require('fs');
-            const diff = fs.readFileSync('/tmp/diff.txt', 'utf8').slice(0, 30000);
+            const diff = fs.readFileSync('/tmp/diff.txt', 'utf8').slice(0, MAX_DIFF_CHARS);
             if (!diff.trim()) {
               console.log('Empty diff, nothing to review');
               return;
@@ -68,6 +69,12 @@ jobs:
             - Comments and logs in English; keep each file under 500 lines.
             - Flag performance regressions, code duplication, and broad except clauses that
               silently swallow errors (e.g. an unconditional CUDA->CPU fallback).
+
+            Avoid false positives:
+            - A removed line in .gitignore means that path is NO LONGER ignored (now tracked),
+              not that the file was deleted.
+            - The diff can be partial: a symbol can be defined, called, or imported in a file not
+              shown. Don't report something as missing/uncalled unless the diff itself removes it.
 
             Be concise. Group findings by severity (P0/P1/P2). If the diff looks good, say so briefly.
 
