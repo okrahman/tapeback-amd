@@ -45,6 +45,21 @@ requires_dbus_next = pytest.mark.skipif(
 # --- pytest fixtures ---
 
 
+@pytest.fixture(autouse=True)
+def isolate_settings_sources(monkeypatch):
+    """Cut Settings off from the developer's real configuration.
+
+    Settings reads ~/.config/tapeback/.env and ./.env, so without this every test
+    that constructs Settings() inherits whatever the machine happens to have
+    configured. That makes results machine-dependent: a developer with
+    TAPEBACK_CHUNK_LENGTH=2 in their user config sees different values than CI.
+    Isolation is by construction — no test should depend on the ambient config.
+    """
+    monkeypatch.setitem(Settings.model_config, "env_file", ())
+    for name in [key for key in os.environ if key.startswith("TAPEBACK_")]:
+        monkeypatch.delenv(name, raising=False)
+
+
 @pytest.fixture
 def tmp_vault(tmp_path):
     """Temporary Obsidian vault for tests."""

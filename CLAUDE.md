@@ -10,9 +10,11 @@ No web servers, databases, Docker.
 
 ## Safety rules
 
-- Всегда сначала надо решить причину проблемы, а не следствие.
-- Не подавлять warnings/errors/логи, не разобравшись в причине. Сначала спросить: это наш баг, баг зависимости, или информационное сообщение? Подавлять можно только осознанно и с объяснением почему.
-- Перед планированием надо продумать оптимальную систему типов.
+- Always fix the cause of a problem, never the symptom.
+- Never suppress warnings/errors/logs without understanding the cause first. Ask: is this our bug, a dependency bug, or an informational message? Suppress only deliberately, with an explanation of why.
+- Design the optimal type system before planning the implementation.
+- Never claim something doesn't exist without verifying first. Check the actual files/directories before making statements.
+- Always propose solutions that make sense. No workarounds or hacks unless explicitly asked.
 - Never delete or overwrite files without backup or user confirmation
 - Never delete files not tracked in git. Run `git ls-files <path>` before removing any file. If untracked — ask user.
 - Never simplify architecture by removing existing features unless explicitly asked.
@@ -38,6 +40,8 @@ No web servers, databases, Docker.
 
 ## Code quality
 
+- Prefer the simplest solution that works. Don't add layers (extra abstractions, design patterns, indirection) unless they solve a real, present problem. If a flat approach does the job — use it.
+- The existing codebase is not a reference to copy from blindly. Question patterns — if existing code has an antipattern, write better code, don't propagate it.
 - No magic numbers in logic. Thresholds, limits, sizes, ratios — all go into `settings.py` as named settings with `TAPEBACK_` env vars, or into `const.py` as module-level constants. Function parameter defaults are not a substitute for proper settings.
 - Values used in multiple modules go into `const.py`. Values used only in one module stay as module-level constants in that module. Configurable values go into `settings.py`.
 - No local imports inside functions. All imports at the top of the file.
@@ -58,6 +62,10 @@ Do not duplicate ruff rules here — if ruff can check it, ruff owns it.
 - E2E tests in `tests/test_e2e_quality.py` — run with `TAPEBACK_RUN_E2E=1`
 - Regression tests (bug-fix) in `tests/regressions/`
 - **Hardcode expected values in tests**: don't reuse the same constant in test and production code. If `const.SPEAKER_YOU = "You"`, the test should assert `== "You"`, not `== const.SPEAKER_YOU`.
+- **Assert exact values, not ranges**: `assert count == 2`, not `assert count >= 1`. Weak assertions hide bugs. If an assertion has to be loose, the test is measuring the wrong thing — fix the seam instead (e.g. inject a clock) rather than weakening the assert.
+- **Boundary values**: test the exact boundary (`==`), one below and one above. A `>=` in production code must have a test where left equals right.
+- **Test both branches of conditionals**: if code has `if x: A else: B`, test both paths.
+- **Isolation by construction, never by cleanup**: a test must not depend on leftover state from another test. Scope every assertion to what the test itself created.
 - **Bug fix workflow**: every fix MUST start with a failing test that reproduces the bug.
   Write the test first, verify it fails, then apply the fix and verify the test passes.
   This prevents regressions and documents the exact failure scenario.
@@ -97,10 +105,12 @@ Do not duplicate ruff rules here — if ruff can check it, ruff owns it.
 3. `uv run ty check`
 4. `uv run pytest`
 5. Security review (see checklist below)
-6. **Always update README.md** when features, settings, commands, or architecture change
-7. **Always update CHANGELOG.md** — check `git tag` first; if top section is already released, bump patch version
+6. **Tech lead review**: re-read your own diff as a strict reviewer. Look for overengineering, antipatterns copied from existing code, unnecessary complexity, and assertions weakened to make a test pass. Fix what you find before finishing.
+7. **Always update README.md** — re-read it and verify it still matches current functionality, settings, commands and architecture. It rots silently; check, don't assume.
+8. **Always update CHANGELOG.md** — check `git tag` first; if top section is already released, bump patch version
+9. **Propose a commit message** (Conventional Commits). `git commit` is blocked, so the user runs it — hand them the exact message. Split into several commits when the diff exceeds ~500 lines or mixes concerns (e.g. `docs:` separate from `feat:`).
 
-Do not finish until lint, types, and tests pass.
+Do not finish until lint, types, tests, security review, and tech lead review pass.
 
 ## Security review checklist
 
@@ -112,6 +122,6 @@ Before completing any change, verify:
 
 ## Gotchas
 
-- Comments and logs in English
+- **Everything committed to git is in English** — code, comments, logs, README, CHANGELOG, CLAUDE.md, specs in `.claude/plans/`, commit messages. This is an open-source project read by people who don't speak Russian. Chat replies to the user follow the user's language; files do not. Russian is fine only as *data* (e.g. quoted Whisper hallucination strings, Russian-speech test fixtures).
 - At the end of each non-trivial session, suggest 1–3 items for .claude/insights-inbox.md
   Notes regarding the migration of permissions from .claude/settings.local.json to .claude/settings.json are also welcome

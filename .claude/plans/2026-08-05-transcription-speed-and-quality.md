@@ -1,6 +1,6 @@
 # Spec: transcription speed and quality
 
-Status: stages 1a and 1b landed; stages 1c / 2 / 3a / 3 / 4 pending.
+Status: stages 1a, 1b and 1c landed; stages 2 / 3a / 3 / 4 pending.
 
 ## Context
 
@@ -50,17 +50,27 @@ def pad_or_trim(array, length: int = 3000, ...):    # audio.py:111
 So **every encoder pass costs a full 30 s but advances only 7 s of audio** — 4.3x redundant passes,
 a multiplier on top of everything else.
 
+**The value in force on this machine is 2, not the repo default of 7.**
+`~/.config/tapeback/.env` sets `TAPEBACK_CHUNK_LENGTH=2`, so production runs pad 200 frames to
+3000 — **15x redundant encoder passes**, not 4.3x. This was found by the stage 1c work (a test
+asserting the default 7 read 2 instead) and is the single largest factor behind the 8203 s.
+
 **Measured** on `2026-05-03_17-56-45.wav` (145.5 s), large-v3-turbo / float16 / cuda, all other
 parameters as in production:
 
 | `chunk_length` | time | RTF | segments | characters |
 |---|---|---|---|---|
-| **7** (current default) | **116.8 s** | 1.25x | 28 | 1659 |
+| **2** (actual production value) | **390.6 s** | **0.37x** | 60 | — |
+| 7 (repo default) | 116.8 s | 1.25x | 28 | 1659 |
 | **30** | **41.4 s** | **3.51x** | 17 | 1514 |
 
-**2.82x faster from one value**, same content (the character delta comes from less ragged
-segmentation), with larger and more natural timecodes. The estimate is conservative: the `30` run
-executed on a card already heat-soaked to 86 °C.
+At the value actually in use, transcription runs **2.7x slower than real time**. Moving to 30 is
+**9.4x faster**, with the same content (the character delta comes from less ragged segmentation) and
+larger, more navigable timecodes.
+
+The `chunk_length=2` run also carried GPU telemetry: `sm 1773 MHz avg / 1590 min, max 87 °C,
+2429 MiB peak, **throttled 90 % of 78 samples**`. So the thermal clamp is real and heavy on a long
+run — but it is a consequence of the run being long, not the reason it is long.
 
 `chunk_length` was originally lowered to 7 to fight hallucinations on long pauses
 ("Субтитры DimaTorzok"). The cure for that is VAD + `no_speech_threshold` + silence gating — all of
@@ -221,11 +231,12 @@ Stage 'transcribe monitor' took 409.1s
   `transcribe mic`, and all previous work ("cleaner, faster mic channel", silence gating) targeted
   that path. The gating works — mic now finishes in 52 s. The problem moved.
 - The same file took 116.8 s end-to-end in the isolated benchmark but 409 s for a single channel
-  inside the pipeline. The difference is that the pipeline runs each channel through `loudnorm`,
-  which lifts quiet audio together with background noise; VAD then sees more "speech" and the
-  temperature ladder fires more often. This sharpens stage 2: `loudnorm` on the monitor channel is
-  suspected of hurting Whisper's input quality, not merely costing ffmpeg time. To be confirmed by
-  measurement, not changed blind.
+  inside the pipeline. **Initial hypothesis — that `loudnorm` was inflating VAD speech and firing
+  the temperature ladder — was wrong.** The pipeline reads `~/.config/tapeback/.env`
+  (`TAPEBACK_CHUNK_LENGTH=2`) while the benchmark passed 7 explicitly. An isolated run at 2 takes
+  390.6 s, against 409 s in the pipeline: `loudnorm` accounts for roughly 5 %, not the bulk. Stage 2
+  should therefore treat the `aresample`/`loudnorm` reordering as an ffmpeg-time optimisation only,
+  and not weaken `loudnorm` on the strength of a hypothesis that measurement has now refuted.
 
 ### Stage 1b — GPU telemetry — DONE
 
@@ -249,21 +260,38 @@ Landed as a ~400-line code diff. `ruff` and `ty` clean; **296 tests pass, covera
   '0x0000000000000001']` parsed to `GPU: sm 300 MHz avg / 300 min, max 57°C, 51 MiB peak,
   throttled 0% of 6 samples` — idle correctly not counted as throttled.
 
-### Stage 1c — run metadata
+### Stage 1c — run metadata — DONE
 
-Split out of 1b to stay under the ~500-line commit limit.
+Split out of 1b to stay under the ~500-line commit limit. **312 tests pass, coverage 93.88 %.**
 
-Persist per-run metadata. Nothing is currently written anywhere, so there is no way to reconstruct
-why the 16 recordings failed. Target: `~/.local/share/tapeback/runs/`, with a settings override.
-Contents: session name, timestamps, resolved model/device/compute type, stage timings, GPU stats,
-segment counts, detected language, outcome (completed / aborted / failed) and the error if any.
+- `_runlog.py`: `run_log()` context manager writing one JSON record per run to
+  `~/.local/share/tapeback/runs/` (honours `XDG_DATA_HOME`; `TAPEBACK_RUN_LOG`,
+  `TAPEBACK_RUN_LOG_DIR`). Holds the settings actually used, every status line verbatim, and the
+  outcome — `completed` / `aborted` (Ctrl+C) / `failed` (with the error). Exceptions are classified
+  and re-raised unchanged, never swallowed.
+- Status lines are stored verbatim rather than parsed back into fields: re-parsing our own formatted
+  output would break on every reword.
+- **Recorded settings are an explicit allow-list, never `settings.model_dump()`** — `Settings`
+  carries `hf_token` and `llm_api_key`, and a post-mortem file that leaks credentials is worse than
+  no file. Two tests guard this, one of which fails the build if a new `SecretStr` field is ever
+  added to the allow-list.
+- A failed record write degrades to `None`: losing a diagnostic file must never destroy the run that
+  produced it. Directory is pruned to the newest 200 records.
+
+**What it caught immediately.** A test asserting the default `chunk_length == 7` read `2`: the test
+suite was never isolated from `~/.config/tapeback/.env`, so every `Settings()` in every test
+inherited the developer's machine configuration. Fixed with an autouse fixture that detaches both
+env-file sources and clears ambient `TAPEBACK_*` variables, plus a regression test. The same finding
+corrected the headline speed number above from 2.82x to **9.4x**.
 
 ### Stage 2 — speed
 
-- `chunk_length`: `7` → `30` (or `None`). One value, ~4.3x less encoder work.
-- `split_channels_16k` (`audio.py:113-116`): move `aresample=16000` **ahead of** `loudnorm`, and
-  measure whether `loudnorm` on the monitor channel should be weakened or dropped (see the stage 1a
-  finding above).
+- `chunk_length`: raise the repo default `7` → `30` (or `None`) **and remove
+  `TAPEBACK_CHUNK_LENGTH=2` from `~/.config/tapeback/.env`** — the user override is what production
+  actually runs, so changing only the default would fix nothing on this machine. Measured 9.4x.
+- `split_channels_16k` (`audio.py:113-116`): move `aresample=16000` **ahead of** `loudnorm`. This is
+  an ffmpeg-time optimisation only — the hypothesis that `loudnorm` was also hurting transcription
+  quality has been refuted by measurement (see stage 1a).
 - Measure before/after on the same file and record the numbers.
 - Batching stays off **until** the code warns that enabling it silently disables several parameters
   (quality cause 7).

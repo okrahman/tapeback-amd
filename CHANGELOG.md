@@ -12,9 +12,13 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - The resolved model, device and compute type are printed after the model loads (`Whisper: large-v3-turbo on cuda/float16`). A run that silently fell back to CPU used to be indistinguishable from a healthy GPU run; now it isn't. Shows `batch_size=N` when batching is enabled.
 - Timings for two stages that previously ran untimed — reading the stereo channels and gating the mic. Their cost used to appear as unexplained dead time between stages.
 - GPU telemetry during transcription (`TAPEBACK_GPU_TELEMETRY`, on by default): one line per stage with average/minimum SM clock, peak temperature, peak VRAM, and the share of samples where the card was thermally or power limited. On thermally constrained laptops a long run can spend most of its time clamped, which until now was indistinguishable from a slow model. Observation only — tapeback never changes clock or power caps. No-op without `nvidia-smi` or on CPU.
+- Per-run JSON records (`TAPEBACK_RUN_LOG`, on by default) in `~/.local/share/tapeback/runs/`: the settings the run actually used, every status line, and the outcome (`completed` / `aborted` / `failed` with the error). Previously a run that failed or was interrupted left nothing behind, so there was no way to tell which configuration produced a given transcript — or why a recording never got one. Credentials are never recorded; the stored settings are an explicit allow-list.
 
 ### Changed
 - `nvidia-smi` is now queried through one helper shared by transcription and diarization, so a missing binary, a driver error and a hung query all degrade the same way instead of each module handling it differently.
+
+### Fixed
+- Tests no longer read the developer's `~/.config/tapeback/.env`. `Settings` declares that file as a source, so every test constructing `Settings()` inherited the ambient machine configuration — a machine with `TAPEBACK_CHUNK_LENGTH=2` set produced different results than CI, and assertions on default values were silently machine-dependent.
 
 ## [0.9.7] — 2026-06-18
 

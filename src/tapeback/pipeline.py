@@ -14,6 +14,7 @@ if TYPE_CHECKING:
 from tapeback import const
 from tapeback._gpu import free_gpu_memory, sample_gpu
 from tapeback._lazy import load_transcriber
+from tapeback._runlog import run_log
 from tapeback._timing import stage_timer
 from tapeback.audio import (
     convert_to_mono16k,
@@ -78,39 +79,40 @@ def stop_and_process(
     on_status("Stopping recording...")
     monitor_path, mic_path = recorder.stop()
 
-    on_status("Merging audio channels...")
-    output_dir = monitor_path.parent
-    with stage_timer("merge", on_status):
-        stereo_path = merge_channels(monitor_path, mic_path, output_dir)
-
     session_name = monitor_path.parent.name
 
-    audio_dest = save_audio_to_vault(stereo_path, settings, session_name)
-    on_status(f"Audio saved: {audio_dest}")
+    with run_log(session_name, settings, on_status) as report:
+        report("Merging audio channels...")
+        output_dir = monitor_path.parent
+        with stage_timer("merge", report):
+            stereo_path = merge_channels(monitor_path, mic_path, output_dir)
 
-    segments, info, raw_segments = process_stereo_file(
-        stereo_path, output_dir, settings, diarize=diarize, on_status=on_status
-    )
+        audio_dest = save_audio_to_vault(stereo_path, settings, session_name)
+        report(f"Audio saved: {audio_dest}")
 
-    audio_rel_path = f"{settings.attachments_dir}/{session_name}.wav"
+        segments, info, raw_segments = process_stereo_file(
+            stereo_path, output_dir, settings, diarize=diarize, on_status=report
+        )
 
-    markdown = format_markdown(
-        segments=segments,
-        session_name=session_name,
-        audio_rel_path=audio_rel_path,
-        duration_seconds=float(info.get("duration", 0.0)),
-        language=str(info.get("language", settings.language)),
-        raw_segments=raw_segments,
-    )
+        audio_rel_path = f"{settings.attachments_dir}/{session_name}.wav"
 
-    md_path = save_markdown_to_vault(markdown, settings, session_name)
-    on_status(f"Saved: {md_path}")
+        markdown = format_markdown(
+            segments=segments,
+            session_name=session_name,
+            audio_rel_path=audio_rel_path,
+            duration_seconds=float(info.get("duration", 0.0)),
+            language=str(info.get("language", settings.language)),
+            raw_segments=raw_segments,
+        )
 
-    if live_transcriber is not None:
-        remove_live_markdown(settings, session_name)
+        md_path = save_markdown_to_vault(markdown, settings, session_name)
+        report(f"Saved: {md_path}")
 
-    if do_summarize:
-        _maybe_summarize(md_path, settings, on_status)
+        if live_transcriber is not None:
+            remove_live_markdown(settings, session_name)
+
+        if do_summarize:
+            _maybe_summarize(md_path, settings, report)
 
     shutil.rmtree(monitor_path.parent, ignore_errors=True)
     return md_path
@@ -130,37 +132,38 @@ def process_file(
         name = audio_path.stem
     validate_session_name(name)
 
-    audio_dest = save_audio_to_vault(audio_path, settings, name)
-    on_status(f"Audio saved: {audio_dest}")
-
     tmp_dir = Path(tempfile.mkdtemp(prefix="tapeback_"))
 
-    if is_stereo(audio_path):
-        on_status("Stereo file detected, using dual-channel pipeline...")
-        segments, info, raw_segments = process_stereo_file(
-            audio_path, tmp_dir, settings, diarize=diarize, on_status=on_status
+    with run_log(name, settings, on_status) as report:
+        audio_dest = save_audio_to_vault(audio_path, settings, name)
+        report(f"Audio saved: {audio_dest}")
+
+        if is_stereo(audio_path):
+            report("Stereo file detected, using dual-channel pipeline...")
+            segments, info, raw_segments = process_stereo_file(
+                audio_path, tmp_dir, settings, diarize=diarize, on_status=report
+            )
+        else:
+            segments, info, raw_segments = process_mono_file(
+                audio_path, tmp_dir, settings, diarize=diarize, on_status=report
+            )
+
+        audio_rel_path = f"{settings.attachments_dir}/{name}.wav"
+
+        markdown = format_markdown(
+            segments=segments,
+            session_name=name,
+            audio_rel_path=audio_rel_path,
+            duration_seconds=float(info.get("duration", 0.0)),
+            language=str(info.get("language", settings.language)),
+            raw_segments=raw_segments,
         )
-    else:
-        segments, info, raw_segments = process_mono_file(
-            audio_path, tmp_dir, settings, diarize=diarize, on_status=on_status
-        )
 
-    audio_rel_path = f"{settings.attachments_dir}/{name}.wav"
+        md_path = save_markdown_to_vault(markdown, settings, name)
+        report(f"Saved: {md_path}")
 
-    markdown = format_markdown(
-        segments=segments,
-        session_name=name,
-        audio_rel_path=audio_rel_path,
-        duration_seconds=float(info.get("duration", 0.0)),
-        language=str(info.get("language", settings.language)),
-        raw_segments=raw_segments,
-    )
-
-    md_path = save_markdown_to_vault(markdown, settings, name)
-    on_status(f"Saved: {md_path}")
-
-    if do_summarize:
-        _maybe_summarize(md_path, settings, on_status)
+        if do_summarize:
+            _maybe_summarize(md_path, settings, report)
 
     shutil.rmtree(tmp_dir, ignore_errors=True)
     return md_path

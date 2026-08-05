@@ -76,6 +76,13 @@ class Settings(BaseSettings):
     # (uses word timestamps, which are always on). None disables it.
     hallucination_silence_threshold: float | None = Field(default=None, ge=0.0)
 
+    # Write one JSON record per processing run (config + status lines + outcome), so a
+    # run that failed or was interrupted can be diagnosed afterwards. Never contains
+    # credentials — the recorded fields are an explicit allow-list in _runlog.py.
+    run_log: bool = True
+    # None → XDG data dir (~/.local/share/tapeback/runs).
+    run_log_dir: Path | None = None
+
     # Sample GPU clocks/temperature during transcription and report a one-line summary
     # per stage. Observation only — tapeback never changes clock or power caps (that
     # needs root). No-op when nvidia-smi is unavailable.

@@ -313,6 +313,8 @@ All settings via environment variables (prefix `TAPEBACK_`) or
 | `TAPEBACK_LANGUAGE` | `auto` | Language code (`auto` for auto-detection, or `en`, `ru`, `fr`, etc.) |
 | `TAPEBACK_DEVICE` | `cuda` | `cuda` or `cpu` |
 | `TAPEBACK_GPU_TELEMETRY` | `true` | Sample GPU clocks/temperature during transcription and print a one-line summary per stage. Observation only — tapeback never changes clock or power caps. No-op without `nvidia-smi` or on `cpu` |
+| `TAPEBACK_RUN_LOG` | `true` | Write one JSON record per run (settings used, every status line, outcome) so a failed or interrupted run can be diagnosed afterwards. Never contains credentials |
+| `TAPEBACK_RUN_LOG_DIR` | *(XDG)* | Where run records go. Default `~/.local/share/tapeback/runs` (honours `XDG_DATA_HOME`). Oldest records are pruned past 200 |
 | `TAPEBACK_COMPUTE_TYPE` | `auto` | `auto`, `float16`, `int8`, or `float32` (`auto` → `float16` on CUDA, `int8` on CPU; pin `int8` if your GPU is memory-tight) |
 | `TAPEBACK_BEAM_SIZE` | `4` | Whisper beam search width (lower = faster, slightly less accurate) |
 | `TAPEBACK_TEMPERATURE` | `[0.0, 0.2, 0.4, 0.6, 0.8, 1.0]` | Temperature fallback ladder. The high steps break Whisper out of hallucination loops on noisy audio — don't shorten unless your input is clean (shortening can cause repeat loops: slower *and* worse) |
@@ -397,6 +399,21 @@ Three lines are worth watching:
   On thermally constrained laptops a long run can end up clamped for its entire
   remainder. tapeback only reports this; changing clock or power caps needs root and
   is left to external tooling. Disable with `TAPEBACK_GPU_TELEMETRY=false`.
+
+### A run failed or you interrupted it — what happened?
+
+Every run writes a JSON record to `~/.local/share/tapeback/runs/`:
+
+```bash
+ls -t ~/.local/share/tapeback/runs/ | head
+jq '{outcome, error, config: .config.chunk_length}' ~/.local/share/tapeback/runs/<file>.json
+```
+
+It holds the settings the run actually used, every status line it printed, and how it
+ended (`completed` / `aborted` / `failed`, with the error for the last one). Useful when
+a transcript looks wrong and you need to know which configuration produced it, or when a
+run died and the terminal is long gone. Credentials are never recorded — the stored
+settings are an explicit allow-list. Disable with `TAPEBACK_RUN_LOG=false`.
 
 ### GPU transcription falls back to CPU on CUDA 13 systems
 
