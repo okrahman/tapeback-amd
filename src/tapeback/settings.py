@@ -57,6 +57,10 @@ class Settings(BaseSettings):
     # segments in parallel batches — several times faster on GPU. Off by default
     # (0) since it can OOM small GPUs; set e.g. TAPEBACK_BATCH_SIZE=8 to enable.
     batch_size: int = Field(default=0, ge=0)
+    # Comma-separated terms to bias decoding towards (faster-whisper `hotwords`).
+    # For domain vocabulary Whisper mangles — product names, acronyms, English
+    # technical terms inside Russian speech. Empty disables the bias entirely.
+    hotwords: str = ""
     vad_filter: bool = True
     # Seconds of audio consumed per decode window. Whisper's encoder is FIXED at 30 s:
     # faster-whisper zero-pads every window back to 3000 mel frames before encoding

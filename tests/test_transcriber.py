@@ -212,6 +212,36 @@ def test_batched_inference_used_when_batch_size_positive(settings):
     mock_model_cls.return_value.transcribe.assert_not_called()
 
 
+def test_hotwords_reach_whisper_when_configured(settings):
+    """The glossary bias must actually be passed through, not just stored."""
+    s = settings.model_copy(update={"device": "cpu", "hotwords": "RAG, ONNX, OpenVINO"})
+    info = MagicMock()
+    info.language, info.language_probability, info.duration = "ru", 0.9, 1.0
+
+    with patch("tapeback.transcriber.WhisperModel") as mock_model_cls:
+        instance = mock_model_cls.return_value
+        instance.transcribe.return_value = (iter([]), info)
+
+        Transcriber(s).transcribe(Path("/fake/audio.wav"))
+
+    assert instance.transcribe.call_args.kwargs["hotwords"] == "RAG, ONNX, OpenVINO"
+
+
+def test_hotwords_omitted_when_empty(settings):
+    """An empty glossary must not be sent — faster-whisper would tokenise it per window."""
+    s = settings.model_copy(update={"device": "cpu", "hotwords": ""})
+    info = MagicMock()
+    info.language, info.language_probability, info.duration = "ru", 0.9, 1.0
+
+    with patch("tapeback.transcriber.WhisperModel") as mock_model_cls:
+        instance = mock_model_cls.return_value
+        instance.transcribe.return_value = (iter([]), info)
+
+        Transcriber(s).transcribe(Path("/fake/audio.wav"))
+
+    assert "hotwords" not in instance.transcribe.call_args.kwargs
+
+
 def test_batching_warns_which_settings_it_drops(settings, capsys):
     """Batching silently reverts anti-hallucination settings — the user must be told."""
     s = settings.model_copy(

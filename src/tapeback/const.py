@@ -58,6 +58,23 @@ CHANNEL_DURATION_DIFF_WARN = 2.0
 # Minimum segment duration for output (seconds)
 MIN_SEGMENT_DURATION = 1.0
 
+# Phrases Whisper emits from its subtitle training corpus rather than from the audio,
+# typically over long pauses. Matched case-insensitively as substrings. Kept here
+# because both the quality benchmark and the transcript filter must agree on the list.
+HALLUCINATION_MARKERS = (
+    "субтитры",
+    "dimatorzok",
+    "продолжение следует",
+    "редактор субтитров",
+    "корректор",
+    "субтитлы",
+    "amara.org",
+    "субтитри",
+    "thanks for watching",
+    "thank you for watching",
+    "подписывайтесь на канал",
+)
+
 # Live transcription
 FILE_LIVE_SUFFIX = "_live"
 WAV_HEADER_FALLBACK = 44

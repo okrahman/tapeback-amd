@@ -227,6 +227,10 @@ class Transcriber:
             "language_detection_segments": self._settings.language_detection_segments,
             "hallucination_silence_threshold": self._settings.hallucination_silence_threshold,
         }
+        # Only pass hotwords when set: faster-whisper tokenises the string into a
+        # decoder bias, and an empty one would still cost that work per window.
+        if self._settings.hotwords:
+            kwargs["hotwords"] = self._settings.hotwords
         if self._batched is not None:
             kwargs["batch_size"] = self._settings.batch_size
             return self._batched.transcribe(str(audio_path), **kwargs)

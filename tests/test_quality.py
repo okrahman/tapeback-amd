@@ -1,0 +1,109 @@
+"""Unit tests for transcript-quality metrics."""
+
+import pytest
+
+from tapeback._quality import (
+    count_hallucination_markers,
+    count_recognised_terms,
+    count_repeated_phrases,
+    count_repeated_words,
+    find_hallucination_markers,
+)
+
+
+def test_find_hallucination_markers_real_transcript_lines():
+    """Real lines from the project's own transcripts, glued to neighbouring words."""
+    text = (
+        "Ведь решение... Субтитры DimaTorzok штука, куда ты вставляешь summary. "
+        "поскольку Корректор .Кулакова общаются мире."
+    )
+    assert find_hallucination_markers(text) == ["субтитры", "dimatorzok", "корректор"]
+
+
+def test_count_hallucination_markers_counts_occurrences_not_distinct():
+    text = "Продолжение следует... и снова Продолжение следует..."
+    assert count_hallucination_markers(text) == 2
+
+
+def test_no_hallucination_markers_in_clean_text():
+    assert find_hallucination_markers("Обычная встреча про RAG и вектора.") == []
+    assert count_hallucination_markers("Обычная встреча про RAG и вектора.") == 0
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        # Boundary: two in a row is emphasis, three is a loop.
+        ("да да ладно", 0),
+        ("да да да ладно", 1),
+        ("да да да да ладно", 1),
+        # A long run counts once, not once per extra repeat.
+        ("no " * 10, 1),
+        # Two separate runs.
+        ("да да да потом нет нет нет", 2),
+        ("совершенно обычная фраза", 0),
+        ("", 0),
+    ],
+)
+def test_count_repeated_words(text, expected):
+    assert count_repeated_words(text) == expected
+
+
+def test_count_repeated_words_ignores_digits():
+    """Timecodes and numbers must not register as repeated words."""
+    assert count_repeated_words("00 00 00 15 15 15") == 0
+
+
+def test_count_repeated_words_is_case_insensitive():
+    assert count_repeated_words("Да да ДА ладно") == 1
+
+
+def test_count_repeated_words_splits_on_apostrophes():
+    """Contractions tokenise into two words, so a repeated one alternates.
+
+    "Let's let's let's" becomes let/s/let/s/let/s — no word is adjacent to itself,
+    so word-level detection reports nothing. This is why phrase-level detection
+    exists alongside it.
+    """
+    assert count_repeated_words("Let's let's LET'S go") == 0
+    assert count_repeated_phrases("Let's let's LET'S go", size=2) == 1
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        # The failure mode word-level detection misses: no single word repeats.
+        ("something happens wrong something happens wrong ok", 1),
+        # Boundary: one occurrence is not a loop.
+        ("something happens wrong ok", 0),
+        # Three back-to-back repeats are still one loop.
+        ("a b c a b c a b c", 1),
+        ("совсем другая речь без повторов вообще", 0),
+        ("", 0),
+    ],
+)
+def test_count_repeated_phrases(text, expected):
+    assert count_repeated_phrases(text) == expected
+
+
+def test_count_repeated_phrases_ignores_non_adjacent_recurrence():
+    """A phrase recurring later in a meeting is normal speech, not a loop."""
+    text = "we need the rag system and then a lot of other words we need the rag"
+    assert count_repeated_phrases(text) == 0
+
+
+def test_count_recognised_terms():
+    text = "We are building the RAG system with ONNX Runtime and vector search."
+    found, missing = count_recognised_terms(text, ["RAG", "ONNX", "OpenVINO", "vector search"])
+    assert found == 3
+    assert missing == ["OpenVINO"]
+
+
+def test_count_recognised_terms_is_case_insensitive():
+    found, missing = count_recognised_terms("we use onnx runtime", ["ONNX"])
+    assert found == 1
+    assert missing == []
+
+
+def test_count_recognised_terms_with_empty_list():
+    assert count_recognised_terms("anything", []) == (0, [])
