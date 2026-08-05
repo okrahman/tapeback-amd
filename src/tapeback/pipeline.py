@@ -12,7 +12,7 @@ if TYPE_CHECKING:
     from tapeback.live import LiveTranscriber
 
 from tapeback import const
-from tapeback._gpu import free_gpu_memory
+from tapeback._gpu import free_gpu_memory, sample_gpu
 from tapeback._lazy import load_transcriber
 from tapeback._timing import stage_timer
 from tapeback.audio import (
@@ -48,6 +48,11 @@ StatusCallback = Callable[[str], None]
 
 def _noop_status(msg: str) -> None:
     pass
+
+
+def _gpu_telemetry_enabled(settings: Settings) -> bool:
+    """GPU sampling is only meaningful for a run that actually asked for the GPU."""
+    return settings.gpu_telemetry and settings.device == "cuda"
 
 
 def stop_and_process(
@@ -199,9 +204,10 @@ def process_stereo_file(
     with stage_timer("load model", on_status):
         transcriber = load_transcriber(settings)
     on_status(transcriber.describe())
-    mic_segments, monitor_segments, info = transcriber.transcribe_stereo(
-        mic_16k, monitor_16k, on_status=on_status
-    )
+    with sample_gpu(on_status, enabled=_gpu_telemetry_enabled(settings)):
+        mic_segments, monitor_segments, info = transcriber.transcribe_stereo(
+            mic_16k, monitor_16k, on_status=on_status
+        )
 
     mic_segments = split_on_silence(
         mic_segments,
@@ -290,7 +296,10 @@ def process_mono_file(
     with stage_timer("load model", on_status):
         transcriber = load_transcriber(settings)
     on_status(transcriber.describe())
-    with stage_timer("transcribe", on_status):
+    with (
+        sample_gpu(on_status, enabled=_gpu_telemetry_enabled(settings)),
+        stage_timer("transcribe", on_status),
+    ):
         segments, info = transcriber.transcribe(mono_16k_path, on_status=on_status)
 
     # Raw transcript before diarization

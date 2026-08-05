@@ -11,6 +11,10 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Progress during transcription: a percentage through the audio every 10 seconds, reported per channel (`transcribe mic: 40% (2:31 / 6:18)`). A long run now shows movement instead of a single opening line, and a channel stuck in a repeat loop is visible as a percentage that stops advancing.
 - The resolved model, device and compute type are printed after the model loads (`Whisper: large-v3-turbo on cuda/float16`). A run that silently fell back to CPU used to be indistinguishable from a healthy GPU run; now it isn't. Shows `batch_size=N` when batching is enabled.
 - Timings for two stages that previously ran untimed — reading the stereo channels and gating the mic. Their cost used to appear as unexplained dead time between stages.
+- GPU telemetry during transcription (`TAPEBACK_GPU_TELEMETRY`, on by default): one line per stage with average/minimum SM clock, peak temperature, peak VRAM, and the share of samples where the card was thermally or power limited. On thermally constrained laptops a long run can spend most of its time clamped, which until now was indistinguishable from a slow model. Observation only — tapeback never changes clock or power caps. No-op without `nvidia-smi` or on CPU.
+
+### Changed
+- `nvidia-smi` is now queried through one helper shared by transcription and diarization, so a missing binary, a driver error and a hung query all degrade the same way instead of each module handling it differently.
 
 ## [0.9.7] — 2026-06-18
 

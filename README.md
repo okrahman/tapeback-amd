@@ -312,6 +312,7 @@ All settings via environment variables (prefix `TAPEBACK_`) or
 | `TAPEBACK_WHISPER_MODEL` | `large-v3-turbo` | Whisper model (`tiny`, `base`, `small`, `medium`, `large-v3-turbo`) |
 | `TAPEBACK_LANGUAGE` | `auto` | Language code (`auto` for auto-detection, or `en`, `ru`, `fr`, etc.) |
 | `TAPEBACK_DEVICE` | `cuda` | `cuda` or `cpu` |
+| `TAPEBACK_GPU_TELEMETRY` | `true` | Sample GPU clocks/temperature during transcription and print a one-line summary per stage. Observation only — tapeback never changes clock or power caps. No-op without `nvidia-smi` or on `cpu` |
 | `TAPEBACK_COMPUTE_TYPE` | `auto` | `auto`, `float16`, `int8`, or `float32` (`auto` → `float16` on CUDA, `int8` on CPU; pin `int8` if your GPU is memory-tight) |
 | `TAPEBACK_BEAM_SIZE` | `4` | Whisper beam search width (lower = faster, slightly less accurate) |
 | `TAPEBACK_TEMPERATURE` | `[0.0, 0.2, 0.4, 0.6, 0.8, 1.0]` | Temperature fallback ladder. The high steps break Whisper out of hallucination loops on noisy audio — don't shorten unless your input is clean (shortening can cause repeat loops: slower *and* worse) |
@@ -379,9 +380,10 @@ Whisper: large-v3-turbo on cuda/float16
   transcribe mic: 40% (2:31 / 6:18)
   transcribe mic: 80% (5:02 / 6:18)
 Stage 'transcribe mic' took 94.2s
+GPU: sm 1832 MHz avg / 1005 min, max 87°C, 2428 MiB peak, throttled 35% of 40 samples
 ```
 
-Two lines are worth watching:
+Three lines are worth watching:
 
 - **`Whisper: <model> on <device>/<compute type>`** — if this says `cpu/int8` when you
   expect `cuda`, the run silently fell back to CPU and will be roughly an order of
@@ -390,6 +392,11 @@ Two lines are worth watching:
 - **`transcribe mic: NN%`** — progress through the audio, printed every 10 seconds.
   If the percentage stops advancing, the model is stuck in a repeat loop on that
   channel rather than working.
+- **`GPU: sm … throttled NN%`** — a high throttled share together with a low minimum
+  clock means the card was held back by heat or its power limit, not by the model.
+  On thermally constrained laptops a long run can end up clamped for its entire
+  remainder. tapeback only reports this; changing clock or power caps needs root and
+  is left to external tooling. Disable with `TAPEBACK_GPU_TELEMETRY=false`.
 
 ### GPU transcription falls back to CPU on CUDA 13 systems
 

@@ -76,6 +76,11 @@ class Settings(BaseSettings):
     # (uses word timestamps, which are always on). None disables it.
     hallucination_silence_threshold: float | None = Field(default=None, ge=0.0)
 
+    # Sample GPU clocks/temperature during transcription and report a one-line summary
+    # per stage. Observation only — tapeback never changes clock or power caps (that
+    # needs root). No-op when nvidia-smi is unavailable.
+    gpu_telemetry: bool = True
+
     # Audio
     monitor_source: str = "auto"
     mic_source: str = "auto"
