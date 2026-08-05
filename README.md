@@ -363,6 +363,34 @@ All settings via environment variables (prefix `TAPEBACK_`) or
 
 ## Troubleshooting
 
+### Reading the processing output
+
+Processing reports what it is doing, how long each stage took, and where Whisper
+actually ran:
+
+```
+Splitting channels...
+Stage 'load channels' took 1.2s
+Stage 'split' took 36.3s
+Stage 'gate mic' took 2.1s
+Transcribing (this may take a few minutes)...
+Stage 'load model' took 10.6s
+Whisper: large-v3-turbo on cuda/float16
+  transcribe mic: 40% (2:31 / 6:18)
+  transcribe mic: 80% (5:02 / 6:18)
+Stage 'transcribe mic' took 94.2s
+```
+
+Two lines are worth watching:
+
+- **`Whisper: <model> on <device>/<compute type>`** — if this says `cpu/int8` when you
+  expect `cuda`, the run silently fell back to CPU and will be roughly an order of
+  magnitude slower. See the CUDA 13 section below. When batching is enabled the line
+  also shows `batch_size=N`.
+- **`transcribe mic: NN%`** — progress through the audio, printed every 10 seconds.
+  If the percentage stops advancing, the model is stuck in a repeat loop on that
+  channel rather than working.
+
 ### GPU transcription falls back to CPU on CUDA 13 systems
 
 If the log shows `Warning: CUDA runtime error, falling back to CPU: Library libcublas.so.12 is not found`,

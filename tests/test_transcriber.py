@@ -212,6 +212,102 @@ def test_batched_inference_used_when_batch_size_positive(settings):
     mock_model_cls.return_value.transcribe.assert_not_called()
 
 
+def test_describe_reports_resolved_device_and_compute_type(settings):
+    """describe() states where the model actually landed, not what was requested."""
+    s = settings.model_copy(
+        update={
+            "device": "cpu",
+            "compute_type": "auto",
+            "whisper_model": "large-v3",
+            "batch_size": 0,
+        }
+    )
+    with patch("tapeback.transcriber.WhisperModel"):
+        description = Transcriber(s).describe()
+
+    assert description == "Whisper: large-v3 on cpu/int8"
+
+
+def test_describe_mentions_batch_size_when_batching_enabled(settings):
+    """Batched mode changes which parameters faster-whisper honours — make it visible."""
+    s = settings.model_copy(
+        update={"device": "cpu", "compute_type": "int8", "whisper_model": "tiny", "batch_size": 8}
+    )
+    with (
+        patch("tapeback.transcriber.WhisperModel"),
+        patch("tapeback.transcriber.BatchedInferencePipeline"),
+    ):
+        description = Transcriber(s).describe()
+
+    assert description == "Whisper: tiny on cpu/int8, batch_size=8"
+
+
+def test_describe_reflects_cpu_fallback_after_cuda_failure(settings):
+    """After a CUDA fallback describe() must say cpu/int8, not the requested cuda/float16."""
+    s = settings.model_copy(update={"device": "cuda", "compute_type": "float16"})
+    info = MagicMock()
+    info.language, info.language_probability, info.duration = "en", 0.9, 1.0
+
+    with patch("tapeback.transcriber.WhisperModel") as mock_model_cls:
+        instance = mock_model_cls.return_value
+        instance.transcribe.side_effect = [
+            RuntimeError("CUDA failed with error out of memory"),
+            (iter([]), info),
+        ]
+        transcriber = Transcriber(s)
+        assert transcriber.describe() == "Whisper: large-v3-turbo on cuda/float16"
+
+        transcriber.transcribe(Path("/fake/audio.wav"))
+
+    assert transcriber.describe() == "Whisper: large-v3-turbo on cpu/int8"
+
+
+def test_transcribe_reports_progress_through_on_status(settings):
+    """Long runs must show movement; faster-whisper's own tqdm bypasses on_status."""
+    s = settings.model_copy(update={"device": "cpu"})
+    info = MagicMock()
+    info.language, info.language_probability, info.duration = "en", 0.9, 600.0
+
+    segs = []
+    for end in (60.0, 300.0, 540.0):
+        seg = MagicMock()
+        seg.start, seg.end, seg.text, seg.words = end - 10.0, end, "text", []
+        segs.append(seg)
+
+    messages: list[str] = []
+    with patch("tapeback.transcriber.WhisperModel") as mock_model_cls:
+        instance = mock_model_cls.return_value
+        instance.transcribe.return_value = (iter(segs), info)
+        # min_interval defaults to 10s of wall clock; a fake clock makes every
+        # segment clear the gap so the mapping position -> percent is testable.
+        with patch("tapeback._timing.time.monotonic", side_effect=[0.0, 100.0, 200.0, 300.0]):
+            Transcriber(s).transcribe(
+                Path("/fake/audio.wav"), stage="transcribe mic", on_status=messages.append
+            )
+
+    assert messages == [
+        "  transcribe mic: 10% (1:00 / 10:00)",
+        "  transcribe mic: 50% (5:00 / 10:00)",
+        "  transcribe mic: 90% (9:00 / 10:00)",
+    ]
+
+
+def test_transcribe_progress_silent_by_default(settings):
+    """A caller that passes no reporter (e.g. live mode) gets no progress output."""
+    s = settings.model_copy(update={"device": "cpu"})
+    info = MagicMock()
+    info.language, info.language_probability, info.duration = "en", 0.9, 600.0
+    seg = MagicMock()
+    seg.start, seg.end, seg.text, seg.words = 0.0, 60.0, "text", []
+
+    with patch("tapeback.transcriber.WhisperModel") as mock_model_cls:
+        instance = mock_model_cls.return_value
+        instance.transcribe.return_value = (iter([seg]), info)
+        segments, _info = Transcriber(s).transcribe(Path("/fake/audio.wav"))
+
+    assert len(segments) == 1
+
+
 def test_plain_inference_when_batch_size_zero(settings):
     """batch_size == 0 keeps the plain (non-batched) path."""
     s = settings.model_copy(update={"device": "cpu", "batch_size": 0})

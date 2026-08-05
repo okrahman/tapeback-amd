@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.8] — 2026-08-05
+
+### Added
+- Progress during transcription: a percentage through the audio every 10 seconds, reported per channel (`transcribe mic: 40% (2:31 / 6:18)`). A long run now shows movement instead of a single opening line, and a channel stuck in a repeat loop is visible as a percentage that stops advancing.
+- The resolved model, device and compute type are printed after the model loads (`Whisper: large-v3-turbo on cuda/float16`). A run that silently fell back to CPU used to be indistinguishable from a healthy GPU run; now it isn't. Shows `batch_size=N` when batching is enabled.
+- Timings for two stages that previously ran untimed — reading the stereo channels and gating the mic. Their cost used to appear as unexplained dead time between stages.
+
 ## [0.9.7] — 2026-06-18
 
 ### Added

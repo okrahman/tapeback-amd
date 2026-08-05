@@ -10,7 +10,7 @@ from huggingface_hub.errors import LocalEntryNotFoundError
 
 from tapeback import const
 from tapeback._gpu import is_cuda_error, preload_cuda_libs
-from tapeback._timing import stage_timer
+from tapeback._timing import ProgressReporter, stage_timer
 from tapeback.models import Segment, Word
 from tapeback.settings import Settings
 
@@ -56,9 +56,24 @@ class Transcriber:
         if settings.device == "cuda":
             # Make ctranslate2 (CUDA 12) find cuBLAS/cuDNN on CUDA 13 systems.
             preload_cuda_libs()
-        compute_type = _resolve_compute_type(settings.compute_type, settings.device)
-        self._model = self._load_model(settings.device, compute_type)
+        self._compute_type = _resolve_compute_type(settings.compute_type, settings.device)
+        self._model = self._load_model(settings.device, self._compute_type)
         self._batched = self._wrap_batched(self._model)
+
+    def describe(self) -> str:
+        """Human-readable record of where the model actually landed.
+
+        Until now the only device-related output was a warning on CPU fallback,
+        which scrolls past between other status lines — so a run that silently
+        dropped to CPU (roughly an order of magnitude slower) looked exactly like
+        a healthy one. Reporting the resolved device positively makes that
+        distinguishable without reproducing the run.
+        """
+        batched = f", batch_size={self._settings.batch_size}" if self._batched else ""
+        return (
+            f"Whisper: {self._settings.whisper_model} on "
+            f"{self._device}/{self._compute_type}{batched}"
+        )
 
     def _wrap_batched(self, model: WhisperModel) -> BatchedInferencePipeline | None:
         """Wrap the model for batched inference when batch_size > 0 (faster on GPU)."""
@@ -99,6 +114,7 @@ class Transcriber:
                     file=sys.stderr,
                 )
                 self._device = "cpu"
+                self._compute_type = "int8"
                 return self._new_model("cpu", "int8")
             raise
 
@@ -113,16 +129,26 @@ class Transcriber:
             file=sys.stderr,
         )
         self._device = "cpu"
+        self._compute_type = "int8"
         self._model = self._new_model("cpu", "int8")
         self._batched = self._wrap_batched(self._model)
 
-    def transcribe(self, audio_path: Path) -> tuple[list[Segment], dict[str, str | float]]:
+    def transcribe(
+        self,
+        audio_path: Path,
+        *,
+        stage: str = "transcribe",
+        on_status: Callable[[str], None] = _noop_status,
+    ) -> tuple[list[Segment], dict[str, str | float]]:
         """Transcribe audio file.
 
         Returns (list of Segments, info dict with language/duration/etc).
         Falls back to CPU if CUDA fails — either when calling transcribe()
         (eager language detection raises before yielding) or while iterating
         the segment generator.
+
+        Progress is reported through ``on_status`` as the segment generator is
+        consumed, so a long run shows movement instead of a single opening line.
         """
         # "auto" → None lets faster-whisper auto-detect language
         language = self._settings.language if self._settings.language != "auto" else None
@@ -130,13 +156,13 @@ class Transcriber:
         segments: list[Segment] = []
         try:
             segments_iter, info = self._invoke_transcribe(audio_path, language)
-            segments = self._collect_segments(segments_iter)
+            segments = self._collect_segments(segments_iter, stage, info.duration, on_status)
         except RuntimeError as exc:
             if self._device != "cuda" or not is_cuda_error(exc):
                 raise
             self._fallback_to_cpu(exc)
             segments_iter, info = self._invoke_transcribe(audio_path, language)
-            segments = self._collect_segments(segments_iter)
+            segments = self._collect_segments(segments_iter, stage, info.duration, on_status)
 
         if not segments:
             print("Warning: No speech detected in audio", file=sys.stderr)
@@ -189,9 +215,13 @@ class Transcriber:
         pass (mostly silence while the user listens) is visible on its own.
         """
         with stage_timer("transcribe mic", on_status):
-            mic_segments, mic_info = self.transcribe(mic_16k)
+            mic_segments, mic_info = self.transcribe(
+                mic_16k, stage="transcribe mic", on_status=on_status
+            )
         with stage_timer("transcribe monitor", on_status):
-            monitor_segments, monitor_info = self.transcribe(monitor_16k)
+            monitor_segments, monitor_info = self.transcribe(
+                monitor_16k, stage="transcribe monitor", on_status=on_status
+            )
 
         # Assign speaker="You" to mic segments
         mic_segments = [
@@ -213,10 +243,22 @@ class Transcriber:
         return mic_segments, monitor_segments, info
 
     @staticmethod
-    def _collect_segments(segments_iter: Iterable[Any]) -> list[Segment]:
-        """Iterate over faster-whisper segments and convert to dataclasses."""
+    def _collect_segments(
+        segments_iter: Iterable[Any],
+        stage: str,
+        total_duration: float,
+        on_status: Callable[[str], None],
+    ) -> list[Segment]:
+        """Iterate over faster-whisper segments and convert to dataclasses.
+
+        Reports throttled progress as it goes: faster-whisper's own
+        ``log_progress`` writes a tqdm bar straight to the terminal, bypassing
+        ``on_status``, so it would never reach the tray log.
+        """
+        progress = ProgressReporter(stage, total_duration, on_status)
         segments: list[Segment] = []
         for seg in segments_iter:
+            progress.update(seg.end)
             words: list[Word] | None = None
             if seg.words:
                 words = [

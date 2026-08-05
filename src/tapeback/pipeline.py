@@ -183,7 +183,8 @@ def process_stereo_file(
     Returns (diarized_segments, info, raw_segments).
     raw_segments have basic You/Other attribution (channel-based, no diarization).
     """
-    mic_raw, monitor_raw, raw_sr = load_stereo_channels(stereo_path)
+    with stage_timer("load channels", on_status):
+        mic_raw, monitor_raw, raw_sr = load_stereo_channels(stereo_path)
 
     on_status("Splitting channels...")
     with stage_timer("split", on_status):
@@ -191,11 +192,13 @@ def process_stereo_file(
 
     if settings.gate_mic_silence:
         # Silence the mic where the user only listens, so Whisper doesn't loop on it.
-        gate_wav_inactive(mic_16k, mic_raw, monitor_raw, raw_sr)
+        with stage_timer("gate mic", on_status):
+            gate_wav_inactive(mic_16k, mic_raw, monitor_raw, raw_sr)
 
     on_status("Transcribing (this may take a few minutes)...")
     with stage_timer("load model", on_status):
         transcriber = load_transcriber(settings)
+    on_status(transcriber.describe())
     mic_segments, monitor_segments, info = transcriber.transcribe_stereo(
         mic_16k, monitor_16k, on_status=on_status
     )
@@ -286,8 +289,9 @@ def process_mono_file(
     on_status("Transcribing (this may take a few minutes)...")
     with stage_timer("load model", on_status):
         transcriber = load_transcriber(settings)
+    on_status(transcriber.describe())
     with stage_timer("transcribe", on_status):
-        segments, info = transcriber.transcribe(mono_16k_path)
+        segments, info = transcriber.transcribe(mono_16k_path, on_status=on_status)
 
     # Raw transcript before diarization
     raw_segments = list(segments)
