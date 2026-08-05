@@ -212,6 +212,40 @@ def test_batched_inference_used_when_batch_size_positive(settings):
     mock_model_cls.return_value.transcribe.assert_not_called()
 
 
+def test_batching_warns_which_settings_it_drops(settings, capsys):
+    """Batching silently reverts anti-hallucination settings — the user must be told."""
+    s = settings.model_copy(
+        update={
+            "device": "cpu",
+            "batch_size": 8,
+            "no_speech_threshold": 0.4,
+            "temperature": (0.0, 0.2, 0.4),
+        }
+    )
+    with (
+        patch("tapeback.transcriber.WhisperModel"),
+        patch("tapeback.transcriber.BatchedInferencePipeline"),
+    ):
+        Transcriber(s)
+
+    warning = capsys.readouterr().err
+    assert "TAPEBACK_BATCH_SIZE=8" in warning
+    assert "no_speech_threshold" in warning
+    assert "condition_on_previous_text" in warning
+    assert "temperature (only the first value is used)" in warning
+    # hallucination_silence_threshold defaults to None — nothing is lost, so it is
+    # not listed; naming settings the user never set would be noise.
+    assert "hallucination_silence_threshold" not in warning
+
+
+def test_no_batching_warning_when_batching_is_off(settings, capsys):
+    s = settings.model_copy(update={"device": "cpu", "batch_size": 0})
+    with patch("tapeback.transcriber.WhisperModel"):
+        Transcriber(s)
+
+    assert "TAPEBACK_BATCH_SIZE" not in capsys.readouterr().err
+
+
 def test_describe_reports_resolved_device_and_compute_type(settings):
     """describe() states where the model actually landed, not what was requested."""
     s = settings.model_copy(

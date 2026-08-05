@@ -15,7 +15,7 @@ def test_settings_ignore_user_env_file():
     The autouse isolate_settings_sources fixture cuts both sources off.
     """
     assert Settings.model_config["env_file"] == ()
-    assert Settings().chunk_length == 7
+    assert Settings().chunk_length == 30
     assert get_settings().whisper_model == "large-v3-turbo"
 
 

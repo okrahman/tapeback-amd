@@ -1,6 +1,6 @@
 # Spec: transcription speed and quality
 
-Status: stages 1a, 1b and 1c landed; stages 2 / 3a / 3 / 4 pending.
+Status: stages 1a, 1b, 1c and 2 landed; stages 3a / 3 / 4 pending.
 
 ## Context
 
@@ -284,17 +284,64 @@ inherited the developer's machine configuration. Fixed with an autouse fixture t
 env-file sources and clears ambient `TAPEBACK_*` variables, plus a regression test. The same finding
 corrected the headline speed number above from 2.82x to **9.4x**.
 
-### Stage 2 — speed
+### Stage 2 — speed — DONE
 
-- `chunk_length`: raise the repo default `7` → `30` (or `None`) **and remove
-  `TAPEBACK_CHUNK_LENGTH=2` from `~/.config/tapeback/.env`** — the user override is what production
-  actually runs, so changing only the default would fix nothing on this machine. Measured 9.4x.
-- `split_channels_16k` (`audio.py:113-116`): move `aresample=16000` **ahead of** `loudnorm`. This is
-  an ffmpeg-time optimisation only — the hypothesis that `loudnorm` was also hurting transcription
-  quality has been refuted by measurement (see stage 1a).
-- Measure before/after on the same file and record the numbers.
-- Batching stays off **until** the code warns that enabling it silently disables several parameters
-  (quality cause 7).
+**315 tests pass, coverage 93.88 %.** The user's `TAPEBACK_CHUNK_LENGTH=2` override has been removed
+from `~/.config/tapeback/.env`, so the new default is what runs.
+
+- `chunk_length` default raised `7` → `30` (`settings.py`), with the encoder-window reasoning in the
+  comment so it does not get lowered again to fight hallucinations.
+- Batching now warns which settings it silently drops (`transcriber.py::_batched_warning`), listing
+  only the ones actually configured. Verified line by line against faster-whisper 1.2.1's own
+  "Unused Arguments" docstring rather than taken on trust.
+
+**End-to-end on the reference recording** `2026-04-17_19-08-24.wav` (13 m 37 s), `--no-diarize
+--no-summarize`:
+
+| stage | time |
+|---|---|
+| split | 30.4 s |
+| load model | 13.3 s |
+| transcribe mic | 140.7 s |
+| transcribe monitor | 199.7 s |
+
+Transcription total 340.4 s for 817 s of audio — **RTF 2.40x**, against 0.37x at the value previously
+in force.
+
+**Quality did not regress — it improved.** Same file, counting subtitle-corpus hallucination markers
+and 3x word repeat loops:
+
+| `chunk_length` | hallucination markers | repeat loops | content chars |
+|---|---|---|---|
+| 2 | 0 | 4 | ~10 100 |
+| 10 | **4** | 2 | 10 130 |
+| 7 | 2 | 2 | 10 556 |
+| **30** | **0** | **1** | 9 468 |
+
+(The 2 run's file measures 20 246 chars only because it also carries the duplicate "Diarized
+Transcript" section — its actual content is comparable.) The historical fear that raising
+`chunk_length` brings back "Субтитры DimaTorzok" did not materialise: those came from windows too
+short to hold speech context, and `no_speech_threshold=0.4` plus `gate_mic_silence` — neither of
+which existed when the value was first lowered — now cover the case they were meant to.
+
+**The ffmpeg reorder was dropped: the hypothesis was wrong twice over.**
+
+- ffmpeg's `loudnorm` upsamples internally to 192 kHz for EBU R128 true-peak measurement and *emits*
+  at that rate. Putting `aresample` before it produces **192 kHz output WAVs** — caught by the
+  existing `test_split_channels_16k`.
+- It is not even faster: measured on a 16-minute recording, resample-first 32.4 s vs current 31.6 s.
+  `loudnorm`'s cost does not scale with its input rate.
+- The real distribution: the split without `loudnorm` takes **0.5 s**, with it **31.6 s** — so
+  `loudnorm` is ~98 % of the stage. `-filter_threads 6` does not help (34.4 s).
+
+The order is now documented as load-bearing in `split_channels_16k`'s docstring. Whether ASR input
+needs EBU R128 normalisation at all is a *quality* question, not a speed one, and belongs in the
+stage 3a grid — it must not be dropped on a hunch.
+
+**Thermals are now the visible next bottleneck.** The run reported `sm 1552 MHz avg / 480 min,
+max 87 °C, throttled 99 % of 68 samples`: the card spent essentially the whole run clamped, with the
+SM clock falling as low as 480 MHz against a 2100 MHz maximum. Shortening the run did not avoid the
+clamp on this chassis, which weakens the stage 1b assumption that it would.
 
 ### Stage 3a — model benchmark, default chosen by numbers
 

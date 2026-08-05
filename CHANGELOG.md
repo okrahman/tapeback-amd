@@ -15,6 +15,8 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Per-run JSON records (`TAPEBACK_RUN_LOG`, on by default) in `~/.local/share/tapeback/runs/`: the settings the run actually used, every status line, and the outcome (`completed` / `aborted` / `failed` with the error). Previously a run that failed or was interrupted left nothing behind, so there was no way to tell which configuration produced a given transcript — or why a recording never got one. Credentials are never recorded; the stored settings are an explicit allow-list.
 
 ### Changed
+- **Transcription is several times faster: `TAPEBACK_CHUNK_LENGTH` default raised 7 → 30.** Whisper's encoder is fixed at 30 seconds and faster-whisper zero-pads every window back to it, so a smaller value never made a pass cheaper — it only made the run need more of them. Measured on a 145 s recording: `2` → 390.6 s (slower than real time), `7` → 116.8 s, `30` → 41.4 s. Quality improved rather than regressed: on a 13-minute reference recording the new value produced no subtitle-corpus hallucinations at all, against 4 at `10` and 2 at `7`. If you set `TAPEBACK_CHUNK_LENGTH` yourself, remove the override.
+- Enabling `TAPEBACK_BATCH_SIZE` now warns which settings batched inference silently ignores (`no_speech_threshold`, `condition_on_previous_text`, and every `temperature` value after the first). These are anti-hallucination settings, and the run otherwise looked identical.
 - `nvidia-smi` is now queried through one helper shared by transcription and diarization, so a missing binary, a driver error and a hung query all degrade the same way instead of each module handling it differently.
 
 ### Fixed

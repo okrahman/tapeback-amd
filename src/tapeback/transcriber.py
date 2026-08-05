@@ -44,6 +44,36 @@ def _noop_status(_message: str) -> None:
     """Default status sink — used when transcribe_stereo gets no reporter."""
 
 
+# Parameters tapeback configures that BatchedInferencePipeline silently drops.
+# Verified against faster-whisper 1.2.1's own "Unused Arguments" docstring; the
+# temperature entry is separate because it is not ignored outright — only the
+# first value of the ladder is used, which disables the anti-hallucination retries.
+BATCHED_IGNORED_SETTINGS = (
+    "no_speech_threshold",
+    "condition_on_previous_text",
+    "hallucination_silence_threshold",
+)
+
+
+def _batched_warning(settings: Settings) -> str | None:
+    """Warn if batching would silently drop anti-hallucination settings.
+
+    Enabling batching quietly reverts several deliberate choices, and the run
+    otherwise looks identical — so the user must be told which ones, rather than
+    discovering it in a transcript full of repeats.
+    """
+    dropped = [name for name in BATCHED_IGNORED_SETTINGS if getattr(settings, name) is not None]
+    if len(settings.temperature) > 1:
+        dropped.append("temperature (only the first value is used)")
+    if not dropped:
+        return None
+    return (
+        f"Warning: TAPEBACK_BATCH_SIZE={settings.batch_size} enables batched inference, "
+        f"which ignores: {', '.join(dropped)}. "
+        "These are anti-hallucination settings; expect more repeats on quiet channels."
+    )
+
+
 class Transcriber:
     def __init__(self, settings: Settings) -> None:
         """Initialize faster-whisper model.
@@ -59,6 +89,10 @@ class Transcriber:
         self._compute_type = _resolve_compute_type(settings.compute_type, settings.device)
         self._model = self._load_model(settings.device, self._compute_type)
         self._batched = self._wrap_batched(self._model)
+        if self._batched is not None:
+            warning = _batched_warning(settings)
+            if warning is not None:
+                print(warning, file=sys.stderr)
 
     def describe(self) -> str:
         """Human-readable record of where the model actually landed.

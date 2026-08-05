@@ -58,7 +58,14 @@ class Settings(BaseSettings):
     # (0) since it can OOM small GPUs; set e.g. TAPEBACK_BATCH_SIZE=8 to enable.
     batch_size: int = Field(default=0, ge=0)
     vad_filter: bool = True
-    chunk_length: int = 7  # seconds — max VAD chunk before splitting for Whisper
+    # Seconds of audio consumed per decode window. Whisper's encoder is FIXED at 30 s:
+    # faster-whisper zero-pads every window back to 3000 mel frames before encoding
+    # (transcribe.py `pad_or_trim`), so a smaller value does not make the encoder pass
+    # cheaper — it only makes the run need more of them. At 2 the encoder does 15x the
+    # necessary work; measured on a 145 s file, 2 -> 390.6 s and 30 -> 41.4 s.
+    # Do not lower this to fight hallucinations on long pauses; that is what
+    # vad_filter, no_speech_threshold and gate_mic_silence are for.
+    chunk_length: int = 30
     condition_on_previous_text: bool = False
     # Lower = more aggressive silence rejection (helps suppress Whisper training-data
     # hallucinations like "Субтитры DimaTorzok" on long pauses). Default in Whisper is 0.6.

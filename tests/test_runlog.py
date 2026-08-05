@@ -44,7 +44,7 @@ def test_run_log_records_config_events_and_outcome(tmp_path):
         "Whisper: large-v3-turbo on cuda/float16",
     ]
     assert record["config"]["whisper_model"] == "large-v3-turbo"
-    assert record["config"]["chunk_length"] == 7
+    assert record["config"]["chunk_length"] == 30
     assert record["finished_at"] is not None
 
 
