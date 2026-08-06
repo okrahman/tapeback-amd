@@ -23,6 +23,11 @@ from tapeback.transcriber import Transcriber, _resolve_compute_type
         # int8_float16, not float16: measured 14.16x vs 3.90x real time on the same
         # clip and half the VRAM, with no quality cost.
         pytest.param("auto", "cuda", "int8_float16", id="auto_cuda"),
+        # A GPU-only type must be translated when we end up on the CPU: ctranslate2
+        # raises ValueError rather than degrading, so carrying TAPEBACK_COMPUTE_TYPE
+        # across a thermal or VRAM fallback used to crash the run.
+        pytest.param("int8_float16", "cpu", "int8", id="gpu_only_type_on_cpu"),
+        pytest.param("float16", "cpu", "int8", id="float16_on_cpu"),
     ],
 )
 def test_resolve_compute_type(requested, device, expected):

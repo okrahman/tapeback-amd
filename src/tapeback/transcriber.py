@@ -10,7 +10,13 @@ from faster_whisper import BatchedInferencePipeline, WhisperModel
 from huggingface_hub.errors import LocalEntryNotFoundError
 
 from tapeback import const
-from tapeback._gpu import is_cuda_error, preload_cuda_libs, wait_for_clamp_release
+from tapeback._gpu import (
+    free_gpu_memory,
+    get_free_vram_mib,
+    is_cuda_error,
+    preload_cuda_libs,
+    wait_for_clamp_release,
+)
 from tapeback._timing import ProgressReporter, stage_timer
 from tapeback.models import Segment, Word
 from tapeback.settings import Settings
@@ -25,12 +31,24 @@ os.environ["LC_MESSAGES"] = "C"
 locale.setlocale(locale.LC_MESSAGES, "C")
 
 
+# Compute types ctranslate2 cannot run on CPU. Requesting one there raises
+# ValueError rather than degrading, so a device fallback has to translate it.
+_CUDA_ONLY_COMPUTE_TYPES = frozenset({"float16", "int8_float16", "bfloat16", "int8_bfloat16"})
+
+
 def _resolve_compute_type(compute_type: str, device: str) -> str:
-    """Resolve 'auto' compute type based on device.
+    """Resolve the compute type for the device we ended up on.
 
     - auto + cuda → int8_float16
     - auto + cpu  → int8
-    - explicit value passes through.
+    - an explicit CUDA-only type on CPU → int8, because ctranslate2 raises otherwise
+    - any other explicit value passes through.
+
+    The CPU translation matters because the device is now chosen at runtime: a card that
+    is thermally clamped or out of VRAM sends us to the CPU carrying whatever
+    TAPEBACK_COMPUTE_TYPE was set for the GPU. Without this, that combination died with
+    "Requested int8_float16 compute type, but the target device or backend do not
+    support efficient int8_float16 computation" — a crash instead of a fallback.
 
     int8_float16 rather than float16 because it is faster *and* smaller, which is not
     the usual trade-off. Measured on a GTX 1650 Ti with large-v3-turbo, same 90 s clip,
@@ -44,15 +62,48 @@ def _resolve_compute_type(compute_type: str, device: str) -> str:
     the measurements are not. ctranslate2 falls back on its own if a device does not
     support the requested type, so this stays safe on other GPUs.
     """
-    if compute_type != "auto":
-        return compute_type
-    if device == "cuda":
-        return "int8_float16"
-    return "int8"
+    if compute_type == "auto":
+        return "int8_float16" if device == "cuda" else "int8"
+    if device != "cuda" and compute_type in _CUDA_ONLY_COMPUTE_TYPES:
+        print(
+            f"Warning: compute type {compute_type} is GPU-only; using int8 on {device}.",
+            file=sys.stderr,
+        )
+        return "int8"
+    return compute_type
 
 
 def _noop_status(_message: str) -> None:
     """Default status sink — used when transcribe_stereo gets no reporter."""
+
+
+def _enough_vram(settings: Settings) -> bool:
+    """False if the card plainly cannot hold a model right now.
+
+    This is prevention, not optimisation. A CUDA out-of-memory during model load
+    **leaks the allocation**: ctranslate2 builds the model on the C++ side, and when the
+    load fails partway the object is never destroyed and never reaches Python, so there
+    is no handle to release. Measured, free VRAM went 3674 MiB -> 95 MiB and stayed
+    there for the life of the process; neither dropping the exception's traceback nor
+    `CT2_CUDA_ALLOCATOR=cuda_malloc_async` recovers it. Everything afterwards — the
+    diarizer's own VRAM check included — then finds an empty card.
+
+    So the only reliable fix is to not attempt a load that cannot fit. The floor is
+    deliberately crude: the smallest configuration measured here (large-v3-turbo in
+    int8_float16) needs ~1115 MiB, so anything under the threshold cannot work at all.
+    Sizing per model would need a table that goes stale; this catches the case that
+    actually recurs, which is a card already occupied by something else.
+    """
+    free_mib = get_free_vram_mib()
+    if free_mib is None or free_mib >= settings.min_free_vram_mib:
+        return True
+    print(
+        f"Warning: only {free_mib} MiB VRAM free, below the "
+        f"{settings.min_free_vram_mib} MiB needed to load a model — using CPU. "
+        "A previous CUDA out-of-memory leaks VRAM until the process restarts.",
+        file=sys.stderr,
+    )
+    return False
 
 
 def _resolve_device(settings: Settings) -> str:
@@ -68,7 +119,11 @@ def _resolve_device(settings: Settings) -> str:
     on the same clip, CPU 2.39x real time against 0.31x clamped, i.e. the CPU is ~8x
     faster. Waiting it out is what turned a fifteen-minute job into a multi-hour one.
     """
-    if settings.device != "cuda" or settings.thermal_clamp_wait <= 0:
+    if settings.device != "cuda":
+        return settings.device
+    if not _enough_vram(settings):
+        return "cpu"
+    if settings.thermal_clamp_wait <= 0:
         return settings.device
     if wait_for_clamp_release(settings.thermal_clamp_wait):
         return "cuda"
@@ -180,20 +235,39 @@ class Transcriber:
                 local_files_only=False,
             )
 
+    def _release_gpu_model(self) -> None:
+        """Drop every reference to the GPU model, then ask for the memory back.
+
+        Order matters. Assigning the replacement over `self._model` would keep the
+        failed GPU model alive for as long as the new one takes to build, and after an
+        out-of-memory failure there is by definition no room for both. Observed without
+        this: free VRAM went 3674 MiB -> 95 MiB and stayed there, so the diarizer's own
+        VRAM check then sent it to CPU as well — one failure degraded the whole run.
+        """
+        self._model = None
+        self._batched = None
+        free_gpu_memory()
+
     def _load_model(self, device: str, compute_type: str) -> WhisperModel:
         """Load WhisperModel, falling back to CPU on CUDA errors."""
         try:
             return self._new_model(device, compute_type)
         except RuntimeError as exc:
-            if device == "cuda" and is_cuda_error(exc):
-                print(
-                    f"Warning: CUDA not available at load time, falling back to CPU: {exc}",
-                    file=sys.stderr,
-                )
-                self._device = "cpu"
-                self._compute_type = "int8"
-                return self._new_model("cpu", "int8")
-            raise
+            if device != "cuda" or not is_cuda_error(exc):
+                raise
+            message = str(exc)
+            # The exception's traceback holds the frame the failed model was built in,
+            # which keeps its allocation reachable. Break that before retrying, or the
+            # CPU model is constructed while the dead GPU one still occupies VRAM.
+            exc.__traceback__ = None
+            free_gpu_memory()
+            print(
+                f"Warning: CUDA not available at load time, falling back to CPU: {message}",
+                file=sys.stderr,
+            )
+            self._device = "cpu"
+            self._compute_type = "int8"
+            return self._new_model("cpu", "int8")
 
     def _fallback_to_cpu(self, exc: Exception) -> None:
         """Recreate model on CPU after a CUDA runtime failure.
@@ -205,6 +279,8 @@ class Transcriber:
             f"Warning: CUDA runtime error, falling back to CPU: {exc}",
             file=sys.stderr,
         )
+        exc.__traceback__ = None
+        self._release_gpu_model()
         self._device = "cpu"
         self._compute_type = "int8"
         self._model = self._new_model("cpu", "int8")
@@ -280,6 +356,10 @@ class Transcriber:
         if self._batched is not None:
             kwargs["batch_size"] = self._settings.batch_size
             return self._batched.transcribe(str(audio_path), **kwargs)
+        if self._model is None:
+            # Only reachable if a CPU fallback itself failed after the GPU model was
+            # released. Say so plainly rather than raising AttributeError on None.
+            raise RuntimeError("No Whisper model is loaded — the CPU fallback failed")
         return self._model.transcribe(str(audio_path), **kwargs)
 
     def transcribe_stereo(

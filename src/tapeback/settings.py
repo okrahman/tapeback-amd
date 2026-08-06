@@ -101,6 +101,12 @@ class Settings(BaseSettings):
     # needs root). No-op when nvidia-smi is unavailable.
     gpu_telemetry: bool = True
 
+    # Refuse to load a model on CUDA below this much free VRAM, and use the CPU instead.
+    # A CUDA out-of-memory during load leaks the allocation on ctranslate2's C++ side
+    # for the life of the process (see transcriber._enough_vram), so the only reliable
+    # cure is not to trigger it. The smallest configuration measured needs ~1115 MiB.
+    min_free_vram_mib: int = Field(default=1200, ge=0)
+
     # Seconds to wait for a GPU thermal clamp to release before starting transcription.
     # On laptops that share one heatsink between CPU and GPU, the controller can cut the
     # GPU's power budget (measured: 50 W -> 5 W, clocks pinned to 300 MHz) and hold it
