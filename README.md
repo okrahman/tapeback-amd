@@ -313,6 +313,8 @@ All settings via environment variables (prefix `TAPEBACK_`) or
 | `TAPEBACK_LANGUAGE` | `auto` | Language code (`auto` for auto-detection, or `en`, `ru`, `fr`, etc.) |
 | `TAPEBACK_DEVICE` | `cuda` | `cuda` or `cpu` |
 | `TAPEBACK_GPU_TELEMETRY` | `true` | Sample GPU clocks/temperature during transcription and print a one-line summary per stage. Observation only — tapeback never changes clock or power caps. No-op without `nvidia-smi` or on `cpu` |
+| `TAPEBACK_ISOLATE_TRANSCRIPTION` | `true` | Run transcription in a child process. A CUDA out-of-memory permanently leaks VRAM inside the process it happens in — a child can simply exit and the kernel reclaims it. Costs one process start and model load per run; set `false` to transcribe in-process |
+| `TAPEBACK_MIN_FREE_VRAM_MIB` | `1200` | Use the CPU rather than attempting a CUDA load below this much free VRAM. The smallest measured configuration needs ~1115 MiB |
 | `TAPEBACK_THERMAL_CLAMP_WAIT` | `60` | Seconds to wait for a GPU thermal clamp to release before transcribing. `0` disables the check. See "Transcription is suddenly very slow" below |
 | `TAPEBACK_THERMAL_CLAMP_CPU_FALLBACK` | `true` | Transcribe on CPU when the clamp has not released. A clamped GPU measured ~8× slower than the CPU, so falling back is the fast path, not a degradation |
 | `TAPEBACK_STAGE_PAUSE_SECONDS` | `0` | Idle gap after each transcription stage, to shed heat instead of driving the chassis into a clamp. Try `60` on a laptop that clamps during long recordings |

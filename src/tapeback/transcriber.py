@@ -17,6 +17,7 @@ from tapeback._gpu import (
     preload_cuda_libs,
     wait_for_clamp_release,
 )
+from tapeback._isolated import transcribe_isolated
 from tapeback._timing import ProgressReporter, stage_timer
 from tapeback.models import Segment, Word
 from tapeback.settings import Settings
@@ -180,6 +181,17 @@ class Transcriber:
         First run downloads the model automatically.
         """
         self._settings = settings
+        self._isolated = settings.isolate_transcription
+        if self._isolated:
+            # No model here: the child process owns it, so a CUDA out-of-memory takes
+            # the child down instead of leaking this process's VRAM permanently.
+            # Device resolution belongs there too — doing it twice would wait out the
+            # thermal clamp twice.
+            self._device = settings.device
+            self._compute_type = settings.compute_type
+            self._model = None
+            self._batched = None
+            return
         self._device = _resolve_device(settings)
         if self._device == "cuda":
             # Make ctranslate2 (CUDA 12) find cuBLAS/cuDNN on CUDA 13 systems.
@@ -201,6 +213,10 @@ class Transcriber:
         a healthy one. Reporting the resolved device positively makes that
         distinguishable without reproducing the run.
         """
+        if self._isolated:
+            # The child resolves the real device and reports it as a status event once
+            # it has one; there is nothing truthful to say about it from here yet.
+            return f"Whisper: {self._settings.whisper_model} in an isolated worker"
         batched = f", batch_size={self._settings.batch_size}" if self._batched else ""
         return (
             f"Whisper: {self._settings.whisper_model} on "
@@ -304,6 +320,15 @@ class Transcriber:
         Progress is reported through ``on_status`` as the segment generator is
         consumed, so a long run shows movement instead of a single opening line.
         """
+        if self._isolated:
+            return transcribe_isolated(
+                audio_path,
+                self._settings,
+                stage=stage,
+                on_status=on_status,
+                language_override=language_override,
+            )
+
         # "auto" → None lets faster-whisper auto-detect language. An override wins over
         # "auto" but never over an explicitly configured language.
         configured = self._settings.language

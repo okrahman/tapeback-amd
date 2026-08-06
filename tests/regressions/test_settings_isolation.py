@@ -22,12 +22,15 @@ def test_settings_ignore_user_env_file():
 def test_ambient_tapeback_env_vars_are_cleared():
     """Ambient TAPEBACK_* variables must not leak into tests either.
 
-    The suite pins TAPEBACK_THERMAL_CLAMP_WAIT=0 on purpose so no test polls the real
-    GPU or waits on a thermal clamp; everything else must be gone.
+    Two are pinned on purpose so no test touches real hardware: the thermal clamp wait
+    (which would poll the GPU) and process isolation (which would spawn a worker that
+    loads a real model, ignoring the mocks). Everything else must be gone.
     """
-    leaked = {k for k in os.environ if k.startswith("TAPEBACK_")} - {"TAPEBACK_THERMAL_CLAMP_WAIT"}
+    pinned = {"TAPEBACK_THERMAL_CLAMP_WAIT", "TAPEBACK_ISOLATE_TRANSCRIPTION"}
+    leaked = {k for k in os.environ if k.startswith("TAPEBACK_")} - pinned
     assert leaked == set()
     assert os.environ["TAPEBACK_THERMAL_CLAMP_WAIT"] == "0"
+    assert os.environ["TAPEBACK_ISOLATE_TRANSCRIPTION"] == "false"
 
 
 def test_env_var_set_inside_a_test_still_applies(monkeypatch):

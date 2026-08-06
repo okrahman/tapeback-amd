@@ -101,6 +101,12 @@ class Settings(BaseSettings):
     # needs root). No-op when nvidia-smi is unavailable.
     gpu_telemetry: bool = True
 
+    # Run transcription in a child process. A CUDA out-of-memory leaks its allocation
+    # for the life of the process it happened in, and nothing reachable from Python
+    # releases it — but a process that exits gives the memory back. Costs one process
+    # start and the model load per run; set false to transcribe in-process.
+    isolate_transcription: bool = True
+
     # Refuse to load a model on CUDA below this much free VRAM, and use the CPU instead.
     # A CUDA out-of-memory during load leaks the allocation on ctranslate2's C++ side
     # for the life of the process (see transcriber._enough_vram), so the only reliable
