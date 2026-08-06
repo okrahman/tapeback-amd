@@ -89,6 +89,7 @@ Do not duplicate ruff rules here — if ruff can check it, ruff owns it.
 
 - Conventional commits (feat:, fix:, docs:, refactoring:)
 - Always PR, never push to main
+- `main` is protected: the `lint-and-test` job of `.github/workflows/ci.yml` must pass before a PR can merge. Force-push and branch deletion are blocked.
 - **Do not run git commit, checkout, reset, clean, stash, rebase** — these are blocked in settings.json. Ask user if needed.
 - Max ~500 lines of diff per commit — stop and propose a commit before continuing
 - Always work in the current branch — never switch branches

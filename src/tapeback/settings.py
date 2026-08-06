@@ -174,6 +174,11 @@ class Settings(BaseSettings):
 
     # Summarization
     summarize: bool = True
+    # Replace emails and phone numbers with placeholders in the transcript before it is
+    # sent to an LLM provider, and restore the real values in the summary written to the
+    # vault. Off by default. Only has any effect while summarization runs — that request
+    # is the only thing tapeback sends off the machine. See _mask.py.
+    mask_pii: bool = False
     llm_provider: LLMProvider = "anthropic"
     llm_api_key: SecretStr = SecretStr("")
     llm_model: str = ""

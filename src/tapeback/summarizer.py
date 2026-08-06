@@ -9,6 +9,7 @@ from pathlib import Path
 import click
 
 from tapeback import const
+from tapeback._mask import Masker
 from tapeback.models import ActionItem, Summary
 from tapeback.settings import DEFAULT_MODELS, Settings
 
@@ -285,18 +286,62 @@ def _parse_response(raw: str) -> Summary:
     )
 
 
+def _summary_texts(summary: Summary) -> list[str]:
+    """Every free-text field of a Summary, for scanning."""
+    texts = [summary.brief, *summary.key_decisions]
+    for item in summary.action_items:
+        texts.extend([item.assignee, item.action, item.deadline or ""])
+    return texts
+
+
+def _unmask_summary(summary: Summary, masker: Masker) -> Summary:
+    """Put the real PII back into the parsed summary — the vault is local.
+
+    Restoring after JSON parsing rather than on the raw response is deliberate: an
+    original value may contain a quote or a backslash, which would corrupt the document
+    if substituted back before `json.loads`.
+    """
+    summary.brief = masker.unmask(summary.brief)
+    summary.key_decisions = [masker.unmask(decision) for decision in summary.key_decisions]
+    for item in summary.action_items:
+        item.assignee = masker.unmask(item.assignee)
+        item.action = masker.unmask(item.action)
+        if item.deadline is not None:
+            item.deadline = masker.unmask(item.deadline)
+
+    residue = sorted(
+        {p for text in _summary_texts(summary) for p in masker.residual_placeholders(text)}
+    )
+    if residue:
+        click.echo(
+            f"Warning: summary keeps unresolved placeholders ({', '.join(residue)}) — "
+            "the model altered them, so those values could not be restored.",
+            err=True,
+        )
+    return summary
+
+
 def summarize(transcript: str, settings: Settings) -> Summary:
-    """Send transcript to LLM, parse structured response, return Summary."""
+    """Send transcript to LLM, parse structured response, return Summary.
+
+    With `mask_pii` on, the transcript is masked once and every provider in the fallback
+    chain — and the JSON retry — receives that same masked text; the real values are
+    restored in the returned Summary. The system prompt is a static constant with no user
+    data in it, so it is not masked.
+    """
+    masker = Masker(enabled=settings.mask_pii)
+    masked = masker.mask(transcript)
     try:
-        raw = _call_llm(_SYSTEM_PROMPT, transcript, settings)
-        return _parse_response(raw)
+        raw = _call_llm(_SYSTEM_PROMPT, masked, settings)
+        summary = _parse_response(raw)
     except (json.JSONDecodeError, KeyError):
         # Retry once with shorter prompt
-        raw = _call_llm(_RETRY_PROMPT, transcript, settings)
+        raw = _call_llm(_RETRY_PROMPT, masked, settings)
         try:
-            return _parse_response(raw)
+            summary = _parse_response(raw)
         except (json.JSONDecodeError, KeyError) as exc:
             raise RuntimeError(f"Failed to parse LLM response after retry: {raw[:500]}") from exc
+    return _unmask_summary(summary, masker)
 
 
 def format_summary_markdown(summary: Summary) -> str:

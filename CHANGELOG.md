@@ -8,6 +8,7 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [0.9.8] — 2026-08-05
 
 ### Added
+- Optional PII masking for the LLM request (`TAPEBACK_MASK_PII`, off by default). Summarization is the only thing tapeback sends off the machine; with masking on, emails and phone numbers are replaced by `[EMAIL_1]` / `[PHONE_1]` placeholders before the transcript is sent — on the retry and on every fallback provider too — and the real values are restored in the summary written to the vault. The transcript on disk is never masked. It does not cover names, which is what people actually say aloud, so it is a floor rather than a guarantee.
 - Progress during transcription: a percentage through the audio every 10 seconds, reported per channel (`transcribe mic: 40% (2:31 / 6:18)`). A long run now shows movement instead of a single opening line, and a channel stuck in a repeat loop is visible as a percentage that stops advancing.
 - The resolved model, device and compute type are printed after the model loads (`Whisper: large-v3-turbo on cuda/float16`). A run that silently fell back to CPU used to be indistinguishable from a healthy GPU run; now it isn't. Shows `batch_size=N` when batching is enabled.
 - Timings for two stages that previously ran untimed — reading the stereo channels and gating the mic. Their cost used to appear as unexplained dead time between stages.
