@@ -393,6 +393,61 @@ def test_summarize_command_with_provider_and_model_overrides(
     assert "## Summary" in content
 
 
+_PII_TRANSCRIPT_MD = """\
+---
+date: 2026-03-20
+---
+
+# Meeting 2026-03-20 14:30
+
+[00:00:01] **You:** Ivan will write to ivan.petrov@example.com.
+"""
+
+
+def test_show_masked_prints_the_payload_without_sending_it(
+    runner, tmp_path, monkeypatch, vault_env
+):
+    monkeypatch.setenv("TAPEBACK_MASK_PII", "true")
+    monkeypatch.setenv("TAPEBACK_MASK_TERMS", "Ivan")
+    md_file = tmp_path / "transcript.md"
+    md_file.write_text(_PII_TRANSCRIPT_MD)
+
+    with patch("tapeback.summarizer.summarize") as mock_summarize:
+        result = runner.invoke(cli, ["summarize", str(md_file), "--show-masked"])
+
+    assert result.exit_code == 0, result.output
+    mock_summarize.assert_not_called()
+    assert "ivan.petrov@example.com" not in result.output
+    assert "[TERM_1] will write to [EMAIL_1]." in result.output
+    assert "Masked: EMAIL 1, TERM 1" in result.stderr
+    # Previewing must not touch the file.
+    assert md_file.read_text() == _PII_TRANSCRIPT_MD
+
+
+def test_show_masked_says_so_when_masking_is_off(runner, tmp_path, monkeypatch, vault_env):
+    """Off is the default, and the preview must not look like masking happened."""
+    md_file = tmp_path / "transcript.md"
+    md_file.write_text(_PII_TRANSCRIPT_MD)
+
+    result = runner.invoke(cli, ["summarize", str(md_file), "--show-masked"])
+
+    assert result.exit_code == 0, result.output
+    assert "ivan.petrov@example.com" in result.output
+    assert "Masking is off" in result.stderr
+
+
+def test_show_masked_reports_when_nothing_matched(runner, tmp_path, monkeypatch, vault_env):
+    monkeypatch.setenv("TAPEBACK_MASK_PII", "true")
+    md_file = tmp_path / "transcript.md"
+    md_file.write_text(SAMPLE_TRANSCRIPT_MD)
+
+    result = runner.invoke(cli, ["summarize", str(md_file), "--show-masked"])
+
+    assert result.exit_code == 0, result.output
+    assert "Masked: nothing matched" in result.stderr
+    assert "Hello there." in result.output
+
+
 def test_summarize_command_empty_transcript(runner, tmp_path, monkeypatch, vault_env):
     """summarize with no transcript content → error exit."""
     monkeypatch.setenv("TAPEBACK_LLM_API_KEY", "sk-test")

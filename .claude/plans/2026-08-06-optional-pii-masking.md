@@ -1,6 +1,6 @@
 # Spec: optional PII masking at the LLM boundary
 
-Status: stages 1-2 landed. Stage 3 open.
+Status: all stages landed (1, 2, 3).
 
 ## Context
 

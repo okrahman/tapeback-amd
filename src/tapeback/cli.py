@@ -171,7 +171,12 @@ def process(audio_file: str, name: str | None, no_diarize: bool, no_summarize: b
     help="Override LLM provider",
 )
 @click.option("--model", default=None, help="Override LLM model")
-def summarize(file: str, provider: str | None, model: str | None) -> None:
+@click.option(
+    "--show-masked",
+    is_flag=True,
+    help="Print what would be sent to the provider and exit, without sending it",
+)
+def summarize(file: str, provider: str | None, model: str | None, show_masked: bool) -> None:
     """Summarize an existing transcript markdown file.
 
     Sends the transcript to an LLM and adds a summary section with
@@ -186,6 +191,7 @@ def summarize(file: str, provider: str | None, model: str | None) -> None:
     Examples:
       tapeback summarize vault/meetings/2026-03-26.md
       tapeback summarize transcript.md --provider gemini
+      tapeback summarize transcript.md --show-masked   # check TAPEBACK_MASK_PII
     """
     settings = get_settings()
 
@@ -201,6 +207,7 @@ def summarize(file: str, provider: str | None, model: str | None) -> None:
         extract_transcript_from_markdown,
         format_summary_markdown,
         inject_summary_into_markdown,
+        masked_preview,
     )
     from tapeback.summarizer import summarize as do_summarize
 
@@ -211,6 +218,17 @@ def summarize(file: str, provider: str | None, model: str | None) -> None:
     if not transcript.strip():
         click.echo("Error: No transcript content found in file.", err=True)
         raise SystemExit(1)
+
+    if show_masked:
+        # Report to stderr and the payload to stdout, so it can be piped or diffed.
+        masked, counts = masked_preview(transcript, settings)
+        if not settings.mask_pii:
+            click.echo("Masking is off (TAPEBACK_MASK_PII) — sent verbatim:", err=True)
+        else:
+            tally = ", ".join(f"{label} {n}" for label, n in sorted(counts.items()))
+            click.echo(f"Masked: {tally or 'nothing matched'}", err=True)
+        click.echo(masked)
+        return
 
     click.echo("Summarizing...", err=True)
     summary = do_summarize(transcript, settings)

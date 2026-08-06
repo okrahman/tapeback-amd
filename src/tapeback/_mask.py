@@ -142,6 +142,13 @@ class Masker:
     def mapping(self) -> MaskMap:
         return dict(self._to_original)
 
+    @property
+    def counts(self) -> dict[str, int]:
+        """Distinct values replaced, per label — how much was masked, without disclosing
+        what. Occurrences are not counted: a repeated value reuses its placeholder.
+        """
+        return dict(self._counts)
+
     def unmask(self, text: str) -> str:
         """Restore the originals this masker replaced."""
         if not text or not self._to_original:

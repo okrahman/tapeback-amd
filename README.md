@@ -251,6 +251,18 @@ does not guess them, because guessing would silently rewrite unrelated words.
 `TAPEBACK_MASK_PII=true` is a floor, not a guarantee that the provider sees nothing
 personal.
 
+**Check it before you trust it.** `--show-masked` prints exactly what would be sent
+and stops there — no request, no API key needed:
+
+```bash
+tapeback summarize notes.md --show-masked
+# stderr: Masked: EMAIL 1, TERM 4
+# stdout: the text that would go to the provider
+```
+
+The tally counts distinct values, not occurrences. The payload goes to stdout and
+the tally to stderr, so `--show-masked > sent.txt` gives you something to diff.
+
 ## CLI reference
 
 ```
@@ -268,6 +280,7 @@ tapeback start --no-diarize        # skip speaker identification
 tapeback start --no-summarize      # skip LLM summary
 tapeback process meeting.mp3 --name "weekly-standup"
 tapeback summarize notes.md --provider gemini --model gemini-2.5-pro
+tapeback summarize notes.md --show-masked   # print what would be sent, send nothing
 ```
 
 ## Output format

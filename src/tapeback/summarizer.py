@@ -321,6 +321,17 @@ def _unmask_summary(summary: Summary, masker: Masker) -> Summary:
     return summary
 
 
+def masked_preview(transcript: str, settings: Settings) -> tuple[str, dict[str, int]]:
+    """The exact text `summarize` would send, and how many distinct values were masked.
+
+    Nothing is sent and no API key is needed. Exists because the built-in rules match
+    nothing on a typical spoken transcript, so "masking is on" is otherwise unfalsifiable
+    from the outside.
+    """
+    masker = Masker(enabled=settings.mask_pii, terms=settings.mask_terms)
+    return masker.mask(transcript), masker.counts
+
+
 def summarize(transcript: str, settings: Settings) -> Summary:
     """Send transcript to LLM, parse structured response, return Summary.
 
