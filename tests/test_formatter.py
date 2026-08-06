@@ -79,16 +79,23 @@ def test_format_markdown_preserves_pauses():
 
 
 def test_format_markdown_with_raw_segments():
-    """When raw_segments is provided, output should have two sections:
-    '## Transcript' (raw) and '## Diarized Transcript' (diarized)."""
+    """Two sections when diarization actually splits speakers the raw pass merged.
+
+    The raw pass knows only "You" vs "Other", so both remote turns land on "Other";
+    diarization tells them apart. That difference is what earns a second section — a
+    diarized pass that merely renames "Other" to "Speaker 1" is suppressed as a
+    duplicate (tests/regressions/test_formatter_regressions.py).
+    """
     raw_segments = [
         Segment(start=1.0, end=5.0, text="Hello there.", speaker="You"),
         Segment(start=5.0, end=10.0, text="I'm fine.", speaker="Other"),
+        Segment(start=11.0, end=15.0, text="And I agree.", speaker="Other"),
     ]
 
     diarized_segments = [
         Segment(start=1.0, end=5.0, text="Hello there.", speaker="You"),
         Segment(start=5.0, end=10.0, text="I'm fine.", speaker="Speaker 1"),
+        Segment(start=11.0, end=15.0, text="And I agree.", speaker="Speaker 2"),
     ]
 
     result = format_markdown(

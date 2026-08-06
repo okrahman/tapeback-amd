@@ -170,6 +170,35 @@ def _format_segments_block(segments: list[Segment]) -> list[str]:
     return lines
 
 
+def _speaker_labels(block: list[str]) -> list[str]:
+    """Speaker labels in order of appearance, one per timecoded line."""
+    return [line.split("**")[1] for line in block if line.startswith("[") and "**" in line]
+
+
+def _adds_speaker_information(raw_block: list[str], diarized_block: list[str]) -> bool:
+    """True if the diarized rendering says something the raw one does not.
+
+    Diarization that only renames "Other" to "Speaker 1" produces a byte-for-byte
+    duplicate of the transcript — every file that carried the section was twice the
+    size for no extra information. It is worth a second section only when it actually
+    splits the conversation between speakers, i.e. when the run of labels differs in
+    shape rather than in wording.
+    """
+    if len(raw_block) != len(diarized_block):
+        return True
+    raw_labels = _speaker_labels(raw_block)
+    diarized_labels = _speaker_labels(diarized_block)
+    # Compare the grouping, not the names: "Other/Other" vs "Speaker 1/Speaker 1" is
+    # the same information, while "Other/Other" vs "Speaker 1/Speaker 2" is not.
+    return _label_shape(raw_labels) != _label_shape(diarized_labels)
+
+
+def _label_shape(labels: list[str]) -> list[int]:
+    """Map labels to the order they first appear, so naming does not matter."""
+    seen: dict[str, int] = {}
+    return [seen.setdefault(label, len(seen)) for label in labels]
+
+
 def format_markdown(
     segments: list[Segment],
     session_name: str,
@@ -217,17 +246,20 @@ def format_markdown(
         "",
     ]
 
-    if raw_segments is not None:
+    diarized_block = _format_segments_block(segments)
+    raw_block = _format_segments_block(raw_segments) if raw_segments is not None else None
+
+    if raw_block is not None and _adds_speaker_information(raw_block, diarized_block):
         lines.append("## Transcript")
         lines.append("")
-        lines.extend(_format_segments_block(raw_segments))
+        lines.extend(raw_block)
         lines.append("---")
         lines.append("")
         lines.append("## Diarized Transcript")
         lines.append("")
-        lines.extend(_format_segments_block(segments))
+        lines.extend(diarized_block)
     else:
-        lines.extend(_format_segments_block(segments))
+        lines.extend(diarized_block)
 
     return "\n".join(lines)
 

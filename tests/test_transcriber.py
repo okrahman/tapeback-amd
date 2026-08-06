@@ -72,9 +72,11 @@ def test_transcribe_stereo_pipeline(settings):
 
     with patch("tapeback.transcriber.WhisperModel") as mock_model_cls:
         instance = mock_model_cls.return_value
+        # Monitor is transcribed FIRST so its detected language can be reused for the
+        # gated mic channel — see tests/regressions/test_language_detection.py.
         instance.transcribe.side_effect = [
-            (iter([mock_seg_mic]), mock_info),
             (iter([mock_seg_monitor]), mock_info),
+            (iter([mock_seg_mic]), mock_info),
         ]
 
         transcriber = Transcriber(settings)

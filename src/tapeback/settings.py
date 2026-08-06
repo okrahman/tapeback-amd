@@ -4,6 +4,8 @@ from typing import Literal
 from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from tapeback.glossary import DEFAULT_HOTWORDS
+
 # Default models per provider — used when TAPEBACK_LLM_MODEL is not set.
 # Update here when providers deprecate models.
 DEFAULT_MODELS: dict[str, str] = {
@@ -15,19 +17,6 @@ DEFAULT_MODELS: dict[str, str] = {
     "deepseek": "deepseek-chat",
     "qwen": "qwen-turbo",
 }
-
-# Terms decoding is biased towards by default (faster-whisper `hotwords`). Whisper
-# mangles English technical vocabulary embedded in Russian speech — "tapeback" came
-# back as "ты пупа ты бэк", "Whisper" as "виспер". Measured on a 31-minute recording,
-# this list raised distinct English terms preserved in Latin script from 25 to 33 and
-# cut the share of low-confidence words from 81.5 to 59.4 per 1000. It also reduced
-# hallucinations rather than adding them (2 -> 0 across the benchmark grid), because a
-# biased decoder wanders less. Override with TAPEBACK_HOTWORDS for a different domain.
-DEFAULT_HOTWORDS = (
-    "RAG, ONNX, OpenVINO, LLM, Whisper, Obsidian, tapeback, Excalidraw, Jira, Trello, "
-    "Notion, Slack, Kanban, VPN, MCP, embeddings, vector search, retrieval, pipeline, "
-    "summary, markdown, dogfooding"
-)
 
 type LLMProvider = Literal[
     "anthropic",
@@ -71,8 +60,8 @@ class Settings(BaseSettings):
     # (0) since it can OOM small GPUs; set e.g. TAPEBACK_BATCH_SIZE=8 to enable.
     batch_size: int = Field(default=0, ge=0)
     # Comma-separated terms to bias decoding towards (faster-whisper `hotwords`).
-    # For domain vocabulary Whisper mangles — product names, acronyms, English
-    # technical terms inside Russian speech. Empty disables the bias entirely.
+    # Default glossary and the reasoning behind it live in glossary.py.
+    # Empty disables the bias entirely.
     hotwords: str = DEFAULT_HOTWORDS
     vad_filter: bool = True
     # Seconds of audio consumed per decode window. Whisper's encoder is FIXED at 30 s:

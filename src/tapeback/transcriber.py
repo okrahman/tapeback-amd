@@ -183,6 +183,7 @@ class Transcriber:
         *,
         stage: str = "transcribe",
         on_status: Callable[[str], None] = _noop_status,
+        language_override: str | None = None,
     ) -> tuple[list[Segment], dict[str, str | float]]:
         """Transcribe audio file.
 
@@ -194,8 +195,10 @@ class Transcriber:
         Progress is reported through ``on_status`` as the segment generator is
         consumed, so a long run shows movement instead of a single opening line.
         """
-        # "auto" → None lets faster-whisper auto-detect language
-        language = self._settings.language if self._settings.language != "auto" else None
+        # "auto" → None lets faster-whisper auto-detect language. An override wins over
+        # "auto" but never over an explicitly configured language.
+        configured = self._settings.language
+        language = configured if configured != "auto" else language_override or None
 
         segments: list[Segment] = []
         try:
@@ -261,14 +264,27 @@ class Transcriber:
 
         Each channel is timed separately via on_status so the cost of the mic
         pass (mostly silence while the user listens) is visible on its own.
+
+        The monitor channel goes first so its detected language can be reused for the
+        mic. Both channels are one conversation, but the mic is gated to near silence
+        while the user listens, leaving auto-detection almost nothing to work from — it
+        guessed wrong often enough to produce notes labelled `language: en` whose text
+        was Russian.
         """
-        with stage_timer("transcribe mic", on_status):
-            mic_segments, mic_info = self.transcribe(
-                mic_16k, stage="transcribe mic", on_status=on_status
-            )
         with stage_timer("transcribe monitor", on_status):
             monitor_segments, monitor_info = self.transcribe(
                 monitor_16k, stage="transcribe monitor", on_status=on_status
+            )
+
+        detected = monitor_info.get("language")
+        mic_language = str(detected) if detected else None
+
+        with stage_timer("transcribe mic", on_status):
+            mic_segments, mic_info = self.transcribe(
+                mic_16k,
+                stage="transcribe mic",
+                on_status=on_status,
+                language_override=mic_language,
             )
 
         # Assign speaker="You" to mic segments
