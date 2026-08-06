@@ -27,16 +27,26 @@ locale.setlocale(locale.LC_MESSAGES, "C")
 def _resolve_compute_type(compute_type: str, device: str) -> str:
     """Resolve 'auto' compute type based on device.
 
-    - auto + cuda → float16 (works on 4 GB cards; large-v3-turbo fits in ~1.5 GiB)
+    - auto + cuda → int8_float16
     - auto + cpu  → int8
     - explicit value passes through.
 
-    Users on memory-tight GPUs can pin TAPEBACK_COMPUTE_TYPE=int8 explicitly.
+    int8_float16 rather than float16 because it is faster *and* smaller, which is not
+    the usual trade-off. Measured on a GTX 1650 Ti with large-v3-turbo, same 90 s clip,
+    twice each: float16 3.90x real time and 2139 MiB, int8_float16 **14.16x and
+    1115 MiB**. Quality does not pay for it — decoding the same audio both ways gave
+    near-identical text with single-word differences in both directions, and across the
+    benchmark grid int8_float16 had the lower share of low-confidence words.
+
+    The likely reason is hardware: this is a Turing part without tensor cores, so fp16
+    gets no acceleration while int8 uses the integer datapath. That is a hypothesis;
+    the measurements are not. ctranslate2 falls back on its own if a device does not
+    support the requested type, so this stays safe on other GPUs.
     """
     if compute_type != "auto":
         return compute_type
     if device == "cuda":
-        return "float16"
+        return "int8_float16"
     return "int8"
 
 

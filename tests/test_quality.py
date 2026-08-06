@@ -8,6 +8,10 @@ from tapeback._quality import (
     count_repeated_phrases,
     count_repeated_words,
     find_hallucination_markers,
+    has_speech,
+    low_confidence_rate,
+    punctuation_per_1000_words,
+    strip_hallucinations,
 )
 
 
@@ -90,6 +94,76 @@ def test_count_repeated_phrases_ignores_non_adjacent_recurrence():
     """A phrase recurring later in a meeting is normal speech, not a loop."""
     text = "we need the rag system and then a lot of other words we need the rag"
     assert count_repeated_phrases(text) == 0
+
+
+def test_strip_hallucinations_cuts_the_phrase_and_keeps_the_speech():
+    text = "Ведь решение. Субтитры DimaTorzok штука, куда ты вставляешь summary."
+    assert strip_hallucinations(text) == "Ведь решение. штука, куда ты вставляешь summary"
+
+
+def test_strip_hallucinations_removes_trailing_attribution():
+    assert strip_hallucinations("поскольку Корректор .Кулакова общаются") == ("поскольку общаются")
+
+
+def test_strip_hallucinations_leaves_clean_text_byte_identical():
+    """Clean text must come back untouched — an earlier version ate the full stop."""
+    text = "Обычная реплика про pipeline."
+    assert strip_hallucinations(text) is text
+
+
+def test_strip_hallucinations_can_empty_a_segment():
+    assert strip_hallucinations("Продолжение следует...") == ""
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("слова", True),
+        ("words", True),
+        ("", False),
+        ("   ", False),
+        ("... , ;", False),
+        ("123", False),
+    ],
+)
+def test_has_speech(text, expected):
+    assert has_speech(text) is expected
+
+
+def test_punctuation_per_1000_words():
+    # 10 words, 3 marks -> 300 per 1000.
+    assert (
+        punctuation_per_1000_words("раз, два, три четыре пять шесть семь восемь девять десять.")
+        == 300.0
+    )
+
+
+def test_punctuation_per_1000_words_distinguishes_the_real_failure_mode():
+    """The exact pair a hand comparison turned up: same speech, one unpunctuated."""
+    unpunctuated = "я слышал что то периодически попадаются в новостях то есть это такая вещь"
+    punctuated = (
+        "Я слышал что-то, знаешь, периодически попадаются в новостях, то есть это такая вещь."
+    )
+    assert punctuation_per_1000_words(unpunctuated) == 0.0
+    assert punctuation_per_1000_words(punctuated) > 200.0
+
+
+def test_punctuation_per_1000_words_empty_text():
+    assert punctuation_per_1000_words("") == 0.0
+
+
+@pytest.mark.parametrize(
+    ("probabilities", "threshold", "expected"),
+    [
+        ([0.9, 0.9, 0.9, 0.1], 0.35, 25.0),
+        # Boundary: the threshold itself is NOT below it.
+        ([0.35], 0.35, 0.0),
+        ([0.34], 0.35, 100.0),
+        ([], 0.35, 0.0),
+    ],
+)
+def test_low_confidence_rate(probabilities, threshold, expected):
+    assert low_confidence_rate(probabilities, threshold) == expected
 
 
 def test_count_recognised_terms():

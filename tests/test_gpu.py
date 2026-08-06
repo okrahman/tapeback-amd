@@ -13,6 +13,8 @@ from tapeback._gpu import (
     preload_cuda_libs,
     query_nvidia_smi,
     sample_gpu,
+    thermal_clamp_active,
+    wait_for_clamp_release,
 )
 
 
@@ -122,6 +124,84 @@ def test_get_free_vram_mib(monkeypatch):
 def test_get_free_vram_mib_none_on_unparsable_output(monkeypatch):
     monkeypatch.setattr(_gpu.subprocess, "run", _fake_run("N/A\n"))
     assert get_free_vram_mib() is None
+
+
+@pytest.mark.parametrize(
+    ("reasons_hex", "expected"),
+    [
+        # A healthy idle card reports GpuIdle only.
+        ("0x0000000000000001", False),
+        # SW power cap alone is normal for a 50 W part under load, not a clamp.
+        ("0x0000000000000004", False),
+        # The real observed clamped-at-idle value on this laptop.
+        ("0x0000000000000024", True),
+        ("0x0000000000000020", True),
+        ("0x0000000000000040", True),
+    ],
+)
+def test_thermal_clamp_active(monkeypatch, reasons_hex, expected):
+    monkeypatch.setattr(_gpu.subprocess, "run", _fake_run(f"{reasons_hex}\n"))
+    assert thermal_clamp_active() is expected
+
+
+def test_thermal_clamp_active_unknown_without_nvidia_smi(monkeypatch):
+    def _raise(*_args, **_kwargs):
+        raise FileNotFoundError("nvidia-smi")
+
+    monkeypatch.setattr(_gpu.subprocess, "run", _raise)
+    assert thermal_clamp_active() is None
+
+
+def test_wait_for_clamp_release_returns_when_clear(monkeypatch):
+    monkeypatch.setattr(_gpu.subprocess, "run", _fake_run("0x0000000000000001\n"))
+    slept: list[float] = []
+    assert wait_for_clamp_release(60.0, sleep=slept.append) is True
+    assert slept == []
+
+
+def test_wait_for_clamp_release_polls_until_clear(monkeypatch):
+    responses = iter(["0x24\n", "0x24\n", "0x1\n"])
+
+    def _run(*_args, **_kwargs):
+        return SimpleNamespace(stdout=next(responses), returncode=0)
+
+    monkeypatch.setattr(_gpu.subprocess, "run", _run)
+    slept: list[float] = []
+    reported: list[str] = []
+    assert (
+        wait_for_clamp_release(60.0, poll_interval=5.0, report=reported.append, sleep=slept.append)
+        is True
+    )
+    assert slept == [5.0, 5.0]
+    assert len(reported) == 2
+
+
+def test_wait_for_clamp_release_times_out(monkeypatch):
+    monkeypatch.setattr(_gpu.subprocess, "run", _fake_run("0x24\n"))
+    ticks = iter([0.0, 0.0, 10.0, 100.0])
+    slept: list[float] = []
+    reported: list[str] = []
+    assert (
+        wait_for_clamp_release(
+            60.0,
+            poll_interval=5.0,
+            report=reported.append,
+            clock=lambda: next(ticks),
+            sleep=slept.append,
+        )
+        is False
+    )
+    assert "still thermally clamped" in reported[-1]
+
+
+def test_wait_for_clamp_release_not_blocked_without_nvidia_smi(monkeypatch):
+    """A machine that cannot answer the question must not be made to wait for it."""
+
+    def _raise(*_args, **_kwargs):
+        raise FileNotFoundError("nvidia-smi")
+
+    monkeypatch.setattr(_gpu.subprocess, "run", _raise)
+    assert wait_for_clamp_release(60.0, sleep=lambda _s: None) is True
 
 
 def test_gpu_stats_format():

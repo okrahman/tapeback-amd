@@ -1,6 +1,38 @@
 # Spec: transcription speed and quality
 
-Status: stages 1a, 1b, 1c and 2 landed; stages 3a / 3 / 4 pending.
+Status: stages 1a, 1b, 1c, 2 and 3a landed; stage 3 in progress; 3b / 4 pending.
+
+## Stage 3a result — defaults chosen
+
+Grid of 18 points on 6-minute sampled excerpts, every point run with the thermal clamp
+released (see the thermal note below):
+
+| model | compute | hotwords | RTF | hallu | loops | low-conf % | punct/1k | terms |
+|---|---|---|---|---|---|---|---|---|
+| large-v3 | int8_float16 | off | 7.55 | 0 | 4 | 6.6 | 174 | 5/19 |
+| large-v3 | int8_float16 | on | 6.09 | 0 | 4 | 10.0 | 263 | 9/19 |
+| large-v3-turbo | float16 | off | 3.65 | 1 | 3 | 5.4 | 187 | 10/19 |
+| large-v3-turbo | float16 | on | 4.11 | 0 | 1 | 6.1 | 147 | 13/19 |
+| large-v3-turbo | int8_float16 | off | 13.41 | 2 | 3 | 10.0 | 152 | 10/19 |
+| **large-v3-turbo** | **int8_float16** | **on** | **16.05** | **0** | **1** | **4.9** | 165 | **13/19** |
+
+**Chosen: `large-v3-turbo` + `int8_float16` + hotwords** — best or tied-best in every
+column. Confirmed on the full 31-minute reference recording: 33 distinct English terms
+against 15 originally, low-confidence words 59.4 per 1000 against 124.5, and mic+monitor
+in 194 s against 814 s.
+
+`large-v3` was rejected despite reading better by hand (highest punctuation density, 263)
+because it recognised fewer terms at less than half the speed. The disagreement between
+"reads better" and "recognises terms better" is real and unresolved — it is the reason
+both metrics now exist.
+
+**Thermal caveat that invalidated the first attempt.** The first grid ran with the card in
+an EC clamp and timed the same configuration at **3519 s (RTF 0.31x) against 41 s
+unclamped** — a 25x distortion, at only 68-70 °C, so not heat in the moment. A clamped
+card reports `SW Thermal Slowdown` **at idle** (`0x24`) where a healthy one reports only
+`GpuIdle` (`0x1`); on this laptop it took **451 s of idle** to release. The harness now
+waits for that before every grid point, and the grid runs on short excerpts so no single
+point saturates the chassis.
 
 ## Context
 
@@ -348,6 +380,30 @@ clamp on this chassis, which weakens the stage 1b assumption that it would.
 The model default is fixed **only after measurement**. Grid: `large-v3-turbo` x `large-v3`, each in
 `float16` and `int8_float16`, with `chunk_length` already corrected to 30.
 
+**Model-fit probe done first — it removed a grid point and found a bigger lever than the
+model choice.** Each configuration measured twice on a 90 s clip, in its own process (the
+first attempt was contaminated by the OOM leak described in stage 3b):
+
+| configuration | model VRAM | RTF run1 / run2 |
+|---|---|---|
+| large-v3-turbo / float16 (current default) | 2139 MiB | 3.91x / 3.90x |
+| large-v3-turbo / **int8_float16** | **1115 MiB** | **13.33x / 14.16x** |
+| large-v3 / **int8_float16** | 1883 MiB | **7.21x / 7.04x** |
+| large-v3 / float16 | — | **impossible: OOM at load** |
+
+- **`int8_float16` is 3.6x faster than `float16` on this GPU** and uses half the VRAM.
+  `run1 ≈ run2` in every row, so this is not a warm-up artefact. The current `auto` → `float16`
+  default (set in 0.9.2 on VRAM grounds, without measuring speed) costs a factor of 3.6.
+  Likely cause: the GTX 1650 Ti is TU117, a Turing part **without tensor cores**, so fp16 gets
+  no acceleration while int8 benefits from DP4A integer paths. That explanation is a
+  hypothesis; the measurement is not.
+- **`large-v3` fits, but only in `int8_float16`** — and at 7x it is still ~1.8x faster than the
+  current turbo/float16 default. Confirmed end-to-end: the mic channel of a 31-minute
+  recording took 183.8 s against turbo/float16's 309.3 s.
+- **`large-v3` in `float16` is impossible**, retested with `beam_size=1` and 3674 MiB free —
+  it OOMs on the weights themselves. This grid point is dropped; leaving it in would have
+  spent hours silently transcribing on CPU.
+
 Material — real files with known failures and a pre-written list of terms the model must get right:
 
 - `2026-07-22_18-33-18.wav` — RAG (currently six different spellings), vector search, LLM as judge,
@@ -358,6 +414,21 @@ Material — real files with known failures and a pre-written list of terms the 
 
 Per-run metrics: time, RTF, peak VRAM, sm avg / max temp / % throttled, **how many listed terms were
 recognised correctly**, presence of known hallucination strings, number of repeat loops.
+
+**Two metrics the first hand comparison proved were missing.** Reading three versions of the same
+recording showed large-v3 winning decisively on dimensions nothing automated was measuring:
+
+- **Punctuation and capitalisation.** turbo emitted `я слышал что -то периодически попадаются в
+  новостях то есть это такая вещь которую вроде бы сделали` — one unpunctuated run; large-v3 gave
+  the same speech as `Я слышал что -то, знаешь, периодически попадаются в новостях, то есть это
+  такая вещь, которую вроде бы сделали,` — punctuated, capitalised, and carrying a filler word
+  turbo dropped entirely. Commas per 1000 words: OLD 117, turbo 165, large-v3 167.
+- **Low-confidence word rate** — the italic spans the formatter already emits for
+  `probability < 0.35`, i.e. Whisper's own uncertainty. Per 1000 words: OLD **124.5**, turbo
+  **81.5**, large-v3 **75.1**. This is free to compute and is the single best available proxy for
+  recognition quality.
+
+Both belong in `_quality.py` before the grid's numbers are used to pick a default.
 
 Each configuration is measured twice — without and with `hotwords` — to separate the model's
 contribution from the glossary's. Output: a table in CHANGELOG/README and fixed defaults for
@@ -379,6 +450,28 @@ contribution from the glossary's. Output: a table in CHANGELOG/README and fixed 
   `_merge_consecutive_speakers`. Failing test: 31 minutes of single-speaker segments must produce
   more than one timecode.
 - Drop the "Diarized Transcript" section when it matches the main one segment for segment.
+
+### Stage 3b — VRAM is not released after a CUDA OOM fallback
+
+Observed three times while probing models. When a model fails to load with
+`CUDA failed with error out of memory` and `Transcriber` falls back to CPU, the GPU
+allocation is not returned: free VRAM went 3674 MiB → **95 MiB** and stayed there for the
+remainder of the process.
+
+`free_gpu_memory()` calls `torch.cuda.empty_cache()`, but the memory is held by
+**ctranslate2**, which has its own allocator and is unaffected by torch's cache. The failed
+`WhisperModel` object is also still referenced by the exception's traceback frame at the
+point the fallback runs.
+
+Consequences in the real pipeline: after a transcription OOM the diarizer's
+`get_free_vram_mib()` check sees almost nothing and silently drops to CPU as well, so one
+OOM degrades the whole run rather than just the transcription stage. Anything else measured
+in the same process afterwards is measured on a starved card — this invalidated one of the
+model-probe grid points until it was re-run in a clean process.
+
+Candidate fixes to evaluate: drop the reference before retrying (so the failed model is
+collectable), and call ctranslate2's own release path if one exists, otherwise isolate model
+loading so a failure cannot leave the allocation behind.
 
 ### Stage 4 — stop losing work (the reason 16 recordings vanished)
 

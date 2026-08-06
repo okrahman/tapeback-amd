@@ -1,10 +1,18 @@
 from tapeback import const
+from tapeback._quality import has_speech, strip_hallucinations
 from tapeback.models import Segment
 
 # Words with probability below this are marked as uncertain (italic in markdown).
 # 0.35 is tuned for multilingual speech: English loanwords inside Russian sentences
 # (code-switching) often come back with 0.3-0.5 probability even when correct.
 WORD_LOW_CONFIDENCE = 0.35
+
+# Upper bound on how much audio one merged block may span, in seconds.
+# Merging is driven by speaker identity and pause length, neither of which bounds the
+# result: a long uninterrupted monologue merged into a single block, so a 31-minute
+# recording rendered with its last timecode at [00:00:45]. The text was intact but
+# unnavigable. 60s keeps a block readable while still giving a timecode a minute.
+MAX_BLOCK_SECONDS = 60.0
 
 
 def _format_timecode(seconds: float) -> str:
@@ -41,12 +49,16 @@ def _format_duration_hms(seconds: float) -> str:
 def _merge_consecutive_speakers(
     segments: list[Segment],
     pause_threshold: float = 1.0,
+    max_block_seconds: float = MAX_BLOCK_SECONDS,
 ) -> list[tuple[float, str | None, str]]:
     """Merge consecutive segments from the same speaker into one block.
 
     Segments from the same speaker are NOT merged when the gap between them
     exceeds pause_threshold — this preserves intentional pauses within a
     single speaker's speech.
+
+    A block is also closed once it spans max_block_seconds, so an uninterrupted
+    monologue still gets timecodes to navigate by.
 
     Returns list of (start_time, speaker, merged_text).
     """
@@ -61,7 +73,8 @@ def _merge_consecutive_speakers(
 
     for seg in segments[1:]:
         gap = seg.start - current_end
-        if seg.speaker == current_speaker and gap < pause_threshold:
+        too_long = seg.end - current_start >= max_block_seconds
+        if seg.speaker == current_speaker and gap < pause_threshold and not too_long:
             current_texts.append(seg.text)
             current_end = seg.end
         else:
@@ -114,12 +127,33 @@ def _mark_low_confidence_words(segment: Segment) -> Segment:
     )
 
 
+def _strip_hallucinated_text(segment: Segment) -> Segment:
+    """Drop subtitle-corpus phrases from a segment's text.
+
+    Words are left untouched: they still carry the timings that channel filtering and
+    diarization resegmentation depend on, and the italic markup pass reads the text,
+    not the word list.
+    """
+    cleaned = strip_hallucinations(segment.text)
+    if cleaned == segment.text:
+        return segment
+    return Segment(
+        start=segment.start,
+        end=segment.end,
+        text=cleaned,
+        words=segment.words,
+        speaker=segment.speaker,
+    )
+
+
 def _format_segments_block(segments: list[Segment]) -> list[str]:
     """Format a list of segments into timecoded markdown lines.
 
     Low-confidence words (probability < 0.5) are marked with *italics*.
     """
     long_enough = [s for s in segments if s.end - s.start >= const.MIN_SEGMENT_DURATION]
+    long_enough = [_strip_hallucinated_text(s) for s in long_enough]
+    long_enough = [s for s in long_enough if has_speech(s.text)]
     long_enough = [_mark_low_confidence_words(s) for s in long_enough]
     merged = _merge_consecutive_speakers(long_enough)
 

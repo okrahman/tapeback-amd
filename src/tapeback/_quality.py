@@ -33,6 +33,8 @@ MIN_REPEAT_RUN = 3
 LOOP_NGRAM_SIZE = 3
 MIN_NGRAM_REPEATS = 2
 
+PERCENT = 100.0
+
 
 def _words(text: str) -> list[str]:
     return [match.group().lower() for match in _WORD_RE.finditer(text)]
@@ -53,6 +55,39 @@ def count_hallucination_markers(text: str) -> int:
     """Total occurrences (not distinct markers) of subtitle-corpus phrases."""
     haystack = text.lower()
     return sum(haystack.count(marker) for marker in const.HALLUCINATION_MARKERS)
+
+
+def strip_hallucinations(text: str) -> str:
+    """Remove subtitle-corpus phrases, leaving the surrounding speech intact.
+
+    The markers turn up mid-sentence, splitting real speech ("Ведь решение...
+    Субтитры DimaTorzok штука, куда ты вставляешь summary"), so the phrase is cut out
+    rather than the segment being discarded — dropping the whole segment would lose
+    what was actually said. The trailing name a credit carries ("Корректор .Кулакова",
+    "Субтитры DimaTorzok") is removed with it, since it is part of the same artefact.
+
+    Returns the cleaned text, which may be empty when the segment was nothing else.
+    """
+    cleaned = text
+    for marker in const.HALLUCINATION_MARKERS:
+        # Optional trailing attribution: ".Кулакова", "DimaTorzok", "Семкин".
+        pattern = re.compile(rf"{re.escape(marker)}\s*\.?\s*[^\W\d_]*", re.IGNORECASE | re.UNICODE)
+        cleaned = pattern.sub(" ", cleaned)
+
+    # Only tidy up when something was actually removed. Running the cleanup
+    # unconditionally rewrote every clean segment too — it stripped the closing full
+    # stop off ordinary speech, which the formatter tests caught.
+    if cleaned == text:
+        return text
+
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    cleaned = re.sub(r"\s+([,.!?;:])", r"\1", cleaned)
+    return cleaned.strip(" .,;:")
+
+
+def has_speech(text: str) -> bool:
+    """True if anything but punctuation and whitespace remains."""
+    return bool(_WORD_RE.search(text))
 
 
 def count_repeated_words(text: str, min_run: int = MIN_REPEAT_RUN) -> int:
@@ -107,6 +142,35 @@ def count_repeated_phrases(
         else:
             index += 1
     return loops
+
+
+def punctuation_per_1000_words(text: str) -> float:
+    """Commas and sentence terminators per 1000 words.
+
+    Added after a hand comparison showed the metric suite was blind to the thing that
+    most affects reading: one model returned an unpunctuated run of speech where
+    another returned the same words as sentences. Density rather than a count, so
+    transcripts of different lengths compare.
+    """
+    words = _words(text)
+    if not words:
+        return 0.0
+    marks = len(re.findall(r"[,.!?;:]", text))
+    return marks / len(words) * 1000
+
+
+def low_confidence_rate(probabilities: list[float], threshold: float) -> float:
+    """Share of words Whisper itself scored below ``threshold``, as a percentage.
+
+    The model's own uncertainty is the cheapest honest proxy for recognition
+    quality — it needs no reference transcript and no glossary. Measured across
+    three configurations of one recording it ordered them exactly as a human
+    reading did.
+    """
+    if not probabilities:
+        return 0.0
+    below = sum(1 for probability in probabilities if probability < threshold)
+    return below / len(probabilities) * PERCENT
 
 
 def count_recognised_terms(text: str, terms: list[str]) -> tuple[int, list[str]]:

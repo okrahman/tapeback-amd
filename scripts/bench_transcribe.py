@@ -34,14 +34,17 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from tapeback._gpu import sample_gpu
+from tapeback._gpu import sample_gpu, wait_for_clamp_release
 from tapeback._quality import (
     count_hallucination_markers,
     count_recognised_terms,
     count_repeated_phrases,
     count_repeated_words,
     find_hallucination_markers,
+    low_confidence_rate,
+    punctuation_per_1000_words,
 )
+from tapeback.formatter import WORD_LOW_CONFIDENCE
 from tapeback.settings import Settings
 from tapeback.transcriber import Transcriber
 
@@ -63,6 +66,8 @@ class Result:
     hallucinations_found: list[str]
     repeated_words: int
     repeated_phrases: int
+    punctuation_per_1000: float
+    low_confidence_percent: float
     terms_expected: int
     terms_found: int
     terms_missing: list[str]
@@ -116,6 +121,8 @@ def run_one(
             hallucinations_found=[],
             repeated_words=0,
             repeated_phrases=0,
+            punctuation_per_1000=0.0,
+            low_confidence_percent=0.0,
             terms_expected=len(terms),
             terms_found=0,
             terms_missing=list(terms),
@@ -129,6 +136,7 @@ def run_one(
     text = " ".join(segment.text for segment in segments)
     duration = float(info.get("duration", 0.0))
     found, missing = count_recognised_terms(text, terms)
+    probabilities = [word.probability for segment in segments for word in (segment.words or [])]
 
     return Result(
         recording=audio.name,
@@ -144,6 +152,8 @@ def run_one(
         hallucinations_found=find_hallucination_markers(text),
         repeated_words=count_repeated_words(text),
         repeated_phrases=count_repeated_phrases(text),
+        punctuation_per_1000=round(punctuation_per_1000_words(text), 1),
+        low_confidence_percent=round(low_confidence_rate(probabilities, WORD_LOW_CONFIDENCE), 1),
         terms_expected=len(terms),
         terms_found=found,
         terms_missing=missing,
@@ -175,8 +185,9 @@ def _summary(results: list[Result]) -> str:
         by_config.setdefault((r.model, r.compute_type, r.hotwords), []).append(r)
 
     lines = [
-        "| model | compute | hotwords | median RTF | hallu total | loops total | terms |",
-        "|---|---|---|---|---|---|---|",
+        "| model | compute | hotwords | median RTF | hallu | loops | low-conf % "
+        "| punct/1k | terms |",
+        "|---|---|---|---|---|---|---|---|---|",
     ]
     for (model, compute, hot), group in sorted(by_config.items()):
         found = sum(r.terms_found for r in group)
@@ -185,7 +196,10 @@ def _summary(results: list[Result]) -> str:
         lines.append(
             f"| {model} | {compute} | {hot} | "
             f"{statistics.median(r.rtf for r in group):.2f}x | "
-            f"{sum(r.hallucination_markers for r in group)} | {loops} | {found}/{expected} |"
+            f"{sum(r.hallucination_markers for r in group)} | {loops} | "
+            f"{statistics.median(r.low_confidence_percent for r in group):.1f} | "
+            f"{statistics.median(r.punctuation_per_1000 for r in group):.0f} | "
+            f"{found}/{expected} |"
         )
     return "\n".join(lines)
 
@@ -210,6 +224,17 @@ def main() -> int:
             "table measures queue position as much as configuration. Set 60-120 there."
         ),
     )
+    parser.add_argument(
+        "--clamp-timeout",
+        type=float,
+        default=0.0,
+        help=(
+            "Before each grid point, wait up to this many seconds for a GPU thermal "
+            "clamp to release. A clamped card timed the same configuration at 3519s "
+            "against 41s unclamped, so without this a long grid tabulates thermal "
+            "state instead of settings. 0 disables the wait."
+        ),
+    )
     args = parser.parse_args()
 
     entries = _load_manifest(args.manifest)
@@ -232,6 +257,11 @@ def main() -> int:
                     if not audio.exists():
                         print(f"  skipped: {audio} not found", flush=True)
                         continue
+                    if args.clamp_timeout:
+                        wait_for_clamp_release(
+                            args.clamp_timeout,
+                            report=lambda m: print(f"  {m}", flush=True),
+                        )
                     settings = Settings(
                         whisper_model=model,
                         compute_type=compute,

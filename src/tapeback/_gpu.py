@@ -6,6 +6,7 @@ import gc
 import importlib
 import subprocess
 import threading
+import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -34,6 +35,12 @@ THROTTLE_MASK = (
     | THROTTLE_HW_THERMAL
     | THROTTLE_HW_POWER_BRAKE
 )
+
+# Thermal slowdown specifically. On a laptop whose embedded controller clamps the GPU,
+# these bits stay set at IDLE long after the temperature has dropped — a healthy idle
+# card reports only GpuIdle (0x1). That difference is what makes the clamp detectable
+# without running a load: SW power cap alone (0x4) is normal for a 50 W part under work.
+THERMAL_CLAMP_MASK = THROTTLE_SW_THERMAL | THROTTLE_HW_THERMAL
 
 PERCENT = 100.0
 
@@ -113,6 +120,54 @@ def get_free_vram_mib() -> int | None:
         return int(values[0])
     except ValueError:
         return None
+
+
+def thermal_clamp_active() -> bool | None:
+    """True if the GPU currently reports a thermal slowdown. None if unknown.
+
+    Distinct from `sample_gpu`'s throttle accounting, which measures a stage after
+    the fact. This is the "is it safe to measure anything right now" question.
+    """
+    values = query_nvidia_smi("clocks_event_reasons.active")
+    if not values:
+        return None
+    try:
+        reasons = int(values[0], 16)
+    except ValueError:
+        return None
+    return bool(reasons & THERMAL_CLAMP_MASK)
+
+
+def wait_for_clamp_release(
+    timeout: float,
+    *,
+    poll_interval: float = GPU_SAMPLE_INTERVAL_SEC,
+    report: Callable[[str], None] | None = None,
+    clock: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], None] = time.sleep,
+) -> bool:
+    """Block until the thermal clamp releases, or ``timeout`` seconds pass.
+
+    A benchmark run on a clamped card measures the clamp, not the configuration:
+    the same setting timed 3519 s clamped against 41 s unclamped here. Without this
+    wait, a long grid silently produces a table of thermal state.
+
+    Returns True if the card is (or became) clear, False on timeout. Returns True
+    when the clamp cannot be read at all, so a machine without nvidia-smi is never
+    blocked by a check it cannot perform.
+    """
+    deadline = clock() + timeout
+    while True:
+        clamped = thermal_clamp_active()
+        if clamped is None or not clamped:
+            return True
+        if clock() >= deadline:
+            if report:
+                report(f"GPU still thermally clamped after {timeout:.0f}s — measuring anyway")
+            return False
+        if report:
+            report("GPU thermally clamped, waiting for it to release...")
+        sleep(poll_interval)
 
 
 @dataclass(frozen=True)

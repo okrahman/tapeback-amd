@@ -20,7 +20,9 @@ from tapeback.transcriber import Transcriber, _resolve_compute_type
         pytest.param("float32", "cpu", "float32", id="explicit_float32"),
         # Auto: device-driven only — no VRAM probing
         pytest.param("auto", "cpu", "int8", id="auto_cpu"),
-        pytest.param("auto", "cuda", "float16", id="auto_cuda"),
+        # int8_float16, not float16: measured 14.16x vs 3.90x real time on the same
+        # clip and half the VRAM, with no quality cost.
+        pytest.param("auto", "cuda", "int8_float16", id="auto_cuda"),
     ],
 )
 def test_resolve_compute_type(requested, device, expected):
@@ -225,6 +227,13 @@ def test_hotwords_reach_whisper_when_configured(settings):
         Transcriber(s).transcribe(Path("/fake/audio.wav"))
 
     assert instance.transcribe.call_args.kwargs["hotwords"] == "RAG, ONNX, OpenVINO"
+
+
+def test_default_hotwords_cover_the_terms_the_model_mangles(settings):
+    """The shipped glossary must contain the vocabulary that measurably failed."""
+    glossary = settings.hotwords.lower()
+    for term in ("tapeback", "whisper", "obsidian", "llm", "rag", "onnx", "jira"):
+        assert term in glossary, term
 
 
 def test_hotwords_omitted_when_empty(settings):

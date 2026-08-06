@@ -16,6 +16,19 @@ DEFAULT_MODELS: dict[str, str] = {
     "qwen": "qwen-turbo",
 }
 
+# Terms decoding is biased towards by default (faster-whisper `hotwords`). Whisper
+# mangles English technical vocabulary embedded in Russian speech — "tapeback" came
+# back as "ты пупа ты бэк", "Whisper" as "виспер". Measured on a 31-minute recording,
+# this list raised distinct English terms preserved in Latin script from 25 to 33 and
+# cut the share of low-confidence words from 81.5 to 59.4 per 1000. It also reduced
+# hallucinations rather than adding them (2 -> 0 across the benchmark grid), because a
+# biased decoder wanders less. Override with TAPEBACK_HOTWORDS for a different domain.
+DEFAULT_HOTWORDS = (
+    "RAG, ONNX, OpenVINO, LLM, Whisper, Obsidian, tapeback, Excalidraw, Jira, Trello, "
+    "Notion, Slack, Kanban, VPN, MCP, embeddings, vector search, retrieval, pipeline, "
+    "summary, markdown, dogfooding"
+)
+
 type LLMProvider = Literal[
     "anthropic",
     "openai",
@@ -60,7 +73,7 @@ class Settings(BaseSettings):
     # Comma-separated terms to bias decoding towards (faster-whisper `hotwords`).
     # For domain vocabulary Whisper mangles — product names, acronyms, English
     # technical terms inside Russian speech. Empty disables the bias entirely.
-    hotwords: str = ""
+    hotwords: str = DEFAULT_HOTWORDS
     vad_filter: bool = True
     # Seconds of audio consumed per decode window. Whisper's encoder is FIXED at 30 s:
     # faster-whisper zero-pads every window back to 3000 mel frames before encoding
