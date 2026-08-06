@@ -24,7 +24,9 @@ No web servers, databases, Docker.
 
 ## Architecture
 
-- Source: `src/tapeback/` — cli.py, recorder.py, audio.py, transcriber.py, diarizer.py, channel.py, formatter.py, vault.py, summarizer.py, models.py, settings.py, const.py, tray.py, pipeline.py
+- Source: `src/tapeback/` — cli.py, recorder.py, audio.py, transcriber.py, diarizer.py, channel.py, formatter.py, vault.py, summarizer.py, models.py, settings.py, const.py, tray.py, pipeline.py, glossary.py
+- Private helpers are `_`-prefixed: `_gpu.py` (nvidia-smi, thermal clamp, VRAM), `_worker.py` + `_isolated.py` (out-of-process transcription), `_resume.py` (reusing a finished channel), `_quality.py` (transcript metrics and the hallucination filter), `_runlog.py`, `_timing.py`, `_lazy.py`
+- Benchmarks live in `scripts/bench_transcribe.py` — it drives the real `Transcriber`, so it measures what ships. Configuration choices here are made from its table, not from reasoning; see `.claude/plans/BACKLOG.md` for what that has already overturned.
 - Constants: `src/tapeback/const.py` — import as `from tapeback import const`, use as `const.SPEAKER_YOU`
 - Domain models (Segment, Word, DiarizationSegment, Summary, ActionItem) live in models.py — never in infrastructure modules
 - Settings: pydantic-settings with `TAPEBACK_` prefix, env vars and `.env` only

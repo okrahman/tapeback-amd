@@ -317,7 +317,8 @@ All settings via environment variables (prefix `TAPEBACK_`) or
 | `TAPEBACK_RESUME_CACHE_DIR` | *(XDG)* | Where reusable channel results go. Default `~/.local/share/tapeback/resume` |
 | `TAPEBACK_ISOLATE_TRANSCRIPTION` | `true` | Run transcription in a child process. A CUDA out-of-memory permanently leaks VRAM inside the process it happens in — a child can simply exit and the kernel reclaims it. Costs one process start and model load per run; set `false` to transcribe in-process |
 | `TAPEBACK_MIN_FREE_VRAM_MIB` | `1200` | Use the CPU rather than attempting a CUDA load below this much free VRAM. The smallest measured configuration needs ~1115 MiB |
-| `TAPEBACK_THERMAL_CLAMP_WAIT` | `60` | Seconds to wait for a GPU thermal clamp to release before transcribing. `0` disables the check. See "Transcription is suddenly very slow" below |
+| `TAPEBACK_THERMAL_CLAMP_CHECK` | `true` | Look for a GPU thermal clamp before each transcription stage. One `nvidia-smi` query, retaken per stage — which is what lets a run return to the GPU once the card recovers. See "Transcription is suddenly very slow" below |
+| `TAPEBACK_THERMAL_CLAMP_WAIT` | `0` | Seconds to wait for the clamp to release before giving up on the GPU for this stage. Default is not to wait: the clamp clears on *system* idle and the shortest release measured was 451 s, so any tolerable wait rarely succeeds while the CPU would already be transcribing. Raise it only if the machine will genuinely be idle |
 | `TAPEBACK_THERMAL_CLAMP_CPU_FALLBACK` | `true` | Transcribe on CPU when the clamp has not released. A clamped GPU measured ~8× slower than the CPU, so falling back is the fast path, not a degradation |
 | `TAPEBACK_STAGE_PAUSE_SECONDS` | `0` | Idle gap after each transcription stage, to shed heat instead of driving the chassis into a clamp. Try `60` on a laptop that clamps during long recordings |
 | `TAPEBACK_RUN_LOG` | `true` | Write one JSON record per run (settings used, every status line, outcome) so a failed or interrupted run can be diagnosed afterwards. Never contains credentials |
@@ -332,6 +333,8 @@ All settings via environment variables (prefix `TAPEBACK_`) or
 | `TAPEBACK_MULTILINGUAL` | `false` | Per-segment language detection for mixed-language recordings (code-switching). Less stable than a fixed `TAPEBACK_LANGUAGE` |
 | `TAPEBACK_HALLUCINATION_SILENCE_THRESHOLD` | *(off)* | Seconds; skip silent gaps when a hallucination is detected. ⚠ Triggers per-segment re-processing — can be **much slower** on pause-heavy channels (e.g. the mic). Leave off unless it measurably helps your audio |
 | `TAPEBACK_HOTWORDS` | *(project glossary)* | Comma-separated terms decoding is biased towards — see [`src/tapeback/glossary.py`](src/tapeback/glossary.py). Whisper mangles English terms embedded in Russian speech ("tapeback" → "ты пупа ты бэк"); with the glossary it comes back as "tapeback". Replace with your own domain vocabulary; empty disables the bias. **Keep it under ~223 tokens (~670 characters)** — faster-whisper silently truncates beyond that, so extra terms stop working with no warning |
+| `TAPEBACK_VAD_FILTER` | `true` | Silero voice-activity detection before decoding. Load-bearing: it is a large part of why Whisper stopped hallucinating on silence. Turning it off is not a speed optimisation |
+| `TAPEBACK_CONDITION_ON_PREVIOUS_TEXT` | `false` | Feed the previous window's output back as a prompt. Whisper's own default is `true`; off here because it makes repeat loops much stickier |
 | `TAPEBACK_PAUSE_THRESHOLD` | `1.0` | Seconds; split segments on silence gaps >= this |
 | `TAPEBACK_GATE_MIC_SILENCE` | `true` | Silence the mic channel where you're only listening (mic quiet / monitor dominant) before transcription, so Whisper doesn't loop on the pauses. Dual-channel pipeline only |
 
@@ -359,6 +362,7 @@ All settings via environment variables (prefix `TAPEBACK_`) or
 | `TAPEBACK_DIARIZE` | `true` | Enable speaker diarization |
 | `TAPEBACK_HF_TOKEN` | *(empty)* | HuggingFace token ([setup](#speaker-diarization)) |
 | `TAPEBACK_MAX_SPEAKERS` | *(auto)* | Maximum number of speakers |
+| `TAPEBACK_CLUSTERING_THRESHOLD` | *(pyannote default)* | Speaker-clustering threshold passed to pyannote. Lower splits speakers more readily, higher merges them |
 | `TAPEBACK_SPECTRAL_MERGE_THRESHOLD` | `0.96` | Spectral speaker merging (0 = off; lower merges more aggressively) |
 
 ### LLM summarization
@@ -380,33 +384,39 @@ Processing reports what it is doing, how long each stage took, and where Whisper
 actually ran:
 
 ```
+Stage 'load channels' took 0.7s
 Splitting channels...
-Stage 'load channels' took 1.2s
-Stage 'split' took 36.3s
-Stage 'gate mic' took 2.1s
+Stage 'split' took 82.0s
+Stage 'gate mic' took 2.3s
 Transcribing (this may take a few minutes)...
-Stage 'load model' took 10.6s
-Whisper: large-v3-turbo on cuda/float16
-  transcribe mic: 40% (2:31 / 6:18)
-  transcribe mic: 80% (5:02 / 6:18)
-Stage 'transcribe mic' took 94.2s
-GPU: sm 1832 MHz avg / 1005 min, max 87°C, 2428 MiB peak, throttled 35% of 40 samples
+Stage 'load model' took 2.3s
+Whisper: large-v3-turbo in an isolated worker
+Whisper: large-v3-turbo on cuda/int8_float16
+  transcribe monitor: 47% (14:58 / 31:40)
+  transcribe monitor: 100% (31:36 / 31:40)
+Stage 'transcribe monitor' took 322.1s
+Pausing 60s to let the GPU cool...
+Stage 'transcribe mic' took 106.9s
+GPU: sm 1035 MHz avg / 300 min, max 87°C, 1436 MiB peak, throttled 56% of 78 samples
 ```
 
-Three lines are worth watching:
+The monitor channel is transcribed first so its detected language can be reused for the
+microphone, which is mostly silence while you are listening and guesses badly on its own.
 
-- **`Whisper: <model> on <device>/<compute type>`** — if this says `cpu/int8` when you
-  expect `cuda`, the run silently fell back to CPU and will be roughly an order of
-  magnitude slower. See the CUDA 13 section below. When batching is enabled the line
-  also shows `batch_size=N`.
-- **`transcribe mic: NN%`** — progress through the audio, printed every 10 seconds.
-  If the percentage stops advancing, the model is stuck in a repeat loop on that
-  channel rather than working.
+Lines worth watching:
+
+- **`Whisper: <model> on <device>/<compute type>`** — printed by the worker once it has
+  resolved where it will actually run. If it says `cpu/int8` when you expect `cuda`, look
+  just above it for the reason: a thermal clamp, too little free VRAM, or the CUDA 13
+  library problem below. With batching enabled the line also shows `batch_size=N`.
+- **`transcribe monitor: NN%`** — progress through the audio, printed every 10 seconds.
+  If the percentage stops advancing, the model is stuck in a repeat loop on that channel
+  rather than working.
 - **`GPU: sm … throttled NN%`** — a high throttled share together with a low minimum
-  clock means the card was held back by heat or its power limit, not by the model.
-  On thermally constrained laptops a long run can end up clamped for its entire
-  remainder. tapeback only reports this; changing clock or power caps needs root and
-  is left to external tooling. Disable with `TAPEBACK_GPU_TELEMETRY=false`.
+  clock means the card was held back by heat or its power limit, not by the model. This
+  line is a report of what already happened; the *decision* is made before each stage, and
+  a card found clamped is skipped in favour of the CPU. Disable the reporting with
+  `TAPEBACK_GPU_TELEMETRY=false`.
 
 ### A run failed or you interrupted it — what happened?
 
@@ -436,16 +446,32 @@ CPU package           93 °C      (this is what the controller is reacting to)
 ```
 
 The GPU is not overheating; it is being cut to a tenth of its power budget to protect a
-shared cooler. Two things follow:
+shared cooler. Three things follow.
 
-- **It does not clear when the work stops.** Measured: ~450 s of idle after moderate
-  heating, and still latched after 900 s once the chassis was saturated. Only idling
-  releases it.
-- **The CPU is faster in this state** — 2.39× real time against 0.31× on the clamped GPU.
-  tapeback detects the clamp before transcribing and moves to the CPU, printing a
-  warning. Disable with `TAPEBACK_THERMAL_CLAMP_CPU_FALLBACK=false`.
+**It clears on system idle, not on the GPU cooling down.** Measured: ~450 s of idle after
+moderate heating, still latched after 900 s once the chassis was saturated, and still
+latched an hour later with the GPU down to 72 °C while a browser kept the CPU busy. If
+you are using the machine, it will not release — so waiting for it is not a strategy, and
+`TAPEBACK_THERMAL_CLAMP_WAIT` defaults to 0.
 
-To avoid it rather than react to it: set `TAPEBACK_STAGE_PAUSE_SECONDS=60` so long
+**The CPU is faster in this state** — 2.39× real time against 0.31× on the clamped GPU.
+tapeback checks before each stage and moves to the CPU, saying so. Disable with
+`TAPEBACK_THERMAL_CLAMP_CPU_FALLBACK=false`.
+
+**A run that fell back is not stuck there.** The check is retaken for every stage, each of
+which runs in its own worker process, so a clamp that clears between channels puts the
+next one back on the GPU.
+
+You can tell a clamped card from a merely busy one without any load: a healthy GPU
+reports only `GpuIdle` when idle, a clamped one still reports a thermal reason.
+
+```bash
+nvidia-smi --query-gpu=clocks_event_reasons.active,enforced.power.limit --format=csv,noheader
+# 0x0000000000000001, 50.00 W   -> healthy
+# 0x0000000000000024,  5.00 W   -> clamped
+```
+
+To avoid it rather than react to it, set `TAPEBACK_STAGE_PAUSE_SECONDS=60` so long
 recordings shed heat between channels. The larger lever is the CPU, not the GPU — these
 machines often ship with a sustained CPU power limit well above the chip's class, and
 capping it (or disabling turbo) keeps the whole system out of the clamp. That needs root,

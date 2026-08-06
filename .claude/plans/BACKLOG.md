@@ -122,25 +122,80 @@ had never actually run.
 
 ## 3. `loudnorm` is our own worst thermal contributor
 
-**Measured.** The `split` stage is 98 % `loudnorm`: without it 0.5 s, with it 31.6 s on a
-16-minute recording, and it holds the CPU package at 94 °C for the whole time. `ffmpeg
--filter_threads` does not help (34.4 s). It runs immediately before transcription, so it
-hands the GPU a chassis that is already saturated.
+**Measured 2026-08-06**, same 16-minute recording, each variant after a cooldown:
 
-**Options, in order of confidence.**
+| filter | time | CPU package start → peak |
+|---|---|---|
+| `loudnorm` (current) | **39 s** | 85 → **94 °C** |
+| `dynaudnorm` | **1 s** | 86 → 86 °C |
+| `speechnorm` | 1 s | 93 → 93 °C |
+| none (resample only) | 3 s | 92 → 93 °C |
 
-1. Limit ffmpeg's thread count so the same work is spread thinner. Lowers peak
-   temperature, costs wall-clock. Needs measuring: peak °C and duration for
-   `-threads 1|2|4`.
-2. Replace EBU R128 with something cheaper (`dynaudnorm`, `speechnorm`, or a plain gain
-   from a first-pass RMS). Much less CPU, but it changes what Whisper receives.
-3. Drop normalisation entirely and let Whisper's own feature scaling handle level.
+So the whole cost of the `split` stage is `loudnorm`, and it is also the entirety of
+tapeback's own contribution to chassis heat — 9 °C on top of whatever the desktop is
+already doing, immediately before the GPU is asked to work.
 
-**Why it is not done.** 2 and 3 are quality changes wearing a performance costume. The
-project has twice reverted a "speed" change that measured worse (a shortened temperature
-ladder, a lowered `chunk_length`), so this one goes through the stage-3a harness —
-`scripts/bench_transcribe.py` with normalisation as the varied axis — before anything
-ships. Option 1 is safe and can be measured on its own.
+**Thread limiting was tried and does nothing.**
+
+| variant | time | peak | ffmpeg CPU |
+|---|---|---|---|
+| baseline | 37.0 s | 94 °C | 96 % |
+| `-filter_threads 1` | 36.0 s | 95 °C | 99 % |
+| `-threads 1 -filter_threads 1` | 38.0 s | 94 °C | 99 % |
+
+ffmpeg uses ~96-99 % — one core — even though the graph asks for two `loudnorm` chains;
+it interleaves them on a single thread rather than running them in parallel. There is no
+load to spread, so "spread it thinner" is not an available move. Only doing *less work*
+is.
+
+### The A/B was run — quality is equivalent except on one axis
+
+Three recordings, both channels, 6 minutes sampled from across each (3x2-minute slices),
+rendered through the production filter chain and transcribed with everything else fixed
+(large-v3-turbo, int8, CPU, glossary on).
+
+| set | hallu | rep-w | rep-p | low-conf % | punct/1k | terms | chars |
+|---|---|---|---|---|---|---|---|
+| mon / loudnorm | 1 | 1 | 1 | 1.3 | 248 | 4/19 | 4061 |
+| mon / dynaudnorm | 1 | 1 | 1 | 1.3 | 254 | 4/19 | 4143 |
+| mic / loudnorm | 0 | 1 | **3** | **11.5** | **140** | 10/19 | 4208 |
+| mic / dynaudnorm | 0 | 1 | **0** | **10.1** | **92** | 9/19 | 4362 |
+
+**Monitor channel: identical.** Every metric matches; the punctuation difference
+(248 vs 254) is noise.
+
+**Mic channel — the quiet one normalisation exists for:** `dynaudnorm` is *better* on
+recognition confidence (10.1 % vs 11.5 % low-confidence words) and on phrase loops
+(0 vs 3), level on hallucinations, and one term behind out of nineteen — noise at this
+sample size.
+
+**The one real difference is punctuation on the quiet channel: 92 against 140 per 1000
+words.** That is the same axis on which `large-v3` beat turbo in stage 3a, and the axis
+the metric suite was originally blind to — it was found by reading, not measuring. A
+third less punctuation is probably not noise.
+
+### Recommendation: do not switch the default
+
+The saving is real and large — 39 s and 9 °C on every recording. But the only quality
+difference found lands on readability of the quiet channel, which this project has
+repeatedly under-valued and then regretted. Trading it for 39 seconds is the same deal
+that was reverted twice before.
+
+**Worth doing instead:** make it a setting (`TAPEBACK_NORMALISATION=loudnorm |
+dynaudnorm | none`) keeping `loudnorm` as the default, so a hot or weak machine can take
+the cheap path deliberately without changing anyone else's output.
+
+### Caveats on the measurement
+
+- **Timings from that run are void.** The machine was thrashing swap throughout —
+  load 10–18, 33–38 % iowait, the worker sometimes at 0.4 % CPU. Transcript *text* is
+  deterministic with respect to the audio, so the quality columns stand; RTF does not.
+- Small sample: 3 recordings x 6 minutes per side.
+- **Silence gating was not reproduced.** In production the mic channel is zeroed where
+  the user is only listening, before transcription; these clips were ungated, so Whisper
+  saw more silence than it really would. The gate measures the *pre*-normalisation
+  signal (`SILENCE_RMS_THRESHOLD` on raw channels), so it is unaffected by the filter
+  choice either way — but the real quiet-channel behaviour is gentler than this test.
 
 ---
 
