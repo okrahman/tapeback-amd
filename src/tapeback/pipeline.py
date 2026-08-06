@@ -37,7 +37,7 @@ from tapeback.diarizer import (
     merge_channel_segments,
     merge_similar_speakers,
 )
-from tapeback.formatter import format_markdown
+from tapeback.formatter import TranscriptMeta, format_markdown
 from tapeback.models import Segment
 from tapeback.recorder import Recorder, validate_session_name
 from tapeback.settings import Settings
@@ -98,10 +98,13 @@ def stop_and_process(
 
         markdown = format_markdown(
             segments=segments,
-            session_name=session_name,
-            audio_rel_path=audio_rel_path,
-            duration_seconds=float(info.get("duration", 0.0)),
-            language=str(info.get("language", settings.language)),
+            meta=TranscriptMeta(
+                session_name=session_name,
+                audio_rel_path=audio_rel_path,
+                duration_seconds=float(info.get("duration", 0.0)),
+                language=str(info.get("language", settings.language)),
+                partial=bool(info.get("partial")),
+            ),
             raw_segments=raw_segments,
         )
 
@@ -152,10 +155,13 @@ def process_file(
 
         markdown = format_markdown(
             segments=segments,
-            session_name=name,
-            audio_rel_path=audio_rel_path,
-            duration_seconds=float(info.get("duration", 0.0)),
-            language=str(info.get("language", settings.language)),
+            meta=TranscriptMeta(
+                session_name=name,
+                audio_rel_path=audio_rel_path,
+                duration_seconds=float(info.get("duration", 0.0)),
+                language=str(info.get("language", settings.language)),
+                partial=bool(info.get("partial")),
+            ),
             raw_segments=raw_segments,
         )
 
@@ -207,10 +213,16 @@ def process_stereo_file(
     with stage_timer("load model", on_status):
         transcriber = load_transcriber(settings)
     on_status(transcriber.describe())
-    with sample_gpu(on_status, enabled=_gpu_telemetry_enabled(settings)):
-        mic_segments, monitor_segments, info = transcriber.transcribe_stereo(
-            mic_16k, monitor_16k, on_status=on_status
-        )
+    try:
+        with sample_gpu(on_status, enabled=_gpu_telemetry_enabled(settings)):
+            mic_segments, monitor_segments, info = transcriber.transcribe_stereo(
+                mic_16k, monitor_16k, on_status=on_status
+            )
+    finally:
+        # Release VRAM even when the stage raised, so a failure here does not starve
+        # the diarizer that runs next.
+        del transcriber
+        free_gpu_memory()
 
     mic_segments = split_on_silence(
         mic_segments,
@@ -236,9 +248,6 @@ def process_stereo_file(
         for s in monitor_segments
     ]
     raw_segments = merge_channel_segments(mic_segments, raw_monitor)
-
-    del transcriber
-    free_gpu_memory()
 
     diarized = False
     if diarize and settings.diarize and settings.hf_token.get_secret_value():
@@ -299,17 +308,19 @@ def process_mono_file(
     with stage_timer("load model", on_status):
         transcriber = load_transcriber(settings)
     on_status(transcriber.describe())
-    with (
-        sample_gpu(on_status, enabled=_gpu_telemetry_enabled(settings)),
-        stage_timer("transcribe", on_status),
-    ):
-        segments, info = transcriber.transcribe(mono_16k_path, on_status=on_status)
+    try:
+        with (
+            sample_gpu(on_status, enabled=_gpu_telemetry_enabled(settings)),
+            stage_timer("transcribe", on_status),
+        ):
+            segments, info = transcriber.transcribe(mono_16k_path, on_status=on_status)
+    finally:
+        # Release VRAM even when the stage raised — see the stereo path.
+        del transcriber
+        free_gpu_memory()
 
     # Raw transcript before diarization
     raw_segments = list(segments)
-
-    del transcriber
-    free_gpu_memory()
 
     stereo_for_attribution = _get_stereo_source(audio_path)
     segments_before = segments

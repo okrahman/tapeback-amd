@@ -293,7 +293,7 @@ class Transcriber:
         stage: str = "transcribe",
         on_status: Callable[[str], None] = _noop_status,
         language_override: str | None = None,
-    ) -> tuple[list[Segment], dict[str, str | float]]:
+    ) -> tuple[list[Segment], dict[str, str | float | bool]]:
         """Transcribe audio file.
 
         Returns (list of Segments, info dict with language/duration/etc).
@@ -312,21 +312,26 @@ class Transcriber:
         segments: list[Segment] = []
         try:
             segments_iter, info = self._invoke_transcribe(audio_path, language)
-            segments = self._collect_segments(segments_iter, stage, info.duration, on_status)
+            segments, interrupted = self._collect_segments(
+                segments_iter, stage, info.duration, on_status
+            )
         except RuntimeError as exc:
             if self._device != "cuda" or not is_cuda_error(exc):
                 raise
             self._fallback_to_cpu(exc)
             segments_iter, info = self._invoke_transcribe(audio_path, language)
-            segments = self._collect_segments(segments_iter, stage, info.duration, on_status)
+            segments, interrupted = self._collect_segments(
+                segments_iter, stage, info.duration, on_status
+            )
 
-        if not segments:
+        if not segments and not interrupted:
             print("Warning: No speech detected in audio", file=sys.stderr)
 
-        info_dict: dict[str, str | float] = {
+        info_dict: dict[str, str | float | bool] = {
             "language": info.language,
             "language_probability": info.language_probability,
             "duration": info.duration,
+            "partial": interrupted,
         }
 
         return segments, info_dict
@@ -368,7 +373,7 @@ class Transcriber:
         monitor_16k: Path,
         *,
         on_status: Callable[[str], None] = _noop_status,
-    ) -> tuple[list[Segment], list[Segment], dict[str, str | float]]:
+    ) -> tuple[list[Segment], list[Segment], dict[str, str | float | bool]]:
         """Transcribe both channels separately.
 
         Returns (mic_segments, monitor_segments, info).
@@ -392,15 +397,21 @@ class Transcriber:
         detected = monitor_info.get("language")
         mic_language = str(detected) if detected else None
 
-        self._pace(on_status)
-
-        with stage_timer("transcribe mic", on_status):
-            mic_segments, mic_info = self.transcribe(
-                mic_16k,
-                stage="transcribe mic",
-                on_status=on_status,
-                language_override=mic_language,
-            )
+        mic_segments: list[Segment] = []
+        mic_info: dict[str, str | float | bool] = {}
+        if monitor_info.get("partial"):
+            # Ctrl+C means stop, not "stop this channel". Starting the second one would
+            # make the user interrupt twice; the monitor's work is already kept.
+            on_status("Skipping the mic channel — transcription was interrupted.")
+        else:
+            self._pace(on_status)
+            with stage_timer("transcribe mic", on_status):
+                mic_segments, mic_info = self.transcribe(
+                    mic_16k,
+                    stage="transcribe mic",
+                    on_status=on_status,
+                    language_override=mic_language,
+                )
 
         # Assign speaker="You" to mic segments
         mic_segments = [
@@ -418,6 +429,10 @@ class Transcriber:
         mic_speech = sum(s.end - s.start for s in mic_segments)
         monitor_speech = sum(s.end - s.start for s in monitor_segments)
         info = mic_info if mic_speech >= monitor_speech else monitor_info
+        # Partiality belongs to the run, not to whichever channel happened to be
+        # picked for its language — a transcript missing one channel is partial.
+        info = dict(info)
+        info["partial"] = bool(monitor_info.get("partial") or mic_info.get("partial"))
 
         return mic_segments, monitor_segments, info
 
@@ -440,8 +455,14 @@ class Transcriber:
         stage: str,
         total_duration: float,
         on_status: Callable[[str], None],
-    ) -> list[Segment]:
+    ) -> tuple[list[Segment], bool]:
         """Iterate over faster-whisper segments and convert to dataclasses.
+
+        Returns (segments, interrupted). On Ctrl+C the segments decoded so far are
+        kept and returned rather than discarded: transcription can run for hours, and
+        throwing all of it away on an interrupt is how sixteen recordings ended up
+        with no transcript at all. The interrupt is not re-raised — the caller writes
+        what it has — but it is reported, so a later one still stops the process.
 
         Reports throttled progress as it goes: faster-whisper's own
         ``log_progress`` writes a tqdm bar straight to the terminal, bypassing
@@ -449,6 +470,22 @@ class Transcriber:
         """
         progress = ProgressReporter(stage, total_duration, on_status)
         segments: list[Segment] = []
+        try:
+            return Transcriber._convert_segments(segments_iter, segments, progress), False
+        except KeyboardInterrupt:
+            on_status(
+                f"Interrupted during '{stage}' — keeping the {len(segments)} "
+                "segments decoded so far."
+            )
+            return segments, True
+
+    @staticmethod
+    def _convert_segments(
+        segments_iter: Iterable[Any],
+        segments: list[Segment],
+        progress: ProgressReporter,
+    ) -> list[Segment]:
+        """Drain the generator into ``segments`` (shared so a caller keeps partials)."""
         for seg in segments_iter:
             progress.update(seg.end)
             words: list[Word] | None = None

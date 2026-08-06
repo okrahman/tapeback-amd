@@ -18,7 +18,7 @@ from tapeback.diarizer import (
     assign_speakers,
     merge_channel_segments,
 )
-from tapeback.formatter import format_markdown
+from tapeback.formatter import TranscriptMeta, format_markdown
 from tapeback.models import DiarizationSegment, Segment
 from tapeback.pipeline import _get_stereo_source, _maybe_diarize_segments
 from tapeback.settings import Settings
@@ -104,10 +104,12 @@ def test_assign_speakers_then_format():
 
     markdown = format_markdown(
         segments=labeled,
-        session_name="2026-03-20_10-00-00",
-        audio_rel_path="attachments/audio/2026-03-20_10-00-00.wav",
-        duration_seconds=15.0,
-        language="en",
+        meta=TranscriptMeta(
+            session_name="2026-03-20_10-00-00",
+            audio_rel_path="attachments/audio/2026-03-20_10-00-00.wav",
+            duration_seconds=15.0,
+            language="en",
+        ),
     )
 
     assert "**You:** Hello from user." in markdown
@@ -154,10 +156,12 @@ def test_stereo_pipeline_to_markdown(tmp_path):
 
     markdown = format_markdown(
         segments=merged,
-        session_name="2026-03-20_10-00-00",
-        audio_rel_path="audio.wav",
-        duration_seconds=3.0,
-        language="en",
+        meta=TranscriptMeta(
+            session_name="2026-03-20_10-00-00",
+            audio_rel_path="audio.wav",
+            duration_seconds=3.0,
+            language="en",
+        ),
     )
 
     # Mic speech kept, monitor crosstalk dropped (and vice versa)

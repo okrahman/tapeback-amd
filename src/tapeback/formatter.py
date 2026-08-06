@@ -1,3 +1,5 @@
+from dataclasses import dataclass
+
 from tapeback import const
 from tapeback._quality import has_speech, strip_hallucinations
 from tapeback.models import Segment
@@ -199,12 +201,28 @@ def _label_shape(labels: list[str]) -> list[int]:
     return [seen.setdefault(label, len(seen)) for label in labels]
 
 
+@dataclass(frozen=True)
+class TranscriptMeta:
+    """Everything the note needs that is not the transcript itself.
+
+    Grouped rather than passed as loose arguments: these all describe the run, they
+    all come from the same place in the pipeline, and the parameter list had grown
+    past the point where call sites stayed readable.
+    """
+
+    session_name: str
+    audio_rel_path: str
+    duration_seconds: float
+    language: str
+    # True when transcription was interrupted and the note covers only part of the
+    # recording. A partial transcript that looks complete is worse than none, because
+    # nothing prompts a re-run.
+    partial: bool = False
+
+
 def format_markdown(
     segments: list[Segment],
-    session_name: str,
-    audio_rel_path: str,
-    duration_seconds: float,
-    language: str,
+    meta: TranscriptMeta,
     raw_segments: list[Segment] | None = None,
 ) -> str:
     """Generate markdown with YAML front matter.
@@ -217,34 +235,46 @@ def format_markdown(
     - "## Diarized Transcript" with diarized segments
     """
     # Parse date and time from session name (format: YYYY-MM-DD_HH-MM-SS)
-    parts = session_name.split("_")
-    date_str = parts[0] if parts else session_name
+    parts = meta.session_name.split("_")
+    date_str = parts[0] if parts else meta.session_name
     time_str = parts[1].replace("-", ":") if len(parts) > 1 else "00:00"
     # Only HH:MM for display
     time_display = ":".join(time_str.split(":")[:2])
 
-    duration_hms = _format_duration_hms(duration_seconds)
-    duration_human = _format_duration_human(duration_seconds)
+    duration_hms = _format_duration_hms(meta.duration_seconds)
+    duration_human = _format_duration_human(meta.duration_seconds)
 
     lines = [
         "---",
         f"date: {date_str}",
         f'time: "{time_display}"',
         f'duration: "{duration_hms}"',
-        f"language: {language}",
-        f'audio: "[[{audio_rel_path}]]"',
+        f"language: {meta.language}",
+        f'audio: "[[{meta.audio_rel_path}]]"',
         "tags:",
         "  - meeting",
         "  - transcript",
+    ]
+    if meta.partial:
+        # Both machine- and human-visible: a partial transcript that looks complete is
+        # worse than no transcript, because nothing prompts you to re-run it.
+        lines.append("  - partial")
+        lines.append("partial: true")
+    lines += [
         "---",
         "",
         f"# Meeting {date_str} {time_display}",
         "",
-        f"**Duration:** {duration_human} | **Language:** {language}",
-        "",
-        "---",
+        f"**Duration:** {duration_human} | **Language:** {meta.language}",
         "",
     ]
+    if meta.partial:
+        lines.append(
+            "> [!warning] Interrupted — this transcript covers only part of the "
+            "recording. Re-run to complete it."
+        )
+        lines.append("")
+    lines += ["---", ""]
 
     diarized_block = _format_segments_block(segments)
     raw_block = _format_segments_block(raw_segments) if raw_segments is not None else None

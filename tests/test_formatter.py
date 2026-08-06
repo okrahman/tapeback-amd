@@ -1,6 +1,11 @@
 """Formatter tests — markdown generation and vault I/O pipelines."""
 
-from tapeback.formatter import _mark_low_confidence_words, format_live_markdown, format_markdown
+from tapeback.formatter import (
+    TranscriptMeta,
+    _mark_low_confidence_words,
+    format_live_markdown,
+    format_markdown,
+)
 from tapeback.models import Segment, Word
 from tapeback.vault import remove_live_markdown, save_live_markdown, save_to_vault
 
@@ -23,10 +28,12 @@ def test_format_markdown_pipeline():
 
     result = format_markdown(
         segments=segments,
-        session_name="2026-03-17_14-30-00",
-        audio_rel_path="attachments/audio/2026-03-17_14-30-00.wav",
-        duration_seconds=5025.0,
-        language="en",
+        meta=TranscriptMeta(
+            session_name="2026-03-17_14-30-00",
+            audio_rel_path="attachments/audio/2026-03-17_14-30-00.wav",
+            duration_seconds=5025.0,
+            language="en",
+        ),
     )
 
     # Frontmatter
@@ -66,10 +73,12 @@ def test_format_markdown_preserves_pauses():
 
     result = format_markdown(
         segments=segments,
-        session_name="2026-03-17_14-30-00",
-        audio_rel_path="audio.wav",
-        duration_seconds=13.0,
-        language="en",
+        meta=TranscriptMeta(
+            session_name="2026-03-17_14-30-00",
+            audio_rel_path="audio.wav",
+            duration_seconds=13.0,
+            language="en",
+        ),
     )
 
     assert "**You:** First block." in result
@@ -100,10 +109,12 @@ def test_format_markdown_with_raw_segments():
 
     result = format_markdown(
         segments=diarized_segments,
-        session_name="2026-04-04_14-30-00",
-        audio_rel_path="audio.wav",
-        duration_seconds=10.0,
-        language="en",
+        meta=TranscriptMeta(
+            session_name="2026-04-04_14-30-00",
+            audio_rel_path="audio.wav",
+            duration_seconds=10.0,
+            language="en",
+        ),
         raw_segments=raw_segments,
     )
 
@@ -133,10 +144,12 @@ def test_format_markdown_without_raw_segments_unchanged():
 
     result = format_markdown(
         segments=segments,
-        session_name="2026-04-04_14-30-00",
-        audio_rel_path="audio.wav",
-        duration_seconds=5.0,
-        language="en",
+        meta=TranscriptMeta(
+            session_name="2026-04-04_14-30-00",
+            audio_rel_path="audio.wav",
+            duration_seconds=5.0,
+            language="en",
+        ),
     )
 
     assert "## Transcript" not in result

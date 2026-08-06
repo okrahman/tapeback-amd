@@ -1,6 +1,6 @@
 """Regression tests for transcript formatting bugs."""
 
-from tapeback.formatter import format_markdown
+from tapeback.formatter import TranscriptMeta, format_markdown
 from tapeback.models import Segment
 
 
@@ -22,10 +22,12 @@ def test_long_single_speaker_stretch_is_not_one_block():
 
     markdown = format_markdown(
         segments=segments,
-        session_name="2026-08-06_12-00-00",
-        audio_rel_path="attachments/audio/x.wav",
-        duration_seconds=1800.0,
-        language="ru",
+        meta=TranscriptMeta(
+            session_name="2026-08-06_12-00-00",
+            audio_rel_path="attachments/audio/x.wav",
+            duration_seconds=1800.0,
+            language="ru",
+        ),
     )
 
     timecodes = [line.split("]")[0] + "]" for line in markdown.splitlines() if line.startswith("[")]
@@ -41,10 +43,12 @@ def test_short_stretch_is_still_merged_into_one_block():
 
     markdown = format_markdown(
         segments=segments,
-        session_name="2026-08-06_12-00-00",
-        audio_rel_path="attachments/audio/x.wav",
-        duration_seconds=10.0,
-        language="ru",
+        meta=TranscriptMeta(
+            session_name="2026-08-06_12-00-00",
+            audio_rel_path="attachments/audio/x.wav",
+            duration_seconds=10.0,
+            language="ru",
+        ),
     )
 
     timecodes = [line for line in markdown.splitlines() if line.startswith("[")]
@@ -72,10 +76,12 @@ def test_subtitle_corpus_hallucinations_are_stripped():
 
     markdown = format_markdown(
         segments=segments,
-        session_name="2026-08-06_12-00-00",
-        audio_rel_path="attachments/audio/x.wav",
-        duration_seconds=30.0,
-        language="ru",
+        meta=TranscriptMeta(
+            session_name="2026-08-06_12-00-00",
+            audio_rel_path="attachments/audio/x.wav",
+            duration_seconds=30.0,
+            language="ru",
+        ),
     )
 
     lowered = markdown.lower()
@@ -100,10 +106,12 @@ def test_segment_that_is_only_a_hallucination_is_dropped_entirely():
 
     markdown = format_markdown(
         segments=segments,
-        session_name="2026-08-06_12-00-00",
-        audio_rel_path="attachments/audio/x.wav",
-        duration_seconds=15.0,
-        language="ru",
+        meta=TranscriptMeta(
+            session_name="2026-08-06_12-00-00",
+            audio_rel_path="attachments/audio/x.wav",
+            duration_seconds=15.0,
+            language="ru",
+        ),
     )
 
     lines = [line for line in markdown.splitlines() if line.startswith("[")]
@@ -126,10 +134,12 @@ def test_diarized_section_omitted_when_it_only_relabels_speakers():
 
     markdown = format_markdown(
         segments=diarized,
-        session_name="2026-08-06_12-00-00",
-        audio_rel_path="attachments/audio/x.wav",
-        duration_seconds=15.0,
-        language="ru",
+        meta=TranscriptMeta(
+            session_name="2026-08-06_12-00-00",
+            audio_rel_path="attachments/audio/x.wav",
+            duration_seconds=15.0,
+            language="ru",
+        ),
         raw_segments=raw,
     )
 
@@ -147,10 +157,12 @@ def test_diarized_section_kept_when_it_adds_speaker_information():
 
     markdown = format_markdown(
         segments=diarized,
-        session_name="2026-08-06_12-00-00",
-        audio_rel_path="attachments/audio/x.wav",
-        duration_seconds=15.0,
-        language="ru",
+        meta=TranscriptMeta(
+            session_name="2026-08-06_12-00-00",
+            audio_rel_path="attachments/audio/x.wav",
+            duration_seconds=15.0,
+            language="ru",
+        ),
         raw_segments=raw,
     )
 
@@ -163,10 +175,12 @@ def test_speaker_change_still_splits_regardless_of_length():
 
     markdown = format_markdown(
         segments=segments,
-        session_name="2026-08-06_12-00-00",
-        audio_rel_path="attachments/audio/x.wav",
-        duration_seconds=10.0,
-        language="ru",
+        meta=TranscriptMeta(
+            session_name="2026-08-06_12-00-00",
+            audio_rel_path="attachments/audio/x.wav",
+            duration_seconds=10.0,
+            language="ru",
+        ),
     )
 
     lines = [line for line in markdown.splitlines() if line.startswith("[")]
