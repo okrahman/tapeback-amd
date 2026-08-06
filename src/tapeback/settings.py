@@ -4,6 +4,8 @@ from typing import Literal
 from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from tapeback.glossary import DEFAULT_HOTWORDS
+
 # Default models per provider — used when TAPEBACK_LLM_MODEL is not set.
 # Update here when providers deprecate models.
 DEFAULT_MODELS: dict[str, str] = {
@@ -57,8 +59,19 @@ class Settings(BaseSettings):
     # segments in parallel batches — several times faster on GPU. Off by default
     # (0) since it can OOM small GPUs; set e.g. TAPEBACK_BATCH_SIZE=8 to enable.
     batch_size: int = Field(default=0, ge=0)
+    # Comma-separated terms to bias decoding towards (faster-whisper `hotwords`).
+    # Default glossary and the reasoning behind it live in glossary.py.
+    # Empty disables the bias entirely.
+    hotwords: str = DEFAULT_HOTWORDS
     vad_filter: bool = True
-    chunk_length: int = 7  # seconds — max VAD chunk before splitting for Whisper
+    # Seconds of audio consumed per decode window. Whisper's encoder is FIXED at 30 s:
+    # faster-whisper zero-pads every window back to 3000 mel frames before encoding
+    # (transcribe.py `pad_or_trim`), so a smaller value does not make the encoder pass
+    # cheaper — it only makes the run need more of them. At 2 the encoder does 15x the
+    # necessary work; measured on a 145 s file, 2 -> 390.6 s and 30 -> 41.4 s.
+    # Do not lower this to fight hallucinations on long pauses; that is what
+    # vad_filter, no_speech_threshold and gate_mic_silence are for.
+    chunk_length: int = 30
     condition_on_previous_text: bool = False
     # Lower = more aggressive silence rejection (helps suppress Whisper training-data
     # hallucinations like "Субтитры DimaTorzok" on long pauses). Default in Whisper is 0.6.
@@ -75,6 +88,59 @@ class Settings(BaseSettings):
     # Skip silent gaps longer than this many seconds when a hallucination is detected
     # (uses word timestamps, which are always on). None disables it.
     hallucination_silence_threshold: float | None = Field(default=None, ge=0.0)
+
+    # Write one JSON record per processing run (config + status lines + outcome), so a
+    # run that failed or was interrupted can be diagnosed afterwards. Never contains
+    # credentials — the recorded fields are an explicit allow-list in _runlog.py.
+    run_log: bool = True
+    # None → XDG data dir (~/.local/share/tapeback/runs).
+    run_log_dir: Path | None = None
+
+    # Sample GPU clocks/temperature during transcription and report a one-line summary
+    # per stage. Observation only — tapeback never changes clock or power caps (that
+    # needs root). No-op when nvidia-smi is unavailable.
+    gpu_telemetry: bool = True
+
+    # Reuse a channel that was already transcribed with the same audio and the same
+    # output-affecting settings, so an interrupted run does not redo finished work.
+    # Granularity is a whole channel — see _resume.py for why not finer.
+    resume_cache: bool = True
+    # None → XDG data dir (~/.local/share/tapeback/resume).
+    resume_cache_dir: Path | None = None
+
+    # Run transcription in a child process. A CUDA out-of-memory leaks its allocation
+    # for the life of the process it happened in, and nothing reachable from Python
+    # releases it — but a process that exits gives the memory back. Costs one process
+    # start and the model load per run; set false to transcribe in-process.
+    isolate_transcription: bool = True
+
+    # Refuse to load a model on CUDA below this much free VRAM, and use the CPU instead.
+    # A CUDA out-of-memory during load leaks the allocation on ctranslate2's C++ side
+    # for the life of the process (see transcriber._enough_vram), so the only reliable
+    # cure is not to trigger it. The smallest configuration measured needs ~1115 MiB.
+    min_free_vram_mib: int = Field(default=1200, ge=0)
+
+    # Look for a GPU thermal clamp before each transcription stage. On laptops that
+    # share one heatsink between CPU and GPU, the controller can cut the GPU's power
+    # budget (measured: 50 W -> 5 W, clocks pinned to 300 MHz) and hold it there while
+    # the CPU stays hot. The check is one nvidia-smi query and is retaken per stage, so
+    # a clamp that clears between channels returns the run to the GPU by itself.
+    thermal_clamp_check: bool = True
+    # Seconds to wait for the clamp to release before giving up on the GPU for this
+    # stage. Default 0 — do not wait. The clamp clears on system idle, and the shortest
+    # release measured was 451 s, so any wait short enough to be tolerable essentially
+    # never succeeds while meanwhile the CPU would already be transcribing at ~2.39x
+    # real time against a clamped GPU's ~0.31x. Raise it only if the machine will
+    # genuinely be idle.
+    thermal_clamp_wait: float = Field(default=0.0, ge=0.0)
+    # When the clamp has not released by then, transcribe on CPU instead of on a card
+    # limited to a tenth of its power. Measured on the same clip: CPU 2.39x real time,
+    # clamped GPU 0.31x — the CPU is ~8x faster, so waiting it out is the worse option.
+    thermal_clamp_cpu_fallback: bool = True
+    # Idle gap after each transcription stage, to shed heat instead of driving the
+    # chassis into the clamp in the first place. Off by default: it costs wall-clock on
+    # a machine that cools adequately.
+    stage_pause_seconds: float = Field(default=0.0, ge=0.0)
 
     # Audio
     monitor_source: str = "auto"

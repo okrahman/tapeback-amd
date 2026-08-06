@@ -96,6 +96,15 @@ def split_channels_16k(stereo_wav: Path, output_dir: Path) -> tuple[Path, Path]:
     """Split stereo WAV into two mono 16kHz WAVs.
 
     Each channel gets independent loudnorm before downsampling.
+
+    The filter order is load-bearing and must not be "optimised" by resampling
+    first: ffmpeg's loudnorm upsamples internally to 192 kHz for EBU R128 true-peak
+    measurement and emits at that rate, so it has to be followed by aresample or the
+    output is a 192 kHz WAV. Measured on a 16-minute recording, resampling first is
+    also marginally SLOWER (32.4 s vs 31.6 s) — loudnorm's cost does not scale with
+    its input rate. Of that 32 s, loudnorm is ~31 s: the split without it takes 0.5 s,
+    and `-filter_threads` does not help.
+
     Returns (mic_16k_path, monitor_16k_path).
     """
     _check_ffmpeg()

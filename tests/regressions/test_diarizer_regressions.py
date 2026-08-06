@@ -85,7 +85,13 @@ def test_diarize_cuda_init_fallback(tmp_vault, capsys):
 
     settings = Settings(vault_path=tmp_vault, hf_token=SecretStr("hf_fake_token"), device="cuda")
 
-    with patch("pyannote.audio.Pipeline") as mock_pipeline_cls:
+    with (
+        patch("pyannote.audio.Pipeline") as mock_pipeline_cls,
+        # Isolation by construction: without this the test reads the machine's real
+        # free VRAM, so anything else using the GPU sends Diarizer down the
+        # not-enough-VRAM branch and this assertion fails for an unrelated reason.
+        patch("tapeback.diarizer.get_free_vram_mib", return_value=4096),
+    ):
         mock_pipeline = MagicMock()
         mock_pipeline_cls.from_pretrained.return_value = mock_pipeline
         mock_pipeline.to.side_effect = RuntimeError("CUDA not available")
@@ -121,7 +127,12 @@ def test_diarize_cuda_oom_fallback(tmp_vault, capsys):
             raise RuntimeError("CUDA out of memory.")
         return mock_annotation
 
-    with patch("pyannote.audio.Pipeline") as mock_pipeline_cls:
+    with (
+        patch("pyannote.audio.Pipeline") as mock_pipeline_cls,
+        # The assertion below requires the CUDA branch to be taken, which depends on
+        # free VRAM — do not let another process on the GPU decide this test's result.
+        patch("tapeback.diarizer.get_free_vram_mib", return_value=4096),
+    ):
         mock_pipeline = MagicMock()
         mock_pipeline_cls.from_pretrained.return_value = mock_pipeline
         mock_pipeline.side_effect = pipeline_call

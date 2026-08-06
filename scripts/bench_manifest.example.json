@@ -1,0 +1,11 @@
+[
+  {
+    "_comment": "Copy this file, point paths at your own recordings, and list the terms each one is expected to contain. Terms are what the benchmark scores recognition against — pick domain vocabulary you know the model currently gets wrong.",
+    "path": "~/recordings/interview.wav",
+    "terms": ["RAG", "vector search", "Excalidraw", "Notion", "Jira"]
+  },
+  {
+    "path": "~/recordings/architecture-review.wav",
+    "terms": ["ONNX", "OpenVINO", "pipeline", "75"]
+  }
+]

@@ -12,8 +12,9 @@ if TYPE_CHECKING:
     from tapeback.live import LiveTranscriber
 
 from tapeback import const
-from tapeback._gpu import free_gpu_memory
+from tapeback._gpu import free_gpu_memory, sample_gpu
 from tapeback._lazy import load_transcriber
+from tapeback._runlog import run_log
 from tapeback._timing import stage_timer
 from tapeback.audio import (
     convert_to_mono16k,
@@ -36,7 +37,7 @@ from tapeback.diarizer import (
     merge_channel_segments,
     merge_similar_speakers,
 )
-from tapeback.formatter import format_markdown
+from tapeback.formatter import TranscriptMeta, format_markdown
 from tapeback.models import Segment
 from tapeback.recorder import Recorder, validate_session_name
 from tapeback.settings import Settings
@@ -48,6 +49,11 @@ StatusCallback = Callable[[str], None]
 
 def _noop_status(msg: str) -> None:
     pass
+
+
+def _gpu_telemetry_enabled(settings: Settings) -> bool:
+    """GPU sampling is only meaningful for a run that actually asked for the GPU."""
+    return settings.gpu_telemetry and settings.device == "cuda"
 
 
 def stop_and_process(
@@ -73,39 +79,43 @@ def stop_and_process(
     on_status("Stopping recording...")
     monitor_path, mic_path = recorder.stop()
 
-    on_status("Merging audio channels...")
-    output_dir = monitor_path.parent
-    with stage_timer("merge", on_status):
-        stereo_path = merge_channels(monitor_path, mic_path, output_dir)
-
     session_name = monitor_path.parent.name
 
-    audio_dest = save_audio_to_vault(stereo_path, settings, session_name)
-    on_status(f"Audio saved: {audio_dest}")
+    with run_log(session_name, settings, on_status) as report:
+        report("Merging audio channels...")
+        output_dir = monitor_path.parent
+        with stage_timer("merge", report):
+            stereo_path = merge_channels(monitor_path, mic_path, output_dir)
 
-    segments, info, raw_segments = process_stereo_file(
-        stereo_path, output_dir, settings, diarize=diarize, on_status=on_status
-    )
+        audio_dest = save_audio_to_vault(stereo_path, settings, session_name)
+        report(f"Audio saved: {audio_dest}")
 
-    audio_rel_path = f"{settings.attachments_dir}/{session_name}.wav"
+        segments, info, raw_segments = process_stereo_file(
+            stereo_path, output_dir, settings, diarize=diarize, on_status=report
+        )
 
-    markdown = format_markdown(
-        segments=segments,
-        session_name=session_name,
-        audio_rel_path=audio_rel_path,
-        duration_seconds=float(info.get("duration", 0.0)),
-        language=str(info.get("language", settings.language)),
-        raw_segments=raw_segments,
-    )
+        audio_rel_path = f"{settings.attachments_dir}/{session_name}.wav"
 
-    md_path = save_markdown_to_vault(markdown, settings, session_name)
-    on_status(f"Saved: {md_path}")
+        markdown = format_markdown(
+            segments=segments,
+            meta=TranscriptMeta(
+                session_name=session_name,
+                audio_rel_path=audio_rel_path,
+                duration_seconds=float(info.get("duration", 0.0)),
+                language=str(info.get("language", settings.language)),
+                partial=bool(info.get("partial")),
+            ),
+            raw_segments=raw_segments,
+        )
 
-    if live_transcriber is not None:
-        remove_live_markdown(settings, session_name)
+        md_path = save_markdown_to_vault(markdown, settings, session_name)
+        report(f"Saved: {md_path}")
 
-    if do_summarize:
-        _maybe_summarize(md_path, settings, on_status)
+        if live_transcriber is not None:
+            remove_live_markdown(settings, session_name)
+
+        if do_summarize:
+            _maybe_summarize(md_path, settings, report)
 
     shutil.rmtree(monitor_path.parent, ignore_errors=True)
     return md_path
@@ -125,37 +135,41 @@ def process_file(
         name = audio_path.stem
     validate_session_name(name)
 
-    audio_dest = save_audio_to_vault(audio_path, settings, name)
-    on_status(f"Audio saved: {audio_dest}")
-
     tmp_dir = Path(tempfile.mkdtemp(prefix="tapeback_"))
 
-    if is_stereo(audio_path):
-        on_status("Stereo file detected, using dual-channel pipeline...")
-        segments, info, raw_segments = process_stereo_file(
-            audio_path, tmp_dir, settings, diarize=diarize, on_status=on_status
+    with run_log(name, settings, on_status) as report:
+        audio_dest = save_audio_to_vault(audio_path, settings, name)
+        report(f"Audio saved: {audio_dest}")
+
+        if is_stereo(audio_path):
+            report("Stereo file detected, using dual-channel pipeline...")
+            segments, info, raw_segments = process_stereo_file(
+                audio_path, tmp_dir, settings, diarize=diarize, on_status=report
+            )
+        else:
+            segments, info, raw_segments = process_mono_file(
+                audio_path, tmp_dir, settings, diarize=diarize, on_status=report
+            )
+
+        audio_rel_path = f"{settings.attachments_dir}/{name}.wav"
+
+        markdown = format_markdown(
+            segments=segments,
+            meta=TranscriptMeta(
+                session_name=name,
+                audio_rel_path=audio_rel_path,
+                duration_seconds=float(info.get("duration", 0.0)),
+                language=str(info.get("language", settings.language)),
+                partial=bool(info.get("partial")),
+            ),
+            raw_segments=raw_segments,
         )
-    else:
-        segments, info, raw_segments = process_mono_file(
-            audio_path, tmp_dir, settings, diarize=diarize, on_status=on_status
-        )
 
-    audio_rel_path = f"{settings.attachments_dir}/{name}.wav"
+        md_path = save_markdown_to_vault(markdown, settings, name)
+        report(f"Saved: {md_path}")
 
-    markdown = format_markdown(
-        segments=segments,
-        session_name=name,
-        audio_rel_path=audio_rel_path,
-        duration_seconds=float(info.get("duration", 0.0)),
-        language=str(info.get("language", settings.language)),
-        raw_segments=raw_segments,
-    )
-
-    md_path = save_markdown_to_vault(markdown, settings, name)
-    on_status(f"Saved: {md_path}")
-
-    if do_summarize:
-        _maybe_summarize(md_path, settings, on_status)
+        if do_summarize:
+            _maybe_summarize(md_path, settings, report)
 
     shutil.rmtree(tmp_dir, ignore_errors=True)
     return md_path
@@ -183,7 +197,8 @@ def process_stereo_file(
     Returns (diarized_segments, info, raw_segments).
     raw_segments have basic You/Other attribution (channel-based, no diarization).
     """
-    mic_raw, monitor_raw, raw_sr = load_stereo_channels(stereo_path)
+    with stage_timer("load channels", on_status):
+        mic_raw, monitor_raw, raw_sr = load_stereo_channels(stereo_path)
 
     on_status("Splitting channels...")
     with stage_timer("split", on_status):
@@ -191,14 +206,23 @@ def process_stereo_file(
 
     if settings.gate_mic_silence:
         # Silence the mic where the user only listens, so Whisper doesn't loop on it.
-        gate_wav_inactive(mic_16k, mic_raw, monitor_raw, raw_sr)
+        with stage_timer("gate mic", on_status):
+            gate_wav_inactive(mic_16k, mic_raw, monitor_raw, raw_sr)
 
     on_status("Transcribing (this may take a few minutes)...")
     with stage_timer("load model", on_status):
         transcriber = load_transcriber(settings)
-    mic_segments, monitor_segments, info = transcriber.transcribe_stereo(
-        mic_16k, monitor_16k, on_status=on_status
-    )
+    on_status(transcriber.describe())
+    try:
+        with sample_gpu(on_status, enabled=_gpu_telemetry_enabled(settings)):
+            mic_segments, monitor_segments, info = transcriber.transcribe_stereo(
+                mic_16k, monitor_16k, on_status=on_status
+            )
+    finally:
+        # Release VRAM even when the stage raised, so a failure here does not starve
+        # the diarizer that runs next.
+        del transcriber
+        free_gpu_memory()
 
     mic_segments = split_on_silence(
         mic_segments,
@@ -224,9 +248,6 @@ def process_stereo_file(
         for s in monitor_segments
     ]
     raw_segments = merge_channel_segments(mic_segments, raw_monitor)
-
-    del transcriber
-    free_gpu_memory()
 
     diarized = False
     if diarize and settings.diarize and settings.hf_token.get_secret_value():
@@ -286,14 +307,20 @@ def process_mono_file(
     on_status("Transcribing (this may take a few minutes)...")
     with stage_timer("load model", on_status):
         transcriber = load_transcriber(settings)
-    with stage_timer("transcribe", on_status):
-        segments, info = transcriber.transcribe(mono_16k_path)
+    on_status(transcriber.describe())
+    try:
+        with (
+            sample_gpu(on_status, enabled=_gpu_telemetry_enabled(settings)),
+            stage_timer("transcribe", on_status),
+        ):
+            segments, info = transcriber.transcribe(mono_16k_path, on_status=on_status)
+    finally:
+        # Release VRAM even when the stage raised — see the stereo path.
+        del transcriber
+        free_gpu_memory()
 
     # Raw transcript before diarization
     raw_segments = list(segments)
-
-    del transcriber
-    free_gpu_memory()
 
     stereo_for_attribution = _get_stereo_source(audio_path)
     segments_before = segments

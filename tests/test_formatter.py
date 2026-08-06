@@ -1,6 +1,11 @@
 """Formatter tests — markdown generation and vault I/O pipelines."""
 
-from tapeback.formatter import _mark_low_confidence_words, format_live_markdown, format_markdown
+from tapeback.formatter import (
+    TranscriptMeta,
+    _mark_low_confidence_words,
+    format_live_markdown,
+    format_markdown,
+)
 from tapeback.models import Segment, Word
 from tapeback.vault import remove_live_markdown, save_live_markdown, save_to_vault
 
@@ -23,10 +28,12 @@ def test_format_markdown_pipeline():
 
     result = format_markdown(
         segments=segments,
-        session_name="2026-03-17_14-30-00",
-        audio_rel_path="attachments/audio/2026-03-17_14-30-00.wav",
-        duration_seconds=5025.0,
-        language="en",
+        meta=TranscriptMeta(
+            session_name="2026-03-17_14-30-00",
+            audio_rel_path="attachments/audio/2026-03-17_14-30-00.wav",
+            duration_seconds=5025.0,
+            language="en",
+        ),
     )
 
     # Frontmatter
@@ -66,10 +73,12 @@ def test_format_markdown_preserves_pauses():
 
     result = format_markdown(
         segments=segments,
-        session_name="2026-03-17_14-30-00",
-        audio_rel_path="audio.wav",
-        duration_seconds=13.0,
-        language="en",
+        meta=TranscriptMeta(
+            session_name="2026-03-17_14-30-00",
+            audio_rel_path="audio.wav",
+            duration_seconds=13.0,
+            language="en",
+        ),
     )
 
     assert "**You:** First block." in result
@@ -79,24 +88,33 @@ def test_format_markdown_preserves_pauses():
 
 
 def test_format_markdown_with_raw_segments():
-    """When raw_segments is provided, output should have two sections:
-    '## Transcript' (raw) and '## Diarized Transcript' (diarized)."""
+    """Two sections when diarization actually splits speakers the raw pass merged.
+
+    The raw pass knows only "You" vs "Other", so both remote turns land on "Other";
+    diarization tells them apart. That difference is what earns a second section — a
+    diarized pass that merely renames "Other" to "Speaker 1" is suppressed as a
+    duplicate (tests/regressions/test_formatter_regressions.py).
+    """
     raw_segments = [
         Segment(start=1.0, end=5.0, text="Hello there.", speaker="You"),
         Segment(start=5.0, end=10.0, text="I'm fine.", speaker="Other"),
+        Segment(start=11.0, end=15.0, text="And I agree.", speaker="Other"),
     ]
 
     diarized_segments = [
         Segment(start=1.0, end=5.0, text="Hello there.", speaker="You"),
         Segment(start=5.0, end=10.0, text="I'm fine.", speaker="Speaker 1"),
+        Segment(start=11.0, end=15.0, text="And I agree.", speaker="Speaker 2"),
     ]
 
     result = format_markdown(
         segments=diarized_segments,
-        session_name="2026-04-04_14-30-00",
-        audio_rel_path="audio.wav",
-        duration_seconds=10.0,
-        language="en",
+        meta=TranscriptMeta(
+            session_name="2026-04-04_14-30-00",
+            audio_rel_path="audio.wav",
+            duration_seconds=10.0,
+            language="en",
+        ),
         raw_segments=raw_segments,
     )
 
@@ -126,10 +144,12 @@ def test_format_markdown_without_raw_segments_unchanged():
 
     result = format_markdown(
         segments=segments,
-        session_name="2026-04-04_14-30-00",
-        audio_rel_path="audio.wav",
-        duration_seconds=5.0,
-        language="en",
+        meta=TranscriptMeta(
+            session_name="2026-04-04_14-30-00",
+            audio_rel_path="audio.wav",
+            duration_seconds=5.0,
+            language="en",
+        ),
     )
 
     assert "## Transcript" not in result

@@ -1,5 +1,4 @@
 import contextlib
-import subprocess
 import sys
 import wave
 from pathlib import Path
@@ -8,7 +7,7 @@ from typing import Any
 import numpy as np
 
 from tapeback import const
-from tapeback._gpu import is_cuda_error
+from tapeback._gpu import get_free_vram_mib, is_cuda_error
 from tapeback.channel import classify_segment_by_channel, load_stereo_channels
 from tapeback.models import DiarizationSegment, Segment
 from tapeback.settings import Settings
@@ -25,22 +24,6 @@ __all__ = [
     "merge_channel_segments",
     "merge_similar_speakers",
 ]
-
-
-def _get_free_vram_mib() -> int | None:
-    """Get free GPU VRAM in MiB via nvidia-smi. Returns None if unavailable."""
-    try:
-        result = subprocess.run(
-            ["nvidia-smi", "--query-gpu=memory.free", "--format=csv,noheader,nounits"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        if result.returncode == 0:
-            return int(result.stdout.strip().split("\n")[0])
-    except (FileNotFoundError, ValueError, subprocess.TimeoutExpired):
-        pass
-    return None
 
 
 def diarization_available() -> bool:
@@ -95,7 +78,7 @@ class Diarizer:
             self._pipeline.instantiate(params)
 
         if settings.device == "cuda":
-            free_mib = _get_free_vram_mib()
+            free_mib = get_free_vram_mib()
             if free_mib is not None and free_mib < DIARIZATION_VRAM_MIN_MIB:
                 print(
                     f"Warning: Not enough VRAM for diarization "
