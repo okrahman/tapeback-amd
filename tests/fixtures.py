@@ -58,6 +58,10 @@ def isolate_settings_sources(monkeypatch):
     monkeypatch.setitem(Settings.model_config, "env_file", ())
     for name in [key for key in os.environ if key.startswith("TAPEBACK_")]:
         monkeypatch.delenv(name, raising=False)
+    # Same rule applied to the machine's thermal state: without this every test that
+    # builds a Transcriber on "cuda" polls the real GPU and can sit in the clamp wait,
+    # so the suite's runtime would depend on how hot the developer's laptop is.
+    monkeypatch.setenv("TAPEBACK_THERMAL_CLAMP_WAIT", "0")
 
 
 @pytest.fixture

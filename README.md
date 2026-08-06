@@ -313,6 +313,9 @@ All settings via environment variables (prefix `TAPEBACK_`) or
 | `TAPEBACK_LANGUAGE` | `auto` | Language code (`auto` for auto-detection, or `en`, `ru`, `fr`, etc.) |
 | `TAPEBACK_DEVICE` | `cuda` | `cuda` or `cpu` |
 | `TAPEBACK_GPU_TELEMETRY` | `true` | Sample GPU clocks/temperature during transcription and print a one-line summary per stage. Observation only — tapeback never changes clock or power caps. No-op without `nvidia-smi` or on `cpu` |
+| `TAPEBACK_THERMAL_CLAMP_WAIT` | `60` | Seconds to wait for a GPU thermal clamp to release before transcribing. `0` disables the check. See "Transcription is suddenly very slow" below |
+| `TAPEBACK_THERMAL_CLAMP_CPU_FALLBACK` | `true` | Transcribe on CPU when the clamp has not released. A clamped GPU measured ~8× slower than the CPU, so falling back is the fast path, not a degradation |
+| `TAPEBACK_STAGE_PAUSE_SECONDS` | `0` | Idle gap after each transcription stage, to shed heat instead of driving the chassis into a clamp. Try `60` on a laptop that clamps during long recordings |
 | `TAPEBACK_RUN_LOG` | `true` | Write one JSON record per run (settings used, every status line, outcome) so a failed or interrupted run can be diagnosed afterwards. Never contains credentials |
 | `TAPEBACK_RUN_LOG_DIR` | *(XDG)* | Where run records go. Default `~/.local/share/tapeback/runs` (honours `XDG_DATA_HOME`). Oldest records are pruned past 200 |
 | `TAPEBACK_COMPUTE_TYPE` | `auto` | `auto`, `int8_float16`, `float16`, `int8`, or `float32`. `auto` → `int8_float16` on CUDA, `int8` on CPU. **`int8_float16` is both faster and smaller than `float16`** — measured on a GTX 1650 Ti with large-v3-turbo: 14.16× vs 3.90× real time, 1115 MiB vs 2139 MiB, with no quality cost. ctranslate2 falls back on its own if your GPU lacks the type |
@@ -415,6 +418,34 @@ ended (`completed` / `aborted` / `failed`, with the error for the last one). Use
 a transcript looks wrong and you need to know which configuration produced it, or when a
 run died and the terminal is long gone. Credentials are never recorded — the stored
 settings are an explicit allow-list. Disable with `TAPEBACK_RUN_LOG=false`.
+
+### Transcription is suddenly very slow, and the GPU is not even hot
+
+On laptops where the CPU and GPU share one heatsink, the embedded controller responds to
+a hot *system* by starving the GPU. Measured on a GTX 1650 Ti Mobile during a long batch:
+
+```
+enforced.power.limit  5 W        (factory default: 50 W)
+clocks.sm             300 MHz    (maximum: 2100 MHz)
+GPU temperature       74 °C      (its own target is 87 °C — the GPU is fine)
+CPU package           93 °C      (this is what the controller is reacting to)
+```
+
+The GPU is not overheating; it is being cut to a tenth of its power budget to protect a
+shared cooler. Two things follow:
+
+- **It does not clear when the work stops.** Measured: ~450 s of idle after moderate
+  heating, and still latched after 900 s once the chassis was saturated. Only idling
+  releases it.
+- **The CPU is faster in this state** — 2.39× real time against 0.31× on the clamped GPU.
+  tapeback detects the clamp before transcribing and moves to the CPU, printing a
+  warning. Disable with `TAPEBACK_THERMAL_CLAMP_CPU_FALLBACK=false`.
+
+To avoid it rather than react to it: set `TAPEBACK_STAGE_PAUSE_SECONDS=60` so long
+recordings shed heat between channels. The larger lever is the CPU, not the GPU — these
+machines often ship with a sustained CPU power limit well above the chip's class, and
+capping it (or disabling turbo) keeps the whole system out of the clamp. That needs root,
+so tapeback does not do it for you.
 
 ### GPU transcription falls back to CPU on CUDA 13 systems
 

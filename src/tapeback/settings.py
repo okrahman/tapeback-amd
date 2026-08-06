@@ -101,6 +101,20 @@ class Settings(BaseSettings):
     # needs root). No-op when nvidia-smi is unavailable.
     gpu_telemetry: bool = True
 
+    # Seconds to wait for a GPU thermal clamp to release before starting transcription.
+    # On laptops that share one heatsink between CPU and GPU, the controller can cut the
+    # GPU's power budget (measured: 50 W -> 5 W, clocks pinned to 300 MHz) and hold it
+    # there while the CPU stays hot. 0 disables the check entirely.
+    thermal_clamp_wait: float = Field(default=60.0, ge=0.0)
+    # When the clamp has not released by then, transcribe on CPU instead of on a card
+    # limited to a tenth of its power. Measured on the same clip: CPU 2.39x real time,
+    # clamped GPU 0.31x — the CPU is ~8x faster, so waiting it out is the worse option.
+    thermal_clamp_cpu_fallback: bool = True
+    # Idle gap after each transcription stage, to shed heat instead of driving the
+    # chassis into the clamp in the first place. Off by default: it costs wall-clock on
+    # a machine that cools adequately.
+    stage_pause_seconds: float = Field(default=0.0, ge=0.0)
+
     # Audio
     monitor_source: str = "auto"
     mic_source: str = "auto"

@@ -473,6 +473,58 @@ Candidate fixes to evaluate: drop the reference before retrying (so the failed m
 collectable), and call ctranslate2's own release path if one exists, otherwise isolate model
 loading so a failure cannot leave the allocation behind.
 
+### Stage 3c — the thermal clamp is the remaining cause of runs that never finish
+
+Promoted from "secondary factor". Stage 1b assumed a shorter run would outrun the clamp;
+it does not. On this laptop the clamp is the dominant cost of any long recording.
+
+**What it is.** Not ordinary temperature throttling: the embedded controller latches the
+GPU to its 300 MHz floor and holds it there. A clamped card reports `SW Thermal Slowdown`
+**at idle** (`clocks_event_reasons.active = 0x24`) where a healthy one reports only
+`GpuIdle` (`0x1`), and the state is uncorrelated with the temperature at that moment —
+observed latched at 63 °C and released at 76 °C.
+
+**How persistent.** Measured: **451 s of idle** to release after moderate heating; after
+13 consecutive transcriptions it had **not released after 900 s**. Only idle clears it;
+finishing the work does not.
+
+**What it costs.** 300 MHz against a 2100 MHz maximum. Measured end to end, the same
+configuration on the same audio: **3519 s clamped against 140 s clear — 25x.**
+
+**This is what the original 8203 s was.** Two multipliers stacked: `chunk_length=2` doing
+15x redundant encoder work (fixed in stage 2) and a clamped card doing the rest. The
+first is gone; the second is not.
+
+**The decisive measurement — CPU beats a clamped GPU.** Same 180 s clip,
+large-v3-turbo/int8:
+
+| where | RTF |
+|---|---|
+| GPU, unclamped | ~14x |
+| **CPU (i7-10750H, int8)** | **2.39x** |
+| GPU, clamped | ~0.31x |
+
+**CPU is roughly 7.7x faster than the clamped GPU**, and that CPU figure is pessimistic —
+it was taken while a GPU transcription was competing for the same cores. So persisting on
+a clamped card is strictly worse than moving to CPU: it turns a ~15-minute job into a
+multi-hour one.
+
+**Proposed behaviour** (needs a decision before implementing):
+
+1. **Check for the clamp before transcribing.** If it is active, wait a short, bounded
+   time for release; if it does not clear, transcribe on CPU and say so. Reuses
+   `thermal_clamp_active()` / `wait_for_clamp_release()` from stage 1b, which currently
+   only the benchmark uses.
+2. **Pace between channels and stages** so a long recording stops saturating the chassis
+   in the first place. backlog_profiler's Gate 4 measured 0 % throttled samples over
+   76 minutes with pacing, against 93–96 % without.
+3. External clock caps (`thermal_profile.sh on 1050`) remain the only thing that removes
+   the clamp entirely, and remain a manual step: they need root, and tapeback stays an
+   unprivileged CLI.
+
+Both 1 and 2 need settings, and both change runtime behaviour materially rather than only
+reporting — so they are worth agreeing on before they ship.
+
 ### Stage 4 — stop losing work (the reason 16 recordings vanished)
 
 - Catch `KeyboardInterrupt` inside `_collect_segments` and write the segments collected so far to

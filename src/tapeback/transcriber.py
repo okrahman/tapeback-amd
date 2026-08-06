@@ -1,6 +1,7 @@
 import locale
 import os
 import sys
+import time
 from collections.abc import Callable, Iterable
 from pathlib import Path
 from typing import Any
@@ -9,7 +10,7 @@ from faster_whisper import BatchedInferencePipeline, WhisperModel
 from huggingface_hub.errors import LocalEntryNotFoundError
 
 from tapeback import const
-from tapeback._gpu import is_cuda_error, preload_cuda_libs
+from tapeback._gpu import is_cuda_error, preload_cuda_libs, wait_for_clamp_release
 from tapeback._timing import ProgressReporter, stage_timer
 from tapeback.models import Segment, Word
 from tapeback.settings import Settings
@@ -54,6 +55,38 @@ def _noop_status(_message: str) -> None:
     """Default status sink — used when transcribe_stereo gets no reporter."""
 
 
+def _resolve_device(settings: Settings) -> str:
+    """Pick the device to actually run on, avoiding a thermally clamped GPU.
+
+    On a laptop sharing one heatsink between CPU and GPU, the controller responds to a
+    hot *system* by cutting the GPU's power budget — measured here as 50 W dropping to
+    5 W with clocks pinned at 300 MHz while the GPU itself sat at 74 C and the CPU
+    package at 93 C. It releases only on idle, and after sustained load it stayed
+    latched for over 900 s.
+
+    Transcribing on a card in that state is strictly worse than using the CPU: measured
+    on the same clip, CPU 2.39x real time against 0.31x clamped, i.e. the CPU is ~8x
+    faster. Waiting it out is what turned a fifteen-minute job into a multi-hour one.
+    """
+    if settings.device != "cuda" or settings.thermal_clamp_wait <= 0:
+        return settings.device
+    if wait_for_clamp_release(settings.thermal_clamp_wait):
+        return "cuda"
+    if not settings.thermal_clamp_cpu_fallback:
+        print(
+            "Warning: GPU is thermally clamped; transcription will be very slow. "
+            "Set TAPEBACK_THERMAL_CLAMP_CPU_FALLBACK=true to use the CPU instead.",
+            file=sys.stderr,
+        )
+        return "cuda"
+    print(
+        "Warning: GPU is thermally clamped and did not release — transcribing on CPU, "
+        "which is faster in this state. Let the machine idle to clear it.",
+        file=sys.stderr,
+    )
+    return "cpu"
+
+
 # Parameters tapeback configures that BatchedInferencePipeline silently drops.
 # Verified against faster-whisper 1.2.1's own "Unused Arguments" docstring; the
 # temperature entry is separate because it is not ignored outright — only the
@@ -92,12 +125,12 @@ class Transcriber:
         First run downloads the model automatically.
         """
         self._settings = settings
-        self._device = settings.device
-        if settings.device == "cuda":
+        self._device = _resolve_device(settings)
+        if self._device == "cuda":
             # Make ctranslate2 (CUDA 12) find cuBLAS/cuDNN on CUDA 13 systems.
             preload_cuda_libs()
-        self._compute_type = _resolve_compute_type(settings.compute_type, settings.device)
-        self._model = self._load_model(settings.device, self._compute_type)
+        self._compute_type = _resolve_compute_type(settings.compute_type, self._device)
+        self._model = self._load_model(self._device, self._compute_type)
         self._batched = self._wrap_batched(self._model)
         if self._batched is not None:
             warning = _batched_warning(settings)
@@ -279,6 +312,8 @@ class Transcriber:
         detected = monitor_info.get("language")
         mic_language = str(detected) if detected else None
 
+        self._pace(on_status)
+
         with stage_timer("transcribe mic", on_status):
             mic_segments, mic_info = self.transcribe(
                 mic_16k,
@@ -305,6 +340,19 @@ class Transcriber:
         info = mic_info if mic_speech >= monitor_speech else monitor_info
 
         return mic_segments, monitor_segments, info
+
+    def _pace(self, on_status: Callable[[str], None]) -> None:
+        """Idle between stages so the chassis sheds heat instead of latching the clamp.
+
+        Cheaper than recovering from a clamp: once latched it needs minutes of idle,
+        and after sustained load it stayed latched past 900 s. Off by default because
+        it costs wall-clock on a machine that cools adequately.
+        """
+        pause = self._settings.stage_pause_seconds
+        if pause <= 0 or self._device != "cuda":
+            return
+        on_status(f"Pausing {pause:.0f}s to let the GPU cool...")
+        time.sleep(pause)
 
     @staticmethod
     def _collect_segments(

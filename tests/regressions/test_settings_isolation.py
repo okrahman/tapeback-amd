@@ -19,9 +19,15 @@ def test_settings_ignore_user_env_file():
     assert get_settings().whisper_model == "large-v3-turbo"
 
 
-def test_tapeback_env_vars_are_cleared():
-    """Ambient TAPEBACK_* variables must not leak into tests either."""
-    assert [key for key in os.environ if key.startswith("TAPEBACK_")] == []
+def test_ambient_tapeback_env_vars_are_cleared():
+    """Ambient TAPEBACK_* variables must not leak into tests either.
+
+    The suite pins TAPEBACK_THERMAL_CLAMP_WAIT=0 on purpose so no test polls the real
+    GPU or waits on a thermal clamp; everything else must be gone.
+    """
+    leaked = {k for k in os.environ if k.startswith("TAPEBACK_")} - {"TAPEBACK_THERMAL_CLAMP_WAIT"}
+    assert leaked == set()
+    assert os.environ["TAPEBACK_THERMAL_CLAMP_WAIT"] == "0"
 
 
 def test_env_var_set_inside_a_test_still_applies(monkeypatch):
