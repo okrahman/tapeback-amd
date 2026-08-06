@@ -602,6 +602,7 @@ If you find tapeback useful, consider a small donation:
 
 ## Links
 
+- [Contributing](CONTRIBUTING.md)
 - [Changelog](CHANGELOG.md)
 - [Deploy](DEPLOY.md)
 - [CI/CD](.github/workflows/)

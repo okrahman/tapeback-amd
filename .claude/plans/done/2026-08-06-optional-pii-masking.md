@@ -204,7 +204,7 @@ Mirrors `backend/tests/test_llm_mask.py`, plus what this project's rules demand:
   residue present/absent), per the project's testing rules.
 - **Boundary**: a term that is a strict prefix of another (`Ann` vs `Anna`) must not be
   masked inside the longer word.
-- **Regression** (`tests/regressions/`): with masking on, capture what the provider layer
+- **Regression** (`../../../tests/regressions`): with masking on, capture what the provider layer
   received and assert no raw email, phone or listed term appears in it — including on the
   **retry** prompt and on the **second provider in the fallback chain**, which are the two
   paths most likely to be missed.
