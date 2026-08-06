@@ -143,3 +143,119 @@ def test_residual_placeholders_ignored_when_nothing_was_masked():
     masker.mask("nothing personal here")
 
     assert masker.residual_placeholders("the model wrote [EMAIL_1]") == []
+
+
+# ---- user-supplied terms ----------------------------------------------------
+
+
+def test_term_is_masked_and_restored():
+    masker = Masker(enabled=True, terms="Ivan")
+
+    masked = masker.mask("Ivan promised to send it")
+
+    assert masked == "[TERM_1] promised to send it"
+    assert masker.unmask(masked) == "Ivan promised to send it"
+
+
+def test_term_matching_is_case_insensitive_and_restores_what_was_written():
+    masker = Masker(enabled=True, terms="Ivan")
+
+    masked = masker.mask("Ivan and ivan")
+
+    # Different casings are different originals, so each restores exactly as written.
+    assert masked == "[TERM_1] and [TERM_2]"
+    assert masker.unmask(masked) == "Ivan and ivan"
+
+
+def test_longest_term_wins():
+    masker = Masker(enabled=True, terms="Ivan, Ivan Petrov")
+
+    masked = masker.mask("Ivan Petrov called Ivan")
+
+    assert masked == "[TERM_1] called [TERM_2]"
+    assert masker.mapping == {"[TERM_1]": "Ivan Petrov", "[TERM_2]": "Ivan"}
+
+
+def test_term_is_word_bounded():
+    """A term that is a strict prefix of another word must not be masked inside it."""
+    masker = Masker(enabled=True, terms="Ann")
+
+    masked = masker.mask("Ann met Anna and Annabel")
+
+    assert masked == "[TERM_1] met Anna and Annabel"
+
+
+def test_term_ending_in_punctuation():
+    masker = Masker(enabled=True, terms="Acme Inc.")
+
+    masked = masker.mask("signed with Acme Inc. today")
+
+    assert masked == "signed with [TERM_1] today"
+
+
+def test_blank_and_duplicate_entries_are_dropped():
+    masker = Masker(enabled=True, terms=" Ivan , , Ivan ,")
+
+    masked = masker.mask("Ivan and Ivan")
+
+    assert masked == "[TERM_1] and [TERM_1]"
+    assert masker.mapping == {"[TERM_1]": "Ivan"}
+
+
+@pytest.mark.parametrize(
+    "reserved",
+    ["You", "you", "Other", "Speaker 1", "Speaker 12", "speaker 3", "EMAIL", "term"],
+)
+def test_reserved_terms_are_refused_with_a_warning(reserved, capsys):
+    """Masking a transcript label would corrupt structure and protect nothing."""
+    masker = Masker(enabled=True, terms=reserved)
+
+    assert masker.mask(f"{reserved} said so") == f"{reserved} said so"
+    assert reserved in capsys.readouterr().err
+
+
+def test_reserved_term_does_not_disable_the_valid_ones(capsys):
+    masker = Masker(enabled=True, terms="You, Ivan")
+
+    masked = masker.mask("You heard Ivan")
+
+    assert masked == "You heard [TERM_1]"
+    assert "You" in capsys.readouterr().err
+
+
+def test_terms_do_not_cut_into_an_email():
+    """Email is consumed first, so a term matching part of it finds nothing left."""
+    masker = Masker(enabled=True, terms="example")
+
+    masked = masker.mask("write to ivan@example.com")
+
+    assert masked == "write to [EMAIL_1]"
+    assert masker.unmask(masked) == "write to ivan@example.com"
+
+
+def test_labels_are_counted_independently():
+    masker = Masker(enabled=True, terms="Ivan")
+
+    masked = masker.mask(f"Ivan wrote from {_EMAIL} and Ivan called {_PHONE}")
+
+    assert masked == "[TERM_1] wrote from [EMAIL_1] and [TERM_1] called [PHONE_1]"
+
+
+def test_disabled_masker_ignores_terms():
+    masker = Masker(enabled=False, terms="Ivan")
+
+    assert masker.mask("Ivan promised to send it") == "Ivan promised to send it"
+    assert masker.mapping == {}
+
+
+def test_disabled_masker_does_not_warn_about_reserved_terms(capsys):
+    """A stale term list must not nag while the feature is off."""
+    Masker(enabled=False, terms="You")
+
+    assert capsys.readouterr().err == ""
+
+
+def test_no_terms_configured():
+    masker = Masker(enabled=True, terms="")
+
+    assert masker.mask("Ivan promised to send it") == "Ivan promised to send it"

@@ -329,7 +329,7 @@ def summarize(transcript: str, settings: Settings) -> Summary:
     restored in the returned Summary. The system prompt is a static constant with no user
     data in it, so it is not masked.
     """
-    masker = Masker(enabled=settings.mask_pii)
+    masker = Masker(enabled=settings.mask_pii, terms=settings.mask_terms)
     masked = masker.mask(transcript)
     try:
         raw = _call_llm(_SYSTEM_PROMPT, masked, settings)

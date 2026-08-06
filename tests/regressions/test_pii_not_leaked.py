@@ -56,6 +56,21 @@ def test_no_raw_pii_reaches_the_provider(summarize_settings):
     assert summary.key_decisions == ["reach out on +7 900 123-45-67"]
 
 
+def test_listed_terms_do_not_reach_the_provider(summarize_settings):
+    """Names are what people say aloud, so the term list is the part that carries."""
+    settings = summarize_settings.model_copy(update={"mask_pii": True, "mask_terms": "Ivan"})
+    response = _MASKED_RESPONSE.replace("Contact", "[TERM_1] contacts")
+
+    with patch("anthropic.Anthropic") as mock_cls:
+        mock_cls.return_value.messages.create.return_value = mock_anthropic_response(response)
+        summary = summarize(_TRANSCRIPT, settings)
+
+    sent = _anthropic_prompt(mock_cls)
+    assert "Ivan" not in sent
+    assert sent == "[TERM_1] said write to [EMAIL_1] or call [PHONE_1] today."
+    assert summary.brief == "Ivan contacts ivan.petrov@example.com or +7 900 123-45-67."
+
+
 def test_retry_prompt_is_masked_too(summarize_settings):
     settings = summarize_settings.model_copy(update={"mask_pii": True})
 

@@ -179,6 +179,12 @@ class Settings(BaseSettings):
     # vault. Off by default. Only has any effect while summarization runs — that request
     # is the only thing tapeback sends off the machine. See _mask.py.
     mask_pii: bool = False
+    # Comma-separated literal terms to mask alongside emails and phone numbers — names,
+    # company and project names, which is the PII people actually speak aloud. Matching
+    # is case-insensitive and word-bounded, and LITERAL: a term is masked only in the
+    # exact forms listed, so an inflected language needs each form spelled out. Ignored
+    # unless mask_pii is on.
+    mask_terms: str = ""
     llm_provider: LLMProvider = "anthropic"
     llm_api_key: SecretStr = SecretStr("")
     llm_model: str = ""

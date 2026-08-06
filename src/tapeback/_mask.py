@@ -10,13 +10,19 @@ while no provider ever sees it.
 Off by default. With masking disabled every method is the identity function — the request
 is byte-identical to what it would have been without this module.
 
-Coverage is deliberately narrow: deterministic regex for email and phone. Person names
-are the PII people actually speak aloud, and detecting them needs either a user-supplied
-list or NER; both are follow-ups. `_RULES` is the seam for adding detectors.
+Coverage: deterministic regex for email and phone, plus literal terms the user lists in
+`TAPEBACK_MASK_TERMS` — which is what actually matters here, since what people say aloud
+in a meeting is names, not addresses. Term matching is literal by design: a term is
+masked in the exact forms listed and nothing else. Inferring inflected forms needs
+morphology, and guessing them would silently rewrite unrelated words. `_RULES` is the
+seam for adding detectors.
 """
 
 import functools
 import re
+import sys
+
+from tapeback import const
 
 type MaskMap = dict[str, str]  # placeholder -> original value
 
@@ -32,7 +38,61 @@ _PHONE_RE = re.compile(
 # Email first: its host would otherwise be a candidate for phone matching.
 _RULES: tuple[tuple[str, re.Pattern[str]], ...] = (("EMAIL", _EMAIL_RE), ("PHONE", _PHONE_RE))
 
-_PLACEHOLDER_RE = re.compile(r"\[(?:" + "|".join(label for label, _ in _RULES) + r")_\d+\]")
+_TERM_LABEL = "TERM"
+_LABELS: tuple[str, ...] = (*(label for label, _ in _RULES), _TERM_LABEL)
+
+_PLACEHOLDER_RE = re.compile(r"\[(?:" + "|".join(_LABELS) + r")_\d+\]")
+
+# A mask term must not collide with a placeholder label, which the term rule would then
+# chew a hole in, nor with a speaker label, which the system prompt tells the model to
+# reuse verbatim. Neither is personal data, so dropping such a term protects nothing.
+# IGNORECASE because term matching is case-insensitive: "speaker 1" in the list would
+# otherwise slip past the guard and go on to mask the real "Speaker 1" labels.
+_SPEAKER_LABEL_RE = re.compile(
+    re.escape(const.SPEAKER_LABEL_FMT).replace(r"\{\}", r"\d+"), re.IGNORECASE
+)
+_RESERVED_TERMS = frozenset(
+    {const.SPEAKER_YOU.lower(), const.SPEAKER_OTHER.lower(), *(label.lower() for label in _LABELS)}
+)
+
+
+def _parse_terms(raw: str) -> list[str]:
+    """Split the comma-separated setting into usable terms, longest first.
+
+    Longest first is what makes a multi-word term win over its own first word once the
+    terms become one alternation.
+    """
+    terms: list[str] = []
+    for chunk in raw.split(","):
+        term = chunk.strip()
+        if not term:
+            continue
+        if term.lower() in _RESERVED_TERMS or _SPEAKER_LABEL_RE.fullmatch(term):
+            print(
+                f"Warning: ignoring mask term {term!r} — it collides with a transcript label.",
+                file=sys.stderr,
+            )
+            continue
+        terms.append(term)
+    # dict.fromkeys deduplicates while keeping the configured order, so the sort below
+    # (stable) stays deterministic between runs.
+    unique = list(dict.fromkeys(terms))
+    unique.sort(key=len, reverse=True)
+    return unique
+
+
+def _term_pattern(terms: list[str]) -> re.Pattern[str] | None:
+    """One alternation for all terms, or None when there are none.
+
+    One pattern rather than a pass per term: a single leftmost-longest scan cannot match
+    inside a placeholder an earlier term just inserted.
+    """
+    if not terms:
+        return None
+    alternation = "|".join(re.escape(term) for term in terms)
+    # Look-arounds rather than \b: a term may end in punctuation ("Acme Inc."), where \b
+    # would demand a word character exactly where there is none.
+    return re.compile(rf"(?<!\w)(?:{alternation})(?!\w)", re.IGNORECASE)
 
 
 class Masker:
@@ -44,18 +104,26 @@ class Masker:
     must never outlive the call or be written anywhere.
     """
 
-    def __init__(self, *, enabled: bool) -> None:
+    def __init__(self, *, enabled: bool, terms: str = "") -> None:
         self._enabled = enabled
         self._to_placeholder: dict[str, str] = {}  # original -> placeholder
         self._to_original: MaskMap = {}  # placeholder -> original
         self._counts: dict[str, int] = {}  # per-label running index
+        self._rules = _RULES
+        if enabled:
+            # Parsed only when enabled, so a stale term list warns nobody while the
+            # feature is off. Terms run last: earlier rules have already consumed the
+            # addresses a term could otherwise cut in half.
+            pattern = _term_pattern(_parse_terms(terms))
+            if pattern is not None:
+                self._rules = (*_RULES, (_TERM_LABEL, pattern))
 
     def mask(self, text: str) -> str:
         """Replace PII with placeholders. Identity when masking is disabled."""
         if not self._enabled or not text:
             return text
         out = text
-        for label, pattern in _RULES:
+        for label, pattern in self._rules:
             out = pattern.sub(functools.partial(self._sub, label), out)
         return out
 

@@ -231,11 +231,25 @@ placeholders before the transcript is sent — including on the retry and on eve
 fallback provider — and the real values are restored in the summary saved to your
 vault. The transcript on disk is never masked.
 
-**What it does not cover.** Names. Whisper writes what people say, and what people
-say aloud in meetings is names, not email addresses — so on a typical transcript
-these rules match nothing. Masking names needs a list of them or a NER model;
-neither is implemented yet. Do not read `TAPEBACK_MASK_PII=true` as "the provider
-sees nothing personal".
+**Add the names yourself.** Whisper writes what people say, and what people say
+aloud in meetings is names, not email addresses — so on a typical transcript the
+two built-in rules match nothing at all. The part that carries is your own list:
+
+```bash
+TAPEBACK_MASK_TERMS=Ivan Petrov,Ivan,Acme Corp,Project Gemini
+```
+
+Matching is case-insensitive and word-bounded (`Ann` is not masked inside `Anna`),
+and the longest term wins, so listing both `Ivan Petrov` and `Ivan` is fine.
+Terms that collide with a transcript label (`You`, `Other`, `Speaker 1`) are
+refused with a warning — masking those would break speaker attribution and protect
+nothing.
+
+**Matching is literal.** A term is masked in exactly the forms you list. In an
+inflected language every form needs its own entry (`Ivan, Ivana, Ivanu`) — tapeback
+does not guess them, because guessing would silently rewrite unrelated words.
+`TAPEBACK_MASK_PII=true` is a floor, not a guarantee that the provider sees nothing
+personal.
 
 ## CLI reference
 
@@ -393,6 +407,7 @@ All settings via environment variables (prefix `TAPEBACK_`) or
 |---|---|---|
 | `TAPEBACK_SUMMARIZE` | `true` | Enable LLM summarization |
 | `TAPEBACK_MASK_PII` | `false` | Mask emails and phone numbers before sending ([details](#pii-masking)) |
+| `TAPEBACK_MASK_TERMS` | *(empty)* | Comma-separated names/terms to mask too (needs `MASK_PII`) |
 | `TAPEBACK_LLM_PROVIDER` | `anthropic` | Primary provider ([list](#llm-summarization)) |
 | `TAPEBACK_LLM_API_KEY` | *(empty)* | API key (or use provider-specific env var) |
 | `TAPEBACK_LLM_MODEL` | *(provider default)* | Override model name |
