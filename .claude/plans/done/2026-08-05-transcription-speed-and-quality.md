@@ -163,7 +163,7 @@ prone to repeat loops and weaker on non-English audio.
 
 ### 2. No glossary — neither `hotwords` nor `initial_prompt`
 
-`grep` over `src/` returns zero hits. faster-whisper supports `hotwords` (`transcribe.py:1545`).
+`grep` over `../../../src` returns zero hits. faster-whisper supports `hotwords` (`transcribe.py:1545`).
 This is the most direct lever for the "technical terms must survive" requirement.
 
 What its absence costs, from the actual transcripts:
@@ -571,4 +571,4 @@ Required before finishing (from CLAUDE.md): `uv run ruff check --fix`, `uv run r
 is `v0.9.7`, so a new `0.9.8` section dated today).
 
 Tests: every bug fix (timecode collapse, hallucinations, duplicate Diarized section, segment loss on
-Ctrl+C) starts with a failing test under `tests/regressions/`.
+Ctrl+C) starts with a failing test under `../../../tests/regressions`.

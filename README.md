@@ -215,6 +215,54 @@ GEMINI_API_KEY=...
 If the primary provider fails, tapeback automatically tries the next available
 provider (any provider with an API key set).
 
+### PII masking
+
+Summarization is the only thing tapeback sends off the machine — recording,
+transcription and diarization are all local. If that request bothers you, either
+leave summarization off (`TAPEBACK_SUMMARIZE=false`, and nothing is ever sent) or
+turn on masking:
+
+```bash
+TAPEBACK_MASK_PII=true
+```
+
+Emails and phone numbers are then replaced with `[EMAIL_1]` / `[PHONE_1]`
+placeholders before the transcript is sent — including on the retry and on every
+fallback provider — and the real values are restored in the summary saved to your
+vault. The transcript on disk is never masked.
+
+**Add the names yourself.** Whisper writes what people say, and what people say
+aloud in meetings is names, not email addresses — so on a typical transcript the
+two built-in rules match nothing at all. The part that carries is your own list:
+
+```bash
+TAPEBACK_MASK_TERMS=Ivan Petrov,Ivan,Acme Corp,Project Gemini
+```
+
+Matching is case-insensitive and word-bounded (`Ann` is not masked inside `Anna`),
+and the longest term wins, so listing both `Ivan Petrov` and `Ivan` is fine.
+Terms that collide with a transcript label (`You`, `Other`, `Speaker 1`) are
+refused with a warning — masking those would break speaker attribution and protect
+nothing.
+
+**Matching is literal.** A term is masked in exactly the forms you list. In an
+inflected language every form needs its own entry (`Ivan, Ivana, Ivanu`) — tapeback
+does not guess them, because guessing would silently rewrite unrelated words.
+`TAPEBACK_MASK_PII=true` is a floor, not a guarantee that the provider sees nothing
+personal.
+
+**Check it before you trust it.** `--show-masked` prints exactly what would be sent
+and stops there — no request, no API key needed:
+
+```bash
+tapeback summarize notes.md --show-masked
+# stderr: Masked: EMAIL 1, TERM 4
+# stdout: the text that would go to the provider
+```
+
+The tally counts distinct values, not occurrences. The payload goes to stdout and
+the tally to stderr, so `--show-masked > sent.txt` gives you something to diff.
+
 ## CLI reference
 
 ```
@@ -232,6 +280,7 @@ tapeback start --no-diarize        # skip speaker identification
 tapeback start --no-summarize      # skip LLM summary
 tapeback process meeting.mp3 --name "weekly-standup"
 tapeback summarize notes.md --provider gemini --model gemini-2.5-pro
+tapeback summarize notes.md --show-masked   # print what would be sent, send nothing
 ```
 
 ## Output format
@@ -370,6 +419,8 @@ All settings via environment variables (prefix `TAPEBACK_`) or
 | Variable | Default | Description |
 |---|---|---|
 | `TAPEBACK_SUMMARIZE` | `true` | Enable LLM summarization |
+| `TAPEBACK_MASK_PII` | `false` | Mask emails and phone numbers before sending ([details](#pii-masking)) |
+| `TAPEBACK_MASK_TERMS` | *(empty)* | Comma-separated names/terms to mask too (needs `MASK_PII`) |
 | `TAPEBACK_LLM_PROVIDER` | `anthropic` | Primary provider ([list](#llm-summarization)) |
 | `TAPEBACK_LLM_API_KEY` | *(empty)* | API key (or use provider-specific env var) |
 | `TAPEBACK_LLM_MODEL` | *(provider default)* | Override model name |
@@ -551,6 +602,7 @@ If you find tapeback useful, consider a small donation:
 
 ## Links
 
+- [Contributing](CONTRIBUTING.md)
 - [Changelog](CHANGELOG.md)
 - [Deploy](DEPLOY.md)
 - [CI/CD](.github/workflows/)

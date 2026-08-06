@@ -19,13 +19,14 @@ No web servers, databases, Docker.
 - Never delete files not tracked in git. Run `git ls-files <path>` before removing any file. If untracked — ask user.
 - Never simplify architecture by removing existing features unless explicitly asked.
 - Any file with API keys, tokens or credentials is read-only.
+- The LLM summarizer is the only thing that leaves the machine, and a meeting transcript is personal data. `summarizer.summarize()` is the single masking seam (`_mask.py`) — a new outbound call must go through it, never past it. Masking is opt-in (`TAPEBACK_MASK_PII`) because it is the user's data and their call.
 - When fixing linter/import issues: fix one file at a time, run tests after each change.
 - When renaming or refactoring across the project, grep for ALL old names (module, package, repo, env prefix, URLs) across the entire tree before considering the task done. Don't skip files that seem unimportant (PKGBUILD, .install, flake.nix, demo.tape, etc.).
 
 ## Architecture
 
-- Source: `src/tapeback/` — cli.py, recorder.py, audio.py, transcriber.py, diarizer.py, channel.py, formatter.py, vault.py, summarizer.py, models.py, settings.py, const.py, tray.py, pipeline.py, glossary.py
-- Private helpers are `_`-prefixed: `_gpu.py` (nvidia-smi, thermal clamp, VRAM), `_worker.py` + `_isolated.py` (out-of-process transcription), `_resume.py` (reusing a finished channel), `_quality.py` (transcript metrics and the hallucination filter), `_runlog.py`, `_timing.py`, `_lazy.py`
+- Source: `src/tapeback/` — cli.py, recorder.py, audio.py, channel.py, transcriber.py, diarizer.py, speaker_merge.py, formatter.py, vault.py, summarizer.py, glossary.py, live.py, tray.py, pipeline.py + models.py, settings.py, const.py
+- Private helpers are `_`-prefixed: `_gpu.py` (nvidia-smi, thermal clamp, VRAM), `_worker.py` + `_isolated.py` (out-of-process transcription), `_resume.py` (reusing a finished channel), `_quality.py` (transcript metrics and the hallucination filter), `_mask.py` (PII masking at the LLM boundary), `_sni.py` + `_dbusmenu.py` + `_tray_env.py` (tray protocol), `_runlog.py`, `_timing.py`, `_lazy.py`. The prefix means "internal to tapeback", not "pure" — `_gpu.py` shells out and `_worker.py` spawns processes.
 - Benchmarks live in `scripts/bench_transcribe.py` — it drives the real `Transcriber`, so it measures what ships. Configuration choices here are made from its table, not from reasoning; see `.claude/plans/BACKLOG.md` for what that has already overturned.
 - Constants: `src/tapeback/const.py` — import as `from tapeback import const`, use as `const.SPEAKER_YOU`
 - Domain models (Segment, Word, DiarizationSegment, Summary, ActionItem) live in models.py — never in infrastructure modules
@@ -71,6 +72,7 @@ Do not duplicate ruff rules here — if ruff can check it, ruff owns it.
 - **Bug fix workflow**: every fix MUST start with a failing test that reproduces the bug.
   Write the test first, verify it fails, then apply the fix and verify the test passes.
   This prevents regressions and documents the exact failure scenario.
+- **No test may reach a live vendor.** The autouse `isolate_settings_sources` fixture cuts off `.env`, every `TAPEBACK_*` variable, and every provider key in `summarizer._PROVIDER_ENV_VARS` — those are read under their own names (`ANTHROPIC_API_KEY`, ...), so a prefix sweep alone leaves them live. Drive the list off the production mapping, never a copy: a new provider must be isolated when it is added, not when someone remembers. A forgotten mock must then fail, not bill. Live vendors only under `TAPEBACK_RUN_E2E=1`.
 
 ## Versioning & releases
 
@@ -80,7 +82,8 @@ Do not duplicate ruff rules here — if ruff can check it, ruff owns it.
 - CHANGELOG entries for released versions are immutable. Before writing to CHANGELOG.md, run `git tag --sort=-v:refname | head -5` — if the top section version ≤ latest tag, that section is frozen. Create a new patch version (e.g. 0.8.8 → 0.8.9) with today's date.
 - Never use `[Unreleased]` — always assign the next concrete version number with today's date (e.g. `## [0.8.9] — 2026-04-02`).
 - Order CHANGELOG entries by user impact: user-facing fixes first, infrastructure/internal changes last.
-- Version is the single source of truth in `pyproject.toml`. All other files (PKGBUILDs) are updated via `scripts/release.sh <version>`.
+- Version is the single source of truth in `pyproject.toml`. All other files are updated via `scripts/release.sh <version>` — that means all five packaging targets in `packaging/`: `PKGBUILD`, `tapeback-cuda`, `tapeback-diarize`, `tapeback-llm`, `tapeback-tray`, plus `deb/`.
+- Bundled interpreters in distro packages come from a pinned tarball URL (`scripts/build-deb.sh`), not from a tool that fetches one (`uv python install`). The URL is deterministic and so is the archive layout; a tool's layout varies by its own version and by the runner's platform, which once put a broken python into the `.deb`.
 - Release flow: bump version → update CHANGELOG → commit → tag → push → CI publishes to PyPI → update AUR
 - AUR publishing is manual: clone AUR repo, copy PKGBUILD, generate `.SRCINFO`, compute sha256sum, push.
 - PKGBUILD in this repo keeps `sha256sums=('SKIP')` — real checksum is set only in the AUR repo after the tarball is available.

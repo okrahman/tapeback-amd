@@ -11,6 +11,7 @@ from pydantic import SecretStr
 
 from tapeback.recorder import Recorder
 from tapeback.settings import Settings
+from tapeback.summarizer import _PROVIDER_ENV_VARS
 
 
 def _pyannote_available() -> bool:
@@ -58,6 +59,13 @@ def isolate_settings_sources(monkeypatch):
     monkeypatch.setitem(Settings.model_config, "env_file", ())
     for name in [key for key in os.environ if key.startswith("TAPEBACK_")]:
         monkeypatch.delenv(name, raising=False)
+    # Provider keys are read under their own names, not the TAPEBACK_ prefix, so the
+    # sweep above never touched them: a developer with ANTHROPIC_API_KEY exported gave
+    # every test a live provider chain, and one forgotten mock would bill the vendor.
+    # Driven off the production mapping on purpose — a new provider must be isolated
+    # the moment it is added, not the next time someone remembers this list.
+    for env_var in _PROVIDER_ENV_VARS.values():
+        monkeypatch.delenv(env_var, raising=False)
     # Same rule applied to the machine's thermal state: without this every test that
     # builds a Transcriber on "cuda" polls the real GPU and can sit in the clamp wait,
     # so the suite's runtime would depend on how hot the developer's laptop is.
@@ -346,9 +354,11 @@ class HttpError(Exception):
 
 
 def clear_all_provider_env_vars(monkeypatch) -> None:
-    """Remove all provider-specific API key env vars."""
-    from tapeback.summarizer import _PROVIDER_ENV_VARS  # noqa: PLC0415
+    """Remove all provider-specific API key env vars.
 
+    Redundant since isolate_settings_sources does the same for every test; kept because
+    call sites read as an explicit statement of what the test depends on.
+    """
     for env_var in _PROVIDER_ENV_VARS.values():
         monkeypatch.delenv(env_var, raising=False)
 
