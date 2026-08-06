@@ -5,6 +5,10 @@ on:
     branches: ["*"]
   pull_request:
     branches: [main]
+  # Manual trigger. Without it, "no run appeared" is indistinguishable between a
+  # workflow that was never dispatched and one that failed to start — as happened
+  # when pushes stopped producing runs with nothing reported anywhere.
+  workflow_dispatch:
 
 permissions:
   contents: read
