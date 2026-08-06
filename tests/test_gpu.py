@@ -173,7 +173,33 @@ def test_wait_for_clamp_release_polls_until_clear(monkeypatch):
         is True
     )
     assert slept == [5.0, 5.0]
-    assert len(reported) == 2
+    # One opening line; the rest are rationed to CLAMP_REPORT_INTERVAL_SEC and this
+    # wait is far shorter than that.
+    assert len(reported) == 1
+    assert "waiting for it to release" in reported[0]
+
+
+def test_wait_for_clamp_release_rations_its_reporting(monkeypatch):
+    """A long wait must stay visible without printing on every poll.
+
+    At a 5 s poll and a 15-minute timeout, reporting each poll would be 180 lines.
+    """
+    monkeypatch.setattr(_gpu.subprocess, "run", _fake_run("0x24\n"))
+    # Clock advances a minute per poll, so every poll crosses the reporting interval.
+    ticks = iter([0.0, 0.0, 60.0, 120.0, 180.0, 900.0])
+    reported: list[str] = []
+    assert (
+        wait_for_clamp_release(
+            600.0,
+            poll_interval=5.0,
+            report=reported.append,
+            clock=lambda: next(ticks),
+            sleep=lambda _s: None,
+        )
+        is False
+    )
+    assert any("60s of 600s" in m for m in reported)
+    assert "never release it" in reported[-1]
 
 
 def test_wait_for_clamp_release_times_out(monkeypatch):

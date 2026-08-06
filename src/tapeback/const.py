@@ -20,6 +20,11 @@ TEMP_DIR = "/tmp/tapeback"
 # Sample rates
 SAMPLE_RATE_16K = 16000
 
+# Frames read per iteration when de-interleaving a stereo WAV. Large enough that the
+# per-chunk overhead is irrelevant, small enough that the transient buffer (~4 MB at
+# this size) does not matter next to the output arrays.
+READ_CHUNK_FRAMES = 1_000_000
+
 # Audio channel layout
 STEREO_CHANNELS = 2
 # Minimum kept sub-segment duration when splitting on silence without word timings

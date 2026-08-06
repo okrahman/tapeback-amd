@@ -15,12 +15,17 @@ def _rms_for_range(
     samples: np.ndarray,
     sample_rate: int,
 ) -> float:
-    """Compute RMS energy for a time range in samples array."""
+    """Compute RMS energy for a time range in samples array.
+
+    The slice is widened before squaring. Channels are held as int16 to keep a long
+    recording out of swap, and a near-full-scale sample squares to ~1.07e9 — squaring
+    in the sample dtype wraps around and reports the loudest audio as the quietest.
+    """
     sf = max(0, min(int(start * sample_rate), len(samples)))
     ef = max(0, min(int(end * sample_rate), len(samples)))
     if ef <= sf:
         return 0.0
-    return float(np.sqrt(np.mean(samples[sf:ef] ** 2)))
+    return float(np.sqrt(np.mean(samples[sf:ef].astype(np.float64) ** 2)))
 
 
 def filter_silent_segments(
@@ -258,17 +263,46 @@ def split_on_silence(
 def load_stereo_channels(stereo_wav: Path) -> tuple[np.ndarray, np.ndarray, int]:
     """Load stereo WAV and return (mic_channel, monitor_channel, sample_rate).
 
-    mic = left channel, monitor = right channel.
-    Returns float32 arrays for RMS calculations.
+    mic = left channel, monitor = right channel. Channels come back as **int16**, the
+    format they are stored in; every consumer widens the slice it works on.
+
+    Memory is the reason. A 37-minute stereo recording at 48 kHz is 434 MB of int16.
+    Converting the whole thing to float32 up front doubled that to 869 MB held for the
+    entire run, and because the raw buffer stayed alive during the conversion it peaked
+    at 1.3 GB. Measured on a machine with 1.4 GB free, that was the difference between
+    running and thrashing swap — which in turn heats the CPU and drives the GPU into a
+    thermal clamp.
+
+    The per-channel copy is deliberate. `np.frombuffer(...).reshape(-1, 2)[:, 0]` is a
+    stride-2 view and needs no copy at all, but the RMS loop walks these arrays tens of
+    thousands of times and non-contiguous access roughly halves that throughput.
+
+    Reading in chunks rather than all at once keeps the peak down to the two output
+    arrays. Slurping the file first held the interleaved buffer *and* both channels at
+    the same time — 828 MB peak against the 434 MB actually needed.
     """
     with wave.open(str(stereo_wav), "rb") as wf:
         if wf.getnchannels() != const.STEREO_CHANNELS:
             raise ValueError(f"Expected stereo WAV, got {wf.getnchannels()} channels")
         sample_rate = wf.getframerate()
-        raw = wf.readframes(wf.getnframes())
+        total = wf.getnframes()
 
-    samples = np.frombuffer(raw, dtype=np.int16).reshape(-1, 2).astype(np.float32)
-    return samples[:, 0], samples[:, 1], sample_rate
+        mic = np.empty(total, dtype=np.int16)
+        monitor = np.empty(total, dtype=np.int16)
+
+        written = 0
+        while written < total:
+            raw = wf.readframes(min(const.READ_CHUNK_FRAMES, total - written))
+            if not raw:
+                break
+            chunk = np.frombuffer(raw, dtype=np.int16).reshape(-1, 2)
+            end = written + len(chunk)
+            mic[written:end] = chunk[:, 0]
+            monitor[written:end] = chunk[:, 1]
+            written = end
+
+    # A truncated file reports more frames than it holds; keep only what was read.
+    return mic[:written], monitor[:written], sample_rate
 
 
 def classify_segment_by_channel(
@@ -289,8 +323,9 @@ def classify_segment_by_channel(
     if end_frame <= start_frame:
         return None
 
-    mic_rms = float(np.sqrt(np.mean(mic[start_frame:end_frame] ** 2)))
-    monitor_rms = float(np.sqrt(np.mean(monitor[start_frame:end_frame] ** 2)))
+    # Widened before squaring — see _rms_for_range; int16 samples overflow otherwise.
+    mic_rms = float(np.sqrt(np.mean(mic[start_frame:end_frame].astype(np.float64) ** 2)))
+    monitor_rms = float(np.sqrt(np.mean(monitor[start_frame:end_frame].astype(np.float64) ** 2)))
 
     if mic_rms > (monitor_rms + const.CHANNEL_EPSILON) * const.CHANNEL_ENERGY_RATIO:
         return "mic"
@@ -322,9 +357,10 @@ def identify_user_speaker(
         sample_rate = wf.getframerate()
         raw = wf.readframes(wf.getnframes())
 
-    samples = np.frombuffer(raw, dtype=np.int16).reshape(-1, 2).astype(np.float32)
-    mic_channel = samples[:, 0]  # left = mic
-    monitor_channel = samples[:, 1]  # right = monitor
+    # int16, contiguous, for the same memory reason as load_stereo_channels.
+    interleaved = np.frombuffer(raw, dtype=np.int16).reshape(-1, 2)
+    mic_channel = np.ascontiguousarray(interleaved[:, 0])  # left = mic
+    monitor_channel = np.ascontiguousarray(interleaved[:, 1])  # right = monitor
 
     ratios: dict[str, float] = {}
 
@@ -342,8 +378,13 @@ def identify_user_speaker(
             if end_frame <= start_frame:
                 continue
 
-            mic_energy += float(np.sum(mic_channel[start_frame:end_frame] ** 2))
-            monitor_energy += float(np.sum(monitor_channel[start_frame:end_frame] ** 2))
+            # Widened before squaring — see _rms_for_range. This one accumulates over a
+            # whole speaker's segments, so int16 would not merely wrap but go negative,
+            # and the square root of that is a complex number.
+            mic_energy += float(np.sum(mic_channel[start_frame:end_frame].astype(np.float64) ** 2))
+            monitor_energy += float(
+                np.sum(monitor_channel[start_frame:end_frame].astype(np.float64) ** 2)
+            )
             total_frames += end_frame - start_frame
 
         if total_frames > 0:

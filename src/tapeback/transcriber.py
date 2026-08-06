@@ -124,9 +124,20 @@ def _resolve_device(settings: Settings) -> str:
         return settings.device
     if not _enough_vram(settings):
         return "cpu"
-    if settings.thermal_clamp_wait <= 0:
+    if not settings.thermal_clamp_check:
         return settings.device
-    if wait_for_clamp_release(settings.thermal_clamp_wait):
+
+    # Checking is always cheap; waiting is the part that has to be justified. With a
+    # zero wait this is a single query, which is what makes returning to the GPU work:
+    # the decision is retaken for every stage, so a clamp that clears between channels
+    # is picked up at the next one instead of stranding the whole run on the CPU.
+    #
+    # Reported, not silent: a wait can legitimately last minutes, and a process that
+    # prints nothing while it does is indistinguishable from one that has hung.
+    if wait_for_clamp_release(
+        settings.thermal_clamp_wait,
+        report=lambda message: print(message, file=sys.stderr),
+    ):
         return "cuda"
     if not settings.thermal_clamp_cpu_fallback:
         print(

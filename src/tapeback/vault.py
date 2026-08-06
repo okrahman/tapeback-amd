@@ -48,9 +48,19 @@ def save_audio_to_vault(
     Creates {vault}/{attachments_dir}/ if missing.
     Does not overwrite existing files — adds _1, _2, etc. suffix.
     Returns path to the saved audio file.
+
+    A file that already lives in the attachments directory is returned as-is. Copying
+    it would add a `_1.wav` beside itself on every re-run, because the vault never
+    overwrites — which is how roughly 2.2 GB of a 5.5 GB audio directory turned out to
+    be duplicates of recordings that were simply transcribed more than once.
     """
     validate_session_name(session_name)
     attachments_dir = settings.vault_path / settings.attachments_dir
+
+    resolved = audio_path.resolve()
+    if attachments_dir.exists() and resolved.parent == attachments_dir.resolve():
+        return audio_path
+
     attachments_dir.mkdir(parents=True, exist_ok=True)
 
     audio_dest = _unique_path(attachments_dir / f"{session_name}.wav")

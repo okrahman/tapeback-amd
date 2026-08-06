@@ -120,11 +120,19 @@ class Settings(BaseSettings):
     # cure is not to trigger it. The smallest configuration measured needs ~1115 MiB.
     min_free_vram_mib: int = Field(default=1200, ge=0)
 
-    # Seconds to wait for a GPU thermal clamp to release before starting transcription.
-    # On laptops that share one heatsink between CPU and GPU, the controller can cut the
-    # GPU's power budget (measured: 50 W -> 5 W, clocks pinned to 300 MHz) and hold it
-    # there while the CPU stays hot. 0 disables the check entirely.
-    thermal_clamp_wait: float = Field(default=60.0, ge=0.0)
+    # Look for a GPU thermal clamp before each transcription stage. On laptops that
+    # share one heatsink between CPU and GPU, the controller can cut the GPU's power
+    # budget (measured: 50 W -> 5 W, clocks pinned to 300 MHz) and hold it there while
+    # the CPU stays hot. The check is one nvidia-smi query and is retaken per stage, so
+    # a clamp that clears between channels returns the run to the GPU by itself.
+    thermal_clamp_check: bool = True
+    # Seconds to wait for the clamp to release before giving up on the GPU for this
+    # stage. Default 0 — do not wait. The clamp clears on system idle, and the shortest
+    # release measured was 451 s, so any wait short enough to be tolerable essentially
+    # never succeeds while meanwhile the CPU would already be transcribing at ~2.39x
+    # real time against a clamped GPU's ~0.31x. Raise it only if the machine will
+    # genuinely be idle.
+    thermal_clamp_wait: float = Field(default=0.0, ge=0.0)
     # When the clamp has not released by then, transcribe on CPU instead of on a card
     # limited to a tenth of its power. Measured on the same clip: CPU 2.39x real time,
     # clamped GPU 0.31x — the CPU is ~8x faster, so waiting it out is the worse option.

@@ -42,6 +42,10 @@ THROTTLE_MASK = (
 # without running a load: SW power cap alone (0x4) is normal for a 50 W part under work.
 THERMAL_CLAMP_MASK = THROTTLE_SW_THERMAL | THROTTLE_HW_THERMAL
 
+# How often to say we are still waiting on the clamp. The poll itself is cheap; the
+# reporting is what needs rationing, so a long wait stays visible without flooding.
+CLAMP_REPORT_INTERVAL_SEC = 60.0
+
 PERCENT = 100.0
 
 # Substrings that mark a recoverable CUDA/GPU failure. ctranslate2 (faster-whisper)
@@ -155,18 +159,35 @@ def wait_for_clamp_release(
     Returns True if the card is (or became) clear, False on timeout. Returns True
     when the clamp cannot be read at all, so a machine without nvidia-smi is never
     blocked by a check it cannot perform.
+
+    Progress is reported at most every CLAMP_REPORT_INTERVAL_SEC, with the elapsed
+    time: a wait can legitimately run for minutes, and one that prints nothing looks
+    exactly like a hang. Reporting every poll would be 180 lines over a 15-minute wait.
     """
-    deadline = clock() + timeout
+    started = clock()
+    deadline = started + timeout
+    last_report = -CLAMP_REPORT_INTERVAL_SEC
     while True:
         clamped = thermal_clamp_active()
         if clamped is None or not clamped:
+            elapsed = clock() - started
+            if report and elapsed >= CLAMP_REPORT_INTERVAL_SEC:
+                report(f"GPU thermal clamp released after {elapsed:.0f}s.")
             return True
         if clock() >= deadline:
             if report:
-                report(f"GPU still thermally clamped after {timeout:.0f}s — measuring anyway")
+                report(
+                    f"GPU still thermally clamped after {timeout:.0f}s — proceeding anyway. "
+                    "It clears on idle, so a busy machine may never release it."
+                )
             return False
-        if report:
-            report("GPU thermally clamped, waiting for it to release...")
+        elapsed = clock() - started
+        if report and elapsed - last_report >= CLAMP_REPORT_INTERVAL_SEC:
+            last_report = elapsed
+            report(
+                f"GPU thermally clamped, waiting for it to release "
+                f"({elapsed:.0f}s of {timeout:.0f}s)..."
+            )
         sleep(poll_interval)
 
 

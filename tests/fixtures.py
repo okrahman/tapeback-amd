@@ -61,7 +61,7 @@ def isolate_settings_sources(monkeypatch):
     # Same rule applied to the machine's thermal state: without this every test that
     # builds a Transcriber on "cuda" polls the real GPU and can sit in the clamp wait,
     # so the suite's runtime would depend on how hot the developer's laptop is.
-    monkeypatch.setenv("TAPEBACK_THERMAL_CLAMP_WAIT", "0")
+    monkeypatch.setenv("TAPEBACK_THERMAL_CLAMP_CHECK", "false")
     # Likewise for process isolation: a test that mocks WhisperModel would otherwise
     # spawn a real worker, which loads a real model and ignores the mock entirely.
     # Tests for the isolated path opt back in and mock the subprocess instead.

@@ -40,6 +40,7 @@ WORKER_SETTINGS = (
     "multilingual",
     "hallucination_silence_threshold",
     "min_free_vram_mib",
+    "thermal_clamp_check",
     "thermal_clamp_wait",
     "thermal_clamp_cpu_fallback",
 )

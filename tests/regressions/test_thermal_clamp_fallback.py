@@ -33,7 +33,9 @@ def test_clamped_gpu_falls_back_to_cpu(settings, clamped, capsys):
     2.39x real time against 0.31x clamped — this is what turned a fifteen-minute job
     into a multi-hour one that never appeared to finish.
     """
-    s = settings.model_copy(update={"device": "cuda", "thermal_clamp_wait": 60.0})
+    s = settings.model_copy(
+        update={"device": "cuda", "thermal_clamp_check": True, "thermal_clamp_wait": 60.0}
+    )
 
     with patch("tapeback.transcriber.WhisperModel") as mock_model_cls:
         transcriber = Transcriber(s)
@@ -44,7 +46,9 @@ def test_clamped_gpu_falls_back_to_cpu(settings, clamped, capsys):
 
 
 def test_clear_gpu_is_used_normally(settings, clear_gpu):
-    s = settings.model_copy(update={"device": "cuda", "thermal_clamp_wait": 60.0})
+    s = settings.model_copy(
+        update={"device": "cuda", "thermal_clamp_check": True, "thermal_clamp_wait": 60.0}
+    )
 
     with patch("tapeback.transcriber.WhisperModel") as mock_model_cls:
         transcriber = Transcriber(s)
@@ -58,6 +62,7 @@ def test_fallback_can_be_declined(settings, clamped, capsys):
     s = settings.model_copy(
         update={
             "device": "cuda",
+            "thermal_clamp_check": True,
             "thermal_clamp_wait": 60.0,
             "thermal_clamp_cpu_fallback": False,
         }
@@ -70,14 +75,59 @@ def test_fallback_can_be_declined(settings, clamped, capsys):
     assert "very slow" in capsys.readouterr().err
 
 
+def test_the_gpu_is_reclaimed_once_the_clamp_clears(settings, monkeypatch):
+    """A run stranded on the CPU must return to the GPU when the card frees up.
+
+    The decision is retaken for every stage — each channel runs in its own worker,
+    which resolves the device for itself. Without that, one clamp at the wrong moment
+    would hold the whole recording on the CPU even after the card recovered.
+    """
+    clamped = iter([True, False])  # first stage clamped, second clear
+    monkeypatch.setattr(
+        "tapeback.transcriber.wait_for_clamp_release", lambda *_a, **_k: not next(clamped)
+    )
+    monkeypatch.setattr("tapeback.transcriber.get_free_vram_mib", lambda: 4096)
+    s = settings.model_copy(update={"device": "cuda", "thermal_clamp_check": True})
+
+    with patch("tapeback.transcriber.WhisperModel"):
+        first = Transcriber(s).describe()
+        second = Transcriber(s).describe()
+
+    assert first == "Whisper: large-v3-turbo on cpu/int8"
+    assert second == "Whisper: large-v3-turbo on cuda/int8_float16"
+
+
+def test_zero_wait_still_checks_the_clamp(settings, monkeypatch):
+    """Not waiting is not the same as not looking.
+
+    The default is a zero wait: the clamp clears on system idle and the shortest
+    release measured was 451 s, so waiting rarely pays. The check itself is one query
+    and is what makes returning to the GPU at the next stage possible.
+    """
+    waits: list[float] = []
+    monkeypatch.setattr(
+        "tapeback.transcriber.wait_for_clamp_release",
+        lambda timeout, **_k: waits.append(timeout) or False,
+    )
+    monkeypatch.setattr("tapeback.transcriber.get_free_vram_mib", lambda: 4096)
+    s = settings.model_copy(
+        update={"device": "cuda", "thermal_clamp_check": True, "thermal_clamp_wait": 0.0}
+    )
+
+    with patch("tapeback.transcriber.WhisperModel"):
+        assert Transcriber(s).describe() == "Whisper: large-v3-turbo on cpu/int8"
+
+    assert waits == [0.0]
+
+
 def test_clamp_check_skipped_when_disabled(settings, monkeypatch):
-    """thermal_clamp_wait=0 must not touch the GPU at all."""
+    """thermal_clamp_check=false must not touch the GPU at all."""
     calls: list[object] = []
     monkeypatch.setattr(
         "tapeback.transcriber.wait_for_clamp_release",
         lambda *a, **k: calls.append(a) or True,
     )
-    s = settings.model_copy(update={"device": "cuda", "thermal_clamp_wait": 0.0})
+    s = settings.model_copy(update={"device": "cuda", "thermal_clamp_check": False})
 
     with patch("tapeback.transcriber.WhisperModel"):
         Transcriber(s)
@@ -91,7 +141,7 @@ def test_clamp_check_skipped_on_cpu(settings, monkeypatch):
         "tapeback.transcriber.wait_for_clamp_release",
         lambda *a, **k: calls.append(a) or True,
     )
-    s = settings.model_copy(update={"device": "cpu", "thermal_clamp_wait": 60.0})
+    s = settings.model_copy(update={"device": "cpu", "thermal_clamp_check": True})
 
     with patch("tapeback.transcriber.WhisperModel"):
         Transcriber(s)
@@ -102,7 +152,7 @@ def test_clamp_check_skipped_on_cpu(settings, monkeypatch):
 def test_stage_pause_runs_between_channels(settings, clear_gpu):
     """Pacing sheds heat between channels instead of driving into the clamp."""
     s = settings.model_copy(
-        update={"device": "cuda", "thermal_clamp_wait": 60.0, "stage_pause_seconds": 7.0}
+        update={"device": "cuda", "thermal_clamp_check": True, "stage_pause_seconds": 7.0}
     )
     seg = MagicMock()
     seg.start, seg.end, seg.text, seg.words = 0.0, 5.0, "text", []
@@ -128,7 +178,7 @@ def test_stage_pause_runs_between_channels(settings, clear_gpu):
 
 def test_no_pause_when_disabled(settings, clear_gpu):
     s = settings.model_copy(
-        update={"device": "cuda", "thermal_clamp_wait": 60.0, "stage_pause_seconds": 0.0}
+        update={"device": "cuda", "thermal_clamp_check": True, "stage_pause_seconds": 0.0}
     )
     seg = MagicMock()
     seg.start, seg.end, seg.text, seg.words = 0.0, 5.0, "text", []

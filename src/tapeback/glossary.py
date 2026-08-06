@@ -31,15 +31,19 @@ Keeping it useful:
 #
 # Harvested from a corpus of the project's own recordings. Terms added because the
 # transcripts showed them breaking:
-#   "Doctor"        -> docTR
 #   "Layout, MV3"   -> LayoutLMv3
 #   "Onyx, Runtime" -> ONNX Runtime   (plain "ONNX" was already listed and still split)
 #   "RebitMQ"       -> RabbitMQ       (alongside a correct "RabbitMQ" from one speaker)
 #   "OpenSWIFO"     -> OpenVINO
+#   "QVN, last QVN" -> Qwen
+#
+# `docTR` was tried and removed: it was measured still coming back as "Dr. OCR" with the
+# glossary in place — the hotword lost to the phonetic match with an ordinary English
+# word. A term that does not work is not free, it spends budget (see below).
 _AI_ML = (
     "LLM, RAG, Whisper, embeddings, vector search, retrieval, agent, MCP, ONNX, "
-    "ONNX Runtime, OpenVINO, PyTorch, TorchScript, LayoutLMv3, docTR, Tesseract, "
-    "Hugging Face, OCR, CUDA, GPU, VRAM, diarization"
+    "ONNX Runtime, OpenVINO, PyTorch, TorchScript, LayoutLMv3, Tesseract, "
+    "Hugging Face, Qwen, OCR, CUDA, GPU, VRAM, diarization"
 )
 
 _TOOLS = (
