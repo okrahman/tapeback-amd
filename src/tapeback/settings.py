@@ -101,6 +101,13 @@ class Settings(BaseSettings):
     # needs root). No-op when nvidia-smi is unavailable.
     gpu_telemetry: bool = True
 
+    # Reuse a channel that was already transcribed with the same audio and the same
+    # output-affecting settings, so an interrupted run does not redo finished work.
+    # Granularity is a whole channel — see _resume.py for why not finer.
+    resume_cache: bool = True
+    # None → XDG data dir (~/.local/share/tapeback/resume).
+    resume_cache_dir: Path | None = None
+
     # Run transcription in a child process. A CUDA out-of-memory leaks its allocation
     # for the life of the process it happened in, and nothing reachable from Python
     # releases it — but a process that exits gives the memory back. Costs one process

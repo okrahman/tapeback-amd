@@ -9,7 +9,7 @@ from typing import Any
 from faster_whisper import BatchedInferencePipeline, WhisperModel
 from huggingface_hub.errors import LocalEntryNotFoundError
 
-from tapeback import const
+from tapeback import _resume, const
 from tapeback._gpu import (
     free_gpu_memory,
     get_free_vram_mib,
@@ -320,14 +320,24 @@ class Transcriber:
         Progress is reported through ``on_status`` as the segment generator is
         consumed, so a long run shows movement instead of a single opening line.
         """
+        # Checked before the isolation branch so a cache hit costs no process at all.
+        key = self._resume_key(audio_path, stage)
+        if key is not None:
+            cached = _resume.load(key, _resume.resume_dir(self._settings))
+            if cached is not None:
+                on_status(f"Reusing the '{stage}' result from an earlier run.")
+                return cached
+
         if self._isolated:
-            return transcribe_isolated(
+            segments, info = transcribe_isolated(
                 audio_path,
                 self._settings,
                 stage=stage,
                 on_status=on_status,
                 language_override=language_override,
             )
+            self._store_resume(key, segments, info)
+            return segments, info
 
         # "auto" → None lets faster-whisper auto-detect language. An override wins over
         # "auto" but never over an explicitly configured language.
@@ -358,8 +368,29 @@ class Transcriber:
             "duration": info.duration,
             "partial": interrupted,
         }
+        self._store_resume(key, segments, info_dict)
 
         return segments, info_dict
+
+    def _resume_key(self, audio_path: Path, stage: str) -> _resume.ResumeKey | None:
+        if not self._settings.resume_cache:
+            return None
+        return _resume.resume_key(audio_path, self._settings, stage)
+
+    def _store_resume(
+        self,
+        key: _resume.ResumeKey | None,
+        segments: list[Segment],
+        info: dict[str, Any],
+    ) -> None:
+        """Cache a channel, but only a complete one.
+
+        Storing a partial result would make the next run reuse the truncated version
+        and call it done — the opposite of what resuming is for.
+        """
+        if key is None or info.get("partial") or not segments:
+            return
+        _resume.store(key, _resume.resume_dir(self._settings), segments, info)
 
     def _invoke_transcribe(self, audio_path: Path, language: str | None) -> tuple[Any, Any]:
         """Single point that calls into faster-whisper with the configured args.

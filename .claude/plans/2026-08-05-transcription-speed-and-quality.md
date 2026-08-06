@@ -1,6 +1,6 @@
 # Spec: transcription speed and quality
 
-Status: stages 1a, 1b, 1c, 2 and 3a landed; stage 3 in progress; 3b / 4 pending.
+Status: all stages landed (1a, 1b, 1c, 2, 3a, 3, 3b, 3c, 4) plus process isolation and resume.
 
 ## Stage 3a result — defaults chosen
 
@@ -525,13 +525,24 @@ multi-hour one.
 Both 1 and 2 need settings, and both change runtime behaviour materially rather than only
 reporting — so they are worth agreeing on before they ship.
 
-### Stage 4 — stop losing work (the reason 16 recordings vanished)
+### Stage 4 — stop losing work — DONE
 
-- Catch `KeyboardInterrupt` inside `_collect_segments` and write the segments collected so far to
-  markdown instead of discarding everything.
-- `try/finally` around the transcription stage so `free_gpu_memory()` also runs on the exception
-  path.
-- Cache per-channel intermediate results so a re-run does not start from zero.
+- `KeyboardInterrupt` inside the segment loop keeps what was decoded instead of discarding it;
+  the note is tagged `partial` with a visible warning; the second channel is skipped rather than
+  making the user interrupt twice; a further Ctrl+C still stops the process.
+- `try/finally` around transcription so `free_gpu_memory()` runs on the exception path too.
+- **Process isolation** (`TAPEBACK_ISOLATE_TRANSCRIPTION`): transcription runs in a child, so the
+  unfixable ctranslate2 OOM leak dies with it. Verified on the configuration that used to strand
+  the card: free VRAM 3674 → 95 MiB in-process, 3674 → **3674 MiB** isolated. Segments stream back
+  as complete lines, so a killed worker still leaves its finished work with the parent.
+- **Resume** (`TAPEBACK_RESUME_CACHE`): a completed channel is cached against the audio plus every
+  output-affecting setting. Measured on a real clip, a repeat run went **85.8 s → 0.0 s**.
+
+**Two limits worth stating.** Resuming part-way through a channel was rejected on evidence, not
+effort: it needs `clip_timestamps`, which faster-whisper documents as ignoring `vad_filter`, and
+VAD is half of why the silence hallucinations went away. And because the monitor channel runs
+first and is the expensive one, an interrupt during *it* has nothing to reuse — the cache pays off
+when the second channel is the one interrupted.
 
 ### Order
 
