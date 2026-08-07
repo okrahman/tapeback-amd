@@ -23,13 +23,20 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 sed -i "s/^version = \".*\"/version = \"$VERSION\"/" "$REPO_ROOT/pyproject.toml"
 echo "Updated pyproject.toml"
 
-# 2. All PKGBUILDs
+# 2. uv.lock records the project's own version, so bumping pyproject.toml alone leaves
+# it stale — and both CI and the publish workflow install with `uv sync --locked`, which
+# refuses a stale lockfile and fails the whole release. Regenerating here resolves the
+# dependency graph again, so review the diff: it should touch only the tapeback version.
+(cd "$REPO_ROOT" && uv lock --quiet)
+echo "Updated uv.lock"
+
+# 3. All PKGBUILDs
 while IFS= read -r pkgbuild; do
     sed -i "s/^pkgver=.*/pkgver=$VERSION/" "$pkgbuild"
     echo "Updated ${pkgbuild#$REPO_ROOT/}"
 done < <(find "$REPO_ROOT/packaging" -name PKGBUILD)
 
-# 3. Verify CHANGELOG.md has a section for this version
+# 4. Verify CHANGELOG.md has a section for this version
 if ! grep -q "^## \[$VERSION\]" "$REPO_ROOT/CHANGELOG.md"; then
     echo ""
     echo "Warning: CHANGELOG.md has no section for [$VERSION]."
