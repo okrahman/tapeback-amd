@@ -1,3 +1,4 @@
+import re
 from dataclasses import dataclass
 
 from tapeback import const
@@ -15,6 +16,32 @@ WORD_LOW_CONFIDENCE = 0.35
 # recording rendered with its last timecode at [00:00:45]. The text was intact but
 # unnavigable. 60s keeps a block readable while still giving a timecode a minute.
 MAX_BLOCK_SECONDS = 60.0
+
+
+# Terminal-control and other non-printable characters, sanitized out of inline text
+# by `_display_value`.
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def _yaml_scalar(value: object) -> str:
+    """Render a value as a safe double-quoted YAML scalar.
+
+    Metadata values can come from remote detection or an older resume cache, so a
+    quote, backslash, or newline must never escape into the front matter and change
+    its structure.
+    """
+    return '"' + str(value).replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def _display_value(value: object) -> str:
+    """A value safe to interpolate into an inline markdown paragraph.
+
+    Control characters cannot be typed into a note; they are collapsed to spaces so
+    a malicious or corrupt value cannot inject terminal controls or fake headings
+    into the transcript body.
+    """
+    text = str(value)
+    return _CONTROL_CHARS_RE.sub(" ", text)
 
 
 def _format_timecode(seconds: float) -> str:
@@ -249,7 +276,7 @@ def format_markdown(
         f"date: {date_str}",
         f'time: "{time_display}"',
         f'duration: "{duration_hms}"',
-        f"language: {meta.language}",
+        f"language: {_yaml_scalar(meta.language)}",
         f'audio: "[[{meta.audio_rel_path}]]"',
         "tags:",
         "  - meeting",
@@ -265,7 +292,7 @@ def format_markdown(
         "",
         f"# Meeting {date_str} {time_display}",
         "",
-        f"**Duration:** {duration_human} | **Language:** {meta.language}",
+        f"**Duration:** {duration_human} | **Language:** {_display_value(meta.language)}",
         "",
     ]
     if meta.partial:
@@ -312,7 +339,7 @@ def format_live_markdown(
     lines = [
         f"# Live Transcript {date_str} {time_display}",
         "",
-        f"**Language:** {language} | **Status:** recording in progress",
+        f"**Language:** {_display_value(language)} | **Status:** recording in progress",
         "",
         "---",
         "",

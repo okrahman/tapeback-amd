@@ -113,9 +113,7 @@ class Transcriber:
         fingerprint = self._backend.cache_fingerprint()
         language_token = self._effective_language(language_override)
         key = (
-            self._resume_key(audio_path, stage, fingerprint, language_token)
-            if use_resume
-            else None
+            self._resume_key(audio_path, stage, fingerprint, language_token) if use_resume else None
         )
         cached = self._load_resume(key, stage, on_status)
         if cached is not None:
@@ -168,26 +166,35 @@ class Transcriber:
         (live mode) never submits another request to the server that just failed.
         The faster-whisper identity is recomputed here, not assumed: its device can
         resolve differently (VRAM, thermal clamp) from anything the Lemonade backend
-        knew about. Only the result this run actually accepts gets cached, under the
-        faster-whisper fingerprint and the effective language — unless the caller
-        opted out of resume IO.
+        knew about. Resume lookup happens BEFORE inference, under the faster-whisper
+        fingerprint and the effective language, so an outage that keeps forcing
+        fallback never redoes a channel an earlier fallback already cached. Only the
+        result this run actually accepts is stored, under that same identity — unless
+        the caller opted out of resume IO.
         """
         on_status(f"Lemonade transcription failed ({exc}) — falling back to faster-whisper.")
         fw = self._new_fw_backend()
         self._backend = fw
-        language_token = self._effective_language(language_override)
+        key = (
+            self._resume_key(
+                audio_path,
+                stage,
+                fw.cache_fingerprint(),
+                self._effective_language(language_override),
+            )
+            if use_resume
+            else None
+        )
+        cached = self._load_resume(key, stage, on_status)
+        if cached is not None:
+            return cached
         segments, info = fw.transcribe(
             audio_path,
             stage=stage,
             on_status=on_status,
             language_override=language_override,
         )
-        if use_resume:
-            self._store_resume(
-                self._resume_key(audio_path, stage, fw.cache_fingerprint(), language_token),
-                segments,
-                info,
-            )
+        self._store_resume(key, segments, info)
         return segments, info
 
     def transcribe_stereo(

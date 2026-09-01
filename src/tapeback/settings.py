@@ -1,7 +1,8 @@
+import math
 from pathlib import Path
 from typing import Literal
 
-from pydantic import Field, SecretStr, model_validator
+from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from tapeback.glossary import DEFAULT_HOTWORDS
@@ -160,16 +161,30 @@ class Settings(BaseSettings):
     # it out of repr/logs; it is sent only in the Authorization header and never
     # appears in cache fingerprints or error messages.
     lemonade_api_key: SecretStr = SecretStr("")
-    # Per-request read timeout in seconds. Inference on a long chunk can legitimately
-    # take minutes, so this is generous by default; hitting it aborts the run and
-    # falls back to faster-whisper rather than resubmitting to Lemonade.
+    # Per-request timeout in seconds. Enforced as a **total end-to-end deadline**:
+    # connect, upload, redirect classification, and every read of the response
+    # body share the same budget — a trickling peer cannot extend the request
+    # past this bound. Inference on a long chunk can legitimately take minutes,
+    # so this is generous by default; hitting it aborts the run and falls back to
+    # faster-whisper rather than resubmitting to Lemonade.
     lemonade_timeout_seconds: float = Field(default=600.0, gt=0.0)
     # Per-request timeout for the status command's health/system-info diagnostics.
-    # These are tiny GETs against an endpoint that may be the very thing that is
-    # down or stalled: a short bound keeps `tapeback status` a usable diagnostic
-    # instead of a ten-minute hang. Deliberately separate from the inference
-    # timeout above, which must stay generous for long-chunk inference.
+    # Same total-deadline semantics as the inference timeout, but deliberately
+    # short: these are tiny GETs against an endpoint that may be the very thing
+    # that is down or stalled, so `tapeback status` must never hang for minutes.
     lemonade_diagnostics_timeout_seconds: float = Field(default=10.0, gt=0.0)
+
+    @field_validator(
+        "lemonade_timeout_seconds",
+        "lemonade_diagnostics_timeout_seconds",
+    )
+    @classmethod
+    def _finite_timeout(cls, value: float) -> float:
+        """Reject NaN and infinities — a non-finite timeout would never expire."""
+        if not math.isfinite(value):
+            raise ValueError(f"Timeout must be a finite positive number, got {value!r}")
+        return value
+
     # Conservative internal chunk duration for long WAVs. Chosen to keep one request's
     # audio bounded in memory and progress reportable — these are tapeback's own
     # transport bounds, not statements about Lemonade Server limits. Finite bounds:

@@ -19,7 +19,10 @@ Transport decisions that shape the output:
   segments decides the language for every subsequent chunk (their requests carry it
   explicitly). Empty leading chunks are ignored, not treated as the answer.
 - **Timestamps.** Servers return chunk-relative times; they are shifted into
-  file-relative time before anything is returned or stored.
+  file-relative time before anything is returned or stored. Segments and the
+  words inside them are bounded to the audio that was actually sent and to their
+  containing segment, so a hostile or broken response cannot write timestamps
+  past the recording into the transcript or the resume cache.
 - **Transport protection.** Remote endpoints require ``https://``: meeting audio
   and the bearer credential must never travel in plaintext. Plain ``http://`` is
   accepted only for strictly recognized loopback endpoints (``localhost``,
@@ -46,6 +49,7 @@ import json
 import math
 import re
 import struct
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -249,6 +253,37 @@ def normalize_language(raw: str) -> str:
     if code in LANGUAGE_ALIASES:
         return LANGUAGE_ALIASES[code]
     return code
+
+
+# A remote language value must be a bounded, structurally safe token: it is
+# interpolated into multipart field headers, the YAML front matter, and the resume
+# cache, so quotes, CR/LF, control characters, and megabyte strings must never pass.
+# Every real ISO-639-1 code, Whisper language name, and alias (``zh-hans``, ``pt-br``)
+# fits this grammar.
+_LANGUAGE_TOKEN_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,23}$")
+_LANGUAGE_MAX_CHARS = 24
+
+
+def _remote_language(raw: Any) -> str:
+    """Validate a server-supplied language value and normalize it.
+
+    Unlike `normalize_language` (which also digests trusted local settings), this is
+    a schema check: anything that is not a bounded language-like string is a
+    LemonadeCapabilityError, never coerced with ``str()`` and never pinned. A hostile
+    value must fall back, not hard-abort multipart assembly on a later chunk or
+    corrupt the transcript metadata.
+    """
+    if not isinstance(raw, str):
+        raise LemonadeCapabilityError(
+            "Lemonade returned a response with an unusable language value (not a string)"
+        )
+    value = raw.strip().lower()
+    if len(value) > _LANGUAGE_MAX_CHARS or not _LANGUAGE_TOKEN_RE.match(value):
+        raise LemonadeCapabilityError(
+            "Lemonade returned a response with an unusable language value "
+            "(not a bounded language token)"
+        )
+    return normalize_language(value)
 
 
 def _noop_status(_message: str) -> None:
@@ -534,16 +569,25 @@ def _open_url(request: urllib.request.Request, timeout: float, *, bypass_proxies
     return _DEFAULT_OPENER.open(request, timeout=timeout)
 
 
-def _read_bounded(fp: Any, limit: int) -> bytes:
+def _read_bounded(fp: Any, limit: int, *, deadline: float | None = None) -> bytes:
     """Read at most ``limit + 1`` bytes from ``fp``, so overflow is detectable.
 
     A single ``read(n)`` is not a size bound: a stream may legitimately return a
     short read while more data remains, so the read loops until the cap is
     exceeded or the stream ends.
+
+    ``deadline`` is a monotonic end-to-end bound: when given, expiry raises
+    ``LemonadeInferenceTimeout`` even while the peer is still trickling bytes —
+    the socket timeout is an inactivity bound, not a promise that the total
+    request finishes on time.
     """
     pieces: list[bytes] = []
     remaining = limit + 1
     while remaining > 0:
+        if deadline is not None and time.monotonic() >= deadline:
+            raise LemonadeInferenceTimeout(
+                "Lemonade response did not finish within the configured timeout"
+            )
         piece = fp.read(min(65536, remaining))
         if not piece:
             break
@@ -552,7 +596,9 @@ def _read_bounded(fp: Any, limit: int) -> bytes:
     return b"".join(pieces)
 
 
-def _raise_for_http_error(exc: urllib.error.HTTPError, api_key: str) -> NoReturn:
+def _raise_for_http_error(
+    exc: urllib.error.HTTPError, api_key: str, *, deadline: float | None = None
+) -> NoReturn:
     """Map one HTTPError onto the error hierarchy. Never returns.
 
     Redirects are never followed (see `_NoRedirectHandler`), so a 3xx arrives
@@ -560,14 +606,16 @@ def _raise_for_http_error(exc: urllib.error.HTTPError, api_key: str) -> NoReturn
     server-chosen ``Location`` header is never echoed. Error bodies are read
     under the response cap and classified with ``api_key`` as a redaction
     secret, so a response that reflects the Authorization header cannot persist
-    the credential through the exception message.
+    the credential through the exception message. ``deadline`` bounds the error
+    body read like any other body read: a redirect or error page that never
+    finishes must trip the request's total deadline, not hang past it.
     """
     if _HTTP_MULTIPLE_CHOICES <= exc.code < _HTTP_BAD_REQUEST:
         raise LemonadeUnavailableError(
             f"Lemonade responded with a redirect (HTTP {exc.code}); tapeback "
             "never follows redirects — check the configured TAPEBACK_LEMONADE_URL."
         ) from exc
-    raw = _read_bounded(exc, _MAX_RESPONSE_BYTES)
+    raw = _read_bounded(exc, _MAX_RESPONSE_BYTES, deadline=deadline)
     if len(raw) > _MAX_RESPONSE_BYTES:
         # Classify by status alone rather than buffer a giant error body.
         payload = None
@@ -856,7 +904,14 @@ def _require_segments(
     return []
 
 
-def _convert_words(raw_words: Any, offset: float) -> list[Word]:
+def _convert_words(
+    raw_words: Any,
+    offset: float,
+    *,
+    segment_start: float,
+    segment_end: float,
+    chunk_end: float | None = None,
+) -> list[Word]:
     """Convert a response segment's word list, shifted into file-relative time.
 
     Word timestamps and probabilities are validated as strictly as segments: a
@@ -864,6 +919,13 @@ def _convert_words(raw_words: Any, offset: float) -> list[Word]:
     one the server sent as a string — is a schema failure and rejects the whole
     response as a LemonadeCapabilityError, never a ValueError escaping the
     hierarchy or a fabricated default silently recorded.
+
+    Words are also bounded the way segments are: each word must lie inside its
+    containing segment and inside the audio that was actually sent (``chunk_end``,
+    file-relative, when known), both modulo the same boundary slack the segment
+    check applies. An in-bounds segment must not smuggle words far past the
+    recording — diarization rebuilds segment boundaries from these words and the
+    resume cache persists them.
     """
     words: list[Word] = []
     if not isinstance(raw_words, list):
@@ -875,6 +937,15 @@ def _convert_words(raw_words: Any, offset: float) -> list[Word]:
         end = _usable_timestamp(raw.get("end"), "word end")
         if end < start:
             raise LemonadeCapabilityError("Lemonade returned a word whose end precedes its start")
+        if (
+            start < segment_start - _TIMESTAMP_SLACK_SECONDS
+            or end > segment_end + _TIMESTAMP_SLACK_SECONDS
+        ):
+            raise LemonadeCapabilityError("Lemonade returned a word outside its containing segment")
+        if chunk_end is not None and end > chunk_end + _TIMESTAMP_SLACK_SECONDS:
+            raise LemonadeCapabilityError(
+                "Lemonade returned a word ending past the audio it was sent"
+            )
         raw_probability = raw.get("probability")
         if raw_probability is None:
             probability = 0.0
@@ -925,7 +996,7 @@ class _MergeState:
         if self.pinned is None:
             detected = payload.get("language")
             if detected:
-                self.pinned = normalize_language(str(detected))
+                self.pinned = _remote_language(detected)
             raw_probability = payload.get("language_probability")
             if raw_probability is None:
                 # Some Lemonade versions report it under this name instead.
@@ -944,7 +1015,13 @@ class _MergeState:
             # a duplicate and is dropped. The first chunk keeps everything.
             if index > 0 and (start + end) / 2 < core_start:
                 continue
-            words = _convert_words(raw.get("words"), offset)
+            words = _convert_words(
+                raw.get("words"),
+                offset,
+                segment_start=start,
+                segment_end=end,
+                chunk_end=None if chunk_duration is None else offset + chunk_duration,
+            )
             self.segments.append(
                 Segment(
                     start=start,
@@ -1207,9 +1284,18 @@ class LemonadeBackend:
         inference-oriented bound, generous because long-chunk inference
         legitimately takes minutes. Diagnostics endpoints pass their own short
         timeout instead.
+
+        The timeout is enforced as a **monotonic end-to-end deadline**: a server
+        that tricks a byte just before each socket timeout must still complete
+        within the total budget, and a stall at any phase — connect, upload,
+        read — counts against the same clock. The socket timeout is still passed
+        to urllib as a fast inactivity bound, but ``_read_bounded`` also checks
+        the deadline before every read, so a trickling peer cannot extend the
+        request past the configured limit.
         """
         if timeout is None:
             timeout = self._settings.lemonade_timeout_seconds
+        deadline = time.monotonic() + timeout
         try:
             with _open_url(request, timeout, bypass_proxies=self._bypass_proxies) as response:
                 headers = getattr(response, "headers", None)
@@ -1225,7 +1311,7 @@ class LemonadeBackend:
                             f"over the {_MAX_RESPONSE_BYTES}-byte response cap; "
                             "refusing to read it."
                         )
-                raw = _read_bounded(response, _MAX_RESPONSE_BYTES)
+                raw = _read_bounded(response, _MAX_RESPONSE_BYTES, deadline=deadline)
             if len(raw) > _MAX_RESPONSE_BYTES:
                 raise LemonadeUnavailableError(
                     f"Lemonade response exceeded the {_MAX_RESPONSE_BYTES}-byte response "
@@ -1233,7 +1319,7 @@ class LemonadeBackend:
                 )
             return raw
         except urllib.error.HTTPError as exc:
-            _raise_for_http_error(exc, self._api_key)
+            _raise_for_http_error(exc, self._api_key, deadline=deadline)
         except TimeoutError as exc:
             # socket.timeout is TimeoutError on Python 3.10+: this is the
             # read/inference timeout. Never resubmitted to Lemonade — the server may

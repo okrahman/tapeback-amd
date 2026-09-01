@@ -41,7 +41,7 @@ def test_format_markdown_pipeline():
     assert "date: 2026-03-17" in result
     assert 'time: "14:30"' in result
     assert 'duration: "01:23:45"' in result
-    assert "language: en" in result
+    assert 'language: "en"' in result
     assert "[[attachments/audio/2026-03-17_14-30-00.wav]]" in result
     assert "  - meeting" in result
     assert "  - transcript" in result
