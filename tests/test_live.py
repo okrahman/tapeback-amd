@@ -540,13 +540,8 @@ def test_live_channel_error_rolls_back_both_cursors(tmp_path, tmp_vault, monkeyp
 # --- stop() lifecycle ---
 
 
-def test_live_lemonade_request_budget_is_capped(tmp_vault):
-    """A live Lemonade request can never have a worst case past the join budget.
-
-    The 600 s default inference timeout exists for long final files; a live
-    interval is one small pair transaction, so stop()'s join must be able to
-    outlast any request it waits behind.
-    """
+def test_live_lemonade_settings_pass_through_untouched(tmp_vault):
+    """Live work keeps the configured timeout; fallback can outlast one request."""
     settings = Settings(
         vault_path=tmp_vault,
         transcription_backend="lemonade",
@@ -556,11 +551,11 @@ def test_live_lemonade_request_budget_is_capped(tmp_vault):
         settings, "budget-session", tmp_vault / "mic.wav", tmp_vault / "monitor.wav"
     )
 
-    assert lt._settings.lemonade_timeout_seconds == live_mod._LIVE_REQUEST_BUDGET_SECONDS
+    assert lt._settings.lemonade_timeout_seconds == 600.0
 
 
 def test_live_faster_whisper_settings_pass_through_untouched(tmp_vault):
-    """The request-budget cap is a Lemonade-transport concern only."""
+    """Constructing live transcription does not rewrite unrelated backend settings."""
     settings = Settings(vault_path=tmp_vault, lemonade_timeout_seconds=600.0)
     lt = LiveTranscriber(
         settings, "passthrough-session", tmp_vault / "mic.wav", tmp_vault / "monitor.wav"
@@ -570,14 +565,7 @@ def test_live_faster_whisper_settings_pass_through_untouched(tmp_vault):
 
 
 def test_stop_does_not_return_while_the_worker_is_alive(tmp_path, tmp_vault, monkeypatch):
-    """stop() must establish its lifecycle boundary: raise rather than return
-    while the worker can still issue requests or write the live note.
-
-    Regression: stop() joined with a fixed 120 s timeout, never checked
-    is_alive(), and a Lemonade request stalled for 121-600 s survived the join —
-    stop() returned, the final pipeline started, and the worker later woke up to
-    upload another interval and rewrite the live note under it.
-    """
+    """A healthy long-running worker is awaited with progress, not timed out."""
     settings = Settings(vault_path=tmp_vault, live_interval=1, live_min_chunk=0.01)
 
     entered = threading.Event()
@@ -588,17 +576,35 @@ def test_stop_does_not_return_while_the_worker_is_alive(tmp_path, tmp_vault, mon
         release.wait(timeout=10)
 
     monkeypatch.setattr(LiveTranscriber, "_process_chunk", stalled_chunk)
-    monkeypatch.setattr(live_mod, "_STOP_JOIN_TIMEOUT_SECONDS", 0.2)
+    monkeypatch.setattr(live_mod, "_STOP_PROGRESS_INTERVAL_SECONDS", 0.05)
 
     lt = LiveTranscriber(settings, "stall-session", tmp_path / "mic.wav", tmp_path / "monitor.wav")
     lt.start()
     assert entered.wait(timeout=5)
 
-    with pytest.raises(RuntimeError, match="final processing aborted"):
-        lt.stop()
+    statuses: list[str] = []
+    errors: list[BaseException] = []
+
+    def stop_live() -> None:
+        try:
+            lt.stop(statuses.append)
+        except BaseException as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+
+    stop_thread = threading.Thread(target=stop_live)
+    stop_thread.start()
+    deadline = time.monotonic() + 2
+    while not statuses and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+    assert stop_thread.is_alive()
+    assert statuses
+    assert "Still waiting for live transcription" in statuses[-1]
 
     release.set()
-    lt._thread.join(timeout=5)
+    stop_thread.join(timeout=5)
+    assert not stop_thread.is_alive()
+    assert not errors
     assert not lt._thread.is_alive()
 
 

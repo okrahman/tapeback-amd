@@ -76,17 +76,19 @@ def stop_and_process(
 ) -> Path:
     """Stop recording and run the full dual-channel processing pipeline.
 
-    If a live_transcriber is active, stops it first to free GPU memory
-    before the full pipeline creates its own Whisper model.
+    Recording is finalized before live preview teardown, so a slow or failed
+    preview can never leave parecord running. If a live transcriber is active,
+    the pipeline then waits for its worker to exit and free GPU memory before
+    creating its own Whisper model.
 
     Returns path to the saved markdown file.
     """
-    if live_transcriber is not None:
-        on_status("Stopping live transcription...")
-        live_transcriber.stop()
-
     on_status("Stopping recording...")
     monitor_path, mic_path = recorder.stop()
+
+    if live_transcriber is not None:
+        on_status("Stopping live transcription...")
+        live_transcriber.stop(on_status)
 
     session_name = monitor_path.parent.name
 

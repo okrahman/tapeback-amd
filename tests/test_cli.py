@@ -211,6 +211,68 @@ def test_status_command_with_invalid_lemonade_url_reports_and_survives(runner, v
 # --- _stop_and_process (dual-channel pipeline) ---
 
 
+def test_stop_and_process_stops_recorder_before_live_teardown(tmp_vault, tmp_path):
+    """Recording is finalized even when live-preview teardown fails."""
+    settings = Settings(vault_path=tmp_vault)
+    monitor_wav = tmp_path / "session" / "monitor.wav"
+    mic_wav = tmp_path / "session" / "mic.wav"
+    order: list[str] = []
+    on_status = MagicMock()
+
+    recorder = MagicMock()
+    recorder.stop.side_effect = lambda: (
+        order.append("recorder-stopped") or monitor_wav,
+        mic_wav,
+    )
+    live_transcriber = MagicMock()
+
+    def fail_live_stop(callback):
+        order.append("live-stop-failed")
+        raise RuntimeError("preview teardown failed")
+
+    live_transcriber.stop.side_effect = fail_live_stop
+
+    with pytest.raises(RuntimeError, match="preview teardown failed"):
+        stop_and_process(
+            recorder,
+            settings,
+            live_transcriber=live_transcriber,
+            on_status=on_status,
+        )
+
+    assert order == ["recorder-stopped", "live-stop-failed"]
+    live_transcriber.stop.assert_called_once_with(on_status)
+
+
+def test_stop_and_process_enters_pipeline_only_after_live_exit(tmp_vault, tmp_path):
+    """Final processing starts only after recording and the live worker stop."""
+    settings = Settings(vault_path=tmp_vault)
+    session_dir = tmp_path / "session"
+    monitor_wav = session_dir / "monitor.wav"
+    mic_wav = session_dir / "mic.wav"
+    order: list[str] = []
+
+    recorder = MagicMock()
+    recorder.stop.side_effect = lambda: (
+        order.append("recorder-stopped") or monitor_wav,
+        mic_wav,
+    )
+    live_transcriber = MagicMock()
+    live_transcriber.stop.side_effect = lambda _callback: order.append("live-exited")
+
+    def pipeline_started(*_args, **_kwargs):
+        order.append("pipeline-started")
+        raise RuntimeError("stop after ordering assertion")
+
+    with (
+        patch("tapeback.pipeline.merge_channels", side_effect=pipeline_started),
+        pytest.raises(RuntimeError, match="stop after ordering assertion"),
+    ):
+        stop_and_process(recorder, settings, live_transcriber=live_transcriber)
+
+    assert order == ["recorder-stopped", "live-exited", "pipeline-started"]
+
+
 @pytest.mark.skipif(not shutil.which("ffmpeg"), reason="ffmpeg required")
 def test_stop_and_process_pipeline(tmp_vault, session_wavs):
     """_stop_and_process: full dual-channel pipeline with mocked ML models."""

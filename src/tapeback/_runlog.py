@@ -78,9 +78,9 @@ def redact_text(text: str, redactions: tuple[str, ...] = ()) -> str:
     (e.g., prefix or suffix matches) are replaced completely rather than leaving
     reconstructable fragments.
     """
-    out = _CONTROL_CHARS_RE.sub("", text)
-    unique_secrets = sorted({secret for secret in redactions if secret}, key=len, reverse=True)
-    for secret in unique_secrets:
+    out: str = str(_CONTROL_CHARS_RE.sub("", text))
+    unique_secrets: set[str] = {secret for secret in redactions if secret}
+    for secret in sorted(unique_secrets, key=lambda value: len(value), reverse=True):
         out = out.replace(secret, _REDACTED_LABEL)
     return out
 

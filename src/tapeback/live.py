@@ -5,7 +5,9 @@ from __future__ import annotations
 import struct
 import sys
 import threading
+import time
 import wave
+from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -25,17 +27,9 @@ if TYPE_CHECKING:
 # Tolerance for deduplication: segments within this many seconds are considered duplicates
 DEDUP_TOLERANCE_SEC = 0.5
 
-# Worst-case wall clock of one live Lemonade request. Live intervals are
-# live_min_chunk-sized, so inference on them finishes in seconds; the generous
-# default inference timeout exists for long final files, not for intervals. A
-# live request must never be able to outlast stop()'s join budget below.
-_LIVE_REQUEST_BUDGET_SECONDS = 45.0
-
-# How long stop() waits for the worker thread. One interval is one backend
-# transaction of at most two Lemonade requests (mic + monitor) plus file IO, so
-# 2x the request budget + margin is provably sufficient: if the worker is still
-# alive after this wait, something outside the request path is wedged.
-_STOP_JOIN_TIMEOUT_SECONDS = 2 * _LIVE_REQUEST_BUDGET_SECONDS + 30.0
+# Poll rather than joining indefinitely so a legitimate long model load,
+# download, or local fallback remains visible to the caller.
+_STOP_PROGRESS_INTERVAL_SECONDS = 10.0
 
 # Bytes per sample for s16le mono
 BYTES_PER_SAMPLE = 2
@@ -155,19 +149,6 @@ class LiveTranscriber:
         mic_path: Path,
         monitor_path: Path,
     ) -> None:
-        if settings.transcription_backend == "lemonade":
-            # Bound live Lemonade requests by the shutdown budget: stop() must
-            # never return while a live request can still be in flight (see
-            # stop()). The timeout is deliberately excluded from the backend's
-            # cache fingerprint, so this copy changes no cached identity — and
-            # live mode disables resume IO anyway.
-            settings = settings.model_copy(
-                update={
-                    "lemonade_timeout_seconds": min(
-                        settings.lemonade_timeout_seconds, _LIVE_REQUEST_BUDGET_SECONDS
-                    )
-                }
-            )
         self._settings = settings
         self._session_name = session_name
         self._mic_path = mic_path
@@ -204,25 +185,22 @@ class LiveTranscriber:
         """Start the background transcription thread."""
         self._thread.start()
 
-    def stop(self) -> None:
+    def stop(self, on_status: Callable[[str], None] | None = None) -> None:
         """Stop the background thread, process final chunk, free GPU memory.
 
         Establishes a hard lifecycle boundary: when this returns, the worker is
         verifiably dead — it can issue no further request and write no live note
-        afterwards. Live Lemonade requests are bounded by
-        _LIVE_REQUEST_BUDGET_SECONDS (see ``__init__``), so a stalled request
-        cannot outrun the join; if the worker is still alive after the wait,
-        raising is the only honest outcome — proceeding into the final pipeline
-        over a live worker would race it for the session directory and the live
-        note.
+        afterwards. Model construction, downloads, isolated-worker startup, and
+        faster-whisper fallback are not bounded by the Lemonade HTTP timeout, so
+        legitimate work is awaited to completion and periodically reported.
         """
         self._stop_event.set()
-        self._thread.join(timeout=_STOP_JOIN_TIMEOUT_SECONDS)
-        if self._thread.is_alive():
-            raise RuntimeError(
-                "Live transcription worker still running after "
-                f"{_STOP_JOIN_TIMEOUT_SECONDS:.0f}s — final processing aborted."
-            )
+        started_waiting = time.monotonic()
+        while self._thread.is_alive():
+            self._thread.join(timeout=_STOP_PROGRESS_INTERVAL_SECONDS)
+            if self._thread.is_alive() and on_status is not None:
+                elapsed = time.monotonic() - started_waiting
+                on_status(f"Still waiting for live transcription ({elapsed:.0f}s elapsed)...")
 
         # Free GPU memory so the full pipeline can use it
         if self._transcriber is not None:
