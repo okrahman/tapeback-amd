@@ -1,3 +1,4 @@
+import json
 import shutil
 import subprocess
 import time
@@ -8,7 +9,7 @@ import click
 
 from tapeback import const
 from tapeback.recorder import Recorder, detect_devices
-from tapeback.settings import get_settings
+from tapeback.settings import Settings, get_settings
 
 
 def _echo_status(msg: str) -> None:
@@ -243,7 +244,9 @@ def status() -> None:
     """Show current recording status and settings.
 
     Displays whether a recording is in progress, vault path,
-    Whisper model, device, and available audio sources.
+    transcription backend, model, device, and available audio sources.
+    With the Lemonade backend, optionally runs authenticated health and
+    system diagnostics — status only, never a transcription preflight.
     """
     settings = get_settings()
 
@@ -257,8 +260,14 @@ def status() -> None:
         click.echo("Not recording.")
 
     click.echo(f"\nVault: {settings.vault_path}")
-    click.echo(f"Whisper model: {settings.whisper_model}")
-    click.echo(f"Device: {settings.device}")
+    click.echo(f"Backend: {settings.transcription_backend}")
+    if settings.transcription_backend == "lemonade":
+        click.echo(f"Lemonade endpoint: {settings.lemonade_url}")
+        click.echo(f"Lemonade model: {settings.lemonade_model}")
+        _lemonade_diagnostics(settings)
+    else:
+        click.echo(f"Whisper model: {settings.whisper_model}")
+        click.echo(f"Device: {settings.device}")
     click.echo(f"Language: {settings.language}")
 
     if shutil.which("pactl"):
@@ -271,6 +280,28 @@ def status() -> None:
         )
         if result.returncode == 0:
             click.echo(result.stdout)
+
+
+def _lemonade_diagnostics(settings: Settings) -> None:
+    """Best-effort health/system probe for the status command.
+
+    Diagnostics are optional: any failure is reported as a line, never raised, and
+    transcription never depends on these endpoints. Runs here — and only here — so a
+    status check may contact the server, but a transcription run may not preflight.
+    """
+    from tapeback._lemonade import (
+        LemonadeBackend,
+        LemonadeError,
+    )
+
+    try:
+        backend = LemonadeBackend(settings)
+        click.echo(f"Health: {json.dumps(backend.health(), default=str)}")
+        click.echo(f"System info: {json.dumps(backend.system_info(), default=str)}")
+    except LemonadeError as exc:
+        click.echo(f"Lemonade diagnostics unavailable: {exc}", err=True)
+    except OSError as exc:
+        click.echo(f"Lemonade diagnostics unavailable: {exc}", err=True)
 
 
 @cli.command()

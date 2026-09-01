@@ -43,7 +43,7 @@ def test_process_mono_pipeline(runner, tmp_path, monkeypatch, vault_env):
         ]
     )
 
-    with patch("tapeback.transcriber.WhisperModel", return_value=mock_model):
+    with patch("tapeback._fw_backend.WhisperModel", return_value=mock_model):
         result = runner.invoke(cli, ["process", str(audio), "--no-diarize"])
 
     assert result.exit_code == 0, result.output + str(result.exception or "")
@@ -64,7 +64,7 @@ def test_process_mono_pipeline(runner, tmp_path, monkeypatch, vault_env):
     create_silent_wav(audio2, duration=2.0)
     mock_model2 = mock_whisper_transcribe([(0.0, 5.0, "Speech.")])
 
-    with patch("tapeback.transcriber.WhisperModel", return_value=mock_model2):
+    with patch("tapeback._fw_backend.WhisperModel", return_value=mock_model2):
         result2 = runner.invoke(
             cli, ["process", str(audio2), "--name", "my-meeting", "--no-diarize"]
         )
@@ -95,7 +95,7 @@ def test_process_with_diarization(runner, tmp_path, monkeypatch, vault_env):
     )
 
     with (
-        patch("tapeback.transcriber.WhisperModel", return_value=mock_model),
+        patch("tapeback._fw_backend.WhisperModel", return_value=mock_model),
         patch("pyannote.audio.Pipeline") as mock_pipeline_cls,
     ):
         mock_pipeline = MagicMock()
@@ -127,7 +127,7 @@ def test_process_stereo_dual_channel(runner, tmp_path, monkeypatch, vault_env):
         ]
     )
 
-    with patch("tapeback.transcriber.WhisperModel", return_value=mock_model):
+    with patch("tapeback._fw_backend.WhisperModel", return_value=mock_model):
         result = runner.invoke(cli, ["process", str(audio), "--no-diarize"])
 
     assert result.exit_code == 0, result.output + str(result.exception or "")
@@ -186,7 +186,7 @@ def test_stop_and_process_pipeline(tmp_vault, session_wavs):
     annotation = mock_pyannote_annotation([(0.0, 2.0, "SPEAKER_00")])
 
     with (
-        patch("tapeback.transcriber.WhisperModel", return_value=mock_model),
+        patch("tapeback._fw_backend.WhisperModel", return_value=mock_model),
         patch("pyannote.audio.Pipeline") as mock_pipeline_cls,
     ):
         mock_pipeline = MagicMock()
@@ -214,7 +214,7 @@ def test_stop_and_process_no_diarize(tmp_vault, session_wavs):
     mock_model = mock_whisper_transcribe([(0.0, 5.0, "No diarize.")])
 
     with (
-        patch("tapeback.transcriber.WhisperModel", return_value=mock_model),
+        patch("tapeback._fw_backend.WhisperModel", return_value=mock_model),
         patch("pyannote.audio.Pipeline") as mock_pipeline_cls,
     ):
         stop_and_process(mock_recorder, settings, diarize=False)
@@ -239,7 +239,7 @@ def test_process_stereo_file_function(tmp_path, tmp_vault):
 
     mock_model = mock_whisper_transcribe([(0.0, 1.0, "Speech.")])
 
-    with patch("tapeback.transcriber.WhisperModel", return_value=mock_model):
+    with patch("tapeback._fw_backend.WhisperModel", return_value=mock_model):
         segments, _info, _raw = process_stereo_file(stereo, output_dir, settings, diarize=False)
 
     assert len(segments) > 0
@@ -316,7 +316,7 @@ def test_process_with_summarization(runner, tmp_path, monkeypatch, vault_env):
     mock_model = mock_whisper_transcribe([(0.0, 5.0, "Hello from the meeting.")])
 
     with (
-        patch("tapeback.transcriber.WhisperModel", return_value=mock_model),
+        patch("tapeback._fw_backend.WhisperModel", return_value=mock_model),
         patch("tapeback.summarizer._call_llm", return_value=VALID_LLM_RESPONSE_MINIMAL),
     ):
         result = runner.invoke(cli, ["process", str(audio), "--no-diarize"])
@@ -338,7 +338,7 @@ def test_process_no_summarize_flag(runner, tmp_path, monkeypatch, vault_env):
     mock_model = mock_whisper_transcribe([(0.0, 5.0, "Speech.")])
 
     with (
-        patch("tapeback.transcriber.WhisperModel", return_value=mock_model),
+        patch("tapeback._fw_backend.WhisperModel", return_value=mock_model),
         patch("tapeback.summarizer._call_llm") as mock_llm,
     ):
         result = runner.invoke(cli, ["process", str(audio), "--no-diarize", "--no-summarize"])
@@ -360,7 +360,7 @@ def test_stop_and_process_summarization_failure(tmp_vault, session_wavs):
     mock_model = mock_whisper_transcribe([(0.0, 5.0, "Important content.")])
 
     with (
-        patch("tapeback.transcriber.WhisperModel", return_value=mock_model),
+        patch("tapeback._fw_backend.WhisperModel", return_value=mock_model),
         patch("pyannote.audio.Pipeline"),
         patch("tapeback.summarizer._call_llm", side_effect=RuntimeError("API error")),
     ):

@@ -5,7 +5,20 @@ All notable changes to this project will be documented in this file.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.9.8] — 2026-08-05
+## [Unreleased]
+
+### Added
+- **Lemonade transcription backend** (`TAPEBACK_TRANSCRIPTION_BACKEND=lemonade`): transcribe through a [Lemonade Server](https://github.com/lemonade-sdk/lemonade) you run yourself — point tapeback at the URL, optionally set a model and bearer token, and keep everything else (server lifecycle, hardware, accelerator) entirely on the server side. Tapeback sends multipart `POST /v1/audio/transcriptions` requests (`response_format=verbose_json`), chunks long WAVs with conservative internal duration/byte bounds and a small contextual overlap, deduplicates chunks against a versioned core-interval policy, detects the language from the first chunk that contains speech (normalizing Whisper names to ISO-639-1) and pins it for later chunks, and never encodes the server's accelerator choice in configuration, logs, or cache keys. The API key (`TAPEBACK_LEMONADE_API_KEY`) goes only into the `Authorization` header — never into logs, error messages, or resume-cache fingerprints.
+- **Deliberate fallback semantics.** `Transcriber` remains the shared façade and now dispatches to interchangeable backends. Only `LemonadeFallbackError` triggers a faster-whisper fallback for the complete input, and only the accepted faster-whisper result is cached — under the faster-whisper fingerprint, never a mixed one. Server unreachable, retryable server failures, rate limiting, missing/unloadable/rejected models, missing transcription endpoints, and read/inference timeouts all fall back (timeouts are never resubmitted to Lemonade). Authentication failures (401/403), locally invalid configuration, and Ctrl+C never fall back: completed chunks are returned as `partial=true` output, and partial output is never cached.
+- **Transactional stereo caching.** Both channels are one backend transaction: newly generated channel results are staged in memory and committed only when the atomic stereo result completes. If either channel hits an eligible fallback error, all staged Lemonade results are discarded and both channels resolve through faster-whisper — one Lemonade channel and one faster-whisper channel in a single transcript is unrepresentable. Existing complete cache entries are untouched.
+- `tapeback status` shows the configured backend and, for Lemonade, the endpoint and model, plus optional authenticated `/v1/health` and `/v1/system-info` diagnostics that run only for the status command — transcription never preflights the server.
+- An opt-in smoke test against a running Lemonade Server (`TAPEBACK_LEMONADE_SMOKE=1 pytest tests/test_lemonade_integration.py`) that asserts nothing about the server's OS, accelerator, or inference internals.
+
+### Changed
+- faster-whisper logic moved to `tapeback._fw_backend` and Lemonade to `tapeback._lemonade` behind a minimal `TranscriptionBackend` protocol (`tapeback._backends`); choosing Lemonade no longer pays the ~10s faster-whisper import. All previous `Transcriber` settings, defaults, and environment variables are unchanged.
+- Resume-cache keys are now derived from `backend.cache_fingerprint()` instead of a global faster-whisper-centric settings list. Faster-whisper fingerprints cover its model/device/compute/decoding settings; Lemonade fingerprints cover server URL, model, language, chunk duration, overlap, and dedup policy version — and exclude the API key, timeout, and diagnostics. One-time consequence: pre-existing resume entries are recomputed on the next run.
+- GPU telemetry and transcription isolation are disabled for the Lemonade backend (there is no local inference to sample or isolate); `TAPEBACK_DEVICE` still governs faster-whisper and diarization.
+
 
 ### Added
 - Optional PII masking for the LLM request (`TAPEBACK_MASK_PII`, off by default). Summarization is the only thing tapeback sends off the machine; with masking on, emails and phone numbers are replaced by `[EMAIL_1]` / `[PHONE_1]` placeholders before the transcript is sent — on the retry and on every fallback provider too — and the real values are restored in the summary written to the vault. The transcript on disk is never masked.

@@ -49,6 +49,10 @@ def job_settings(settings: Settings) -> dict[str, Any]:
     # Load-bearing: the worker builds a Transcriber of its own, and inheriting this
     # would have it spawn another worker, and that one another, without end.
     payload["isolate_transcription"] = False
+    # The worker exists only for faster-whisper's CUDA OOM problem; the parent's
+    # backend decision is the façade's, made before any worker spawns. Pinning it
+    # keeps the child from re-reading the ambient environment.
+    payload["transcription_backend"] = "faster-whisper"
     # The parent stores the result; a child writing it too would be a second, racier
     # writer of the same file for no benefit.
     payload["resume_cache"] = False

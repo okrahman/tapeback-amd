@@ -142,6 +142,33 @@ class Settings(BaseSettings):
     # a machine that cools adequately.
     stage_pause_seconds: float = Field(default=0.0, ge=0.0)
 
+    # Transcription backend. "faster-whisper" is the built-in local model; "lemonade"
+    # sends WAV files to a Lemonade Server endpoint (whose lifecycle and hardware
+    # choice are externally managed — tapeback never selects or records the
+    # accelerator). On an eligible Lemonade failure the façade falls back to
+    # faster-whisper for that run; see _lemonade.py for the error hierarchy.
+    transcription_backend: Literal["faster-whisper", "lemonade"] = "faster-whisper"
+    # Lemonade Server base URL. Must be a syntactically valid http(s) URL; anything
+    # else is refused before a request is ever built (no fallback).
+    lemonade_url: str = "http://127.0.0.1:13305"
+    # Model identifier as Lemonade Server knows it (e.g. "Whisper-Large-v3-Turbo").
+    lemonade_model: str = "Whisper-Large-v3-Turbo"
+    # Optional bearer token for a Lemonade Server that requires auth. SecretStr keeps
+    # it out of repr/logs; it is sent only in the Authorization header and never
+    # appears in cache fingerprints or error messages.
+    lemonade_api_key: SecretStr = SecretStr("")
+    # Per-request read timeout in seconds. Inference on a long chunk can legitimately
+    # take minutes, so this is generous by default; hitting it aborts the run and
+    # falls back to faster-whisper rather than resubmitting to Lemonade.
+    lemonade_timeout_seconds: float = Field(default=600.0, gt=0.0)
+    # Conservative internal chunk duration for long WAVs. Chosen to keep one request's
+    # audio bounded in memory and progress reportable — these are tapeback's own
+    # transport bounds, not statements about Lemonade Server limits.
+    lemonade_chunk_seconds: float = Field(default=300.0, gt=0.0)
+    # Seconds of contextual overlap prepended to every chunk after the first, so a
+    # segment cut by a chunk boundary is still heard whole by one of the requests.
+    lemonade_overlap_seconds: float = Field(default=2.0, ge=0.0)
+
     # Audio
     monitor_source: str = "auto"
     mic_source: str = "auto"

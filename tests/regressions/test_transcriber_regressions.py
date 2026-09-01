@@ -21,7 +21,7 @@ def test_cuda_fallback_to_cpu(tmp_vault):
             raise RuntimeError("CUDA not available")
         return MagicMock()
 
-    with patch("tapeback.transcriber.WhisperModel", side_effect=mock_init):
+    with patch("tapeback._fw_backend.WhisperModel", side_effect=mock_init):
         Transcriber(s)
 
     assert call_args == ["cuda", "cpu"]
@@ -51,7 +51,7 @@ def test_cuda_inference_fallback_to_cpu(tmp_vault, capsys):
         raise RuntimeError("Library libcublas.so.12 is not found")
         yield  # make it a generator
 
-    with patch("tapeback.transcriber.WhisperModel") as mock_model_cls:
+    with patch("tapeback._fw_backend.WhisperModel") as mock_model_cls:
         cuda_model = MagicMock()
         cpu_model = MagicMock()
         mock_model_cls.side_effect = [cuda_model, cpu_model]
@@ -99,7 +99,7 @@ def test_cuda_fallback_when_transcribe_call_raises(tmp_vault, capsys):
     mock_info.language_probability = 0.99
     mock_info.duration = 5.0
 
-    with patch("tapeback.transcriber.WhisperModel") as mock_model_cls:
+    with patch("tapeback._fw_backend.WhisperModel") as mock_model_cls:
         cuda_model = MagicMock()
         cpu_model = MagicMock()
         mock_model_cls.side_effect = [cuda_model, cpu_model]
@@ -147,7 +147,7 @@ def test_cuda_inference_fallback_preserves_auto_language(tmp_vault):
         raise RuntimeError("CUDA OOM")
         yield  # make it a generator
 
-    with patch("tapeback.transcriber.WhisperModel") as mock_model_cls:
+    with patch("tapeback._fw_backend.WhisperModel") as mock_model_cls:
         cuda_model = MagicMock()
         cpu_model = MagicMock()
         mock_model_cls.side_effect = [cuda_model, cpu_model]
@@ -176,7 +176,7 @@ def test_empty_transcription(settings, capsys):
     mock_info.language_probability = 0.99
     mock_info.duration = 10.0
 
-    with patch("tapeback.transcriber.WhisperModel") as mock_model_cls:
+    with patch("tapeback._fw_backend.WhisperModel") as mock_model_cls:
         instance = mock_model_cls.return_value
         instance.transcribe.return_value = (iter([]), mock_info)
 

@@ -11,8 +11,10 @@ bearing here — it is half of why hallucinations on silence went away — so tr
 a faster resume is a bad deal. That leaves the honest limitation: an interrupt during the
 first channel has nothing to reuse, while one during the second saves the first.
 
-A cached entry is only valid for the exact audio and the exact settings that produced it,
-so the key covers both. Anything that changes what Whisper outputs invalidates it.
+A cached entry is only valid for the exact audio and the exact backend identity that
+produced it, so the key covers both. The backend identity comes from
+``backend.cache_fingerprint()`` — the caller, not this module, decides what makes
+output change, because that answer is per backend (see _backends.py).
 """
 
 from __future__ import annotations
@@ -27,26 +29,6 @@ from typing import Any
 from tapeback.models import Segment, Word
 from tapeback.settings import Settings
 
-# Settings that change what Whisper produces. A cached channel is only reusable when
-# every one of these matches, so adding a knob that affects output means adding it here.
-OUTPUT_AFFECTING_SETTINGS = (
-    "whisper_model",
-    "device",
-    "compute_type",
-    "language",
-    "beam_size",
-    "temperature",
-    "batch_size",
-    "hotwords",
-    "vad_filter",
-    "chunk_length",
-    "condition_on_previous_text",
-    "no_speech_threshold",
-    "language_detection_segments",
-    "multilingual",
-    "hallucination_silence_threshold",
-)
-
 # Keep the directory bounded; entries are cheap but not free.
 MAX_RESUME_ENTRIES = 50
 
@@ -60,7 +42,7 @@ def default_resume_dir() -> Path:
 
 @dataclass(frozen=True)
 class ResumeKey:
-    """Identifies one (audio, settings, channel) combination."""
+    """Identifies one (audio, backend fingerprint, channel) combination."""
 
     digest: str
 
@@ -69,19 +51,55 @@ class ResumeKey:
         return f"{self.digest}.json"
 
 
-def resume_key(audio_path: Path, settings: Settings, stage: str) -> ResumeKey | None:
+def resume_key(audio_path: Path, fingerprint: str, stage: str) -> ResumeKey | None:
     """Fingerprint the inputs. None when the audio cannot be described.
 
     Identity is path + size + mtime rather than a content hash: hashing a 400 MB WAV
     on every run would cost more than it saves, and these files are written once.
+    ``fingerprint`` is the caller's backend identity — every setting that would make
+    the backend produce different output, already collapsed to one string.
     """
     try:
         stat = audio_path.stat()
     except OSError:
         return None
-    parts = [str(audio_path.resolve()), str(stat.st_size), str(stat.st_mtime_ns), stage]
-    parts += [f"{name}={getattr(settings, name)!r}" for name in OUTPUT_AFFECTING_SETTINGS]
+    parts = [
+        str(audio_path.resolve()),
+        str(stat.st_size),
+        str(stat.st_mtime_ns),
+        stage,
+        fingerprint,
+    ]
     return ResumeKey(hashlib.sha256("\x00".join(parts).encode()).hexdigest()[:32])
+
+
+def settings_fingerprint(settings: Settings) -> str:
+    """Faster-whisper's output-affecting identity, for `FasterWhisperBackend`.
+
+    Kept beside the resume store so its meaning stays obvious: this is exactly the
+    set of settings that change what faster-whisper produces, and a cached channel
+    is only reusable when every one of them matches. Adding a knob that affects
+    faster-whisper output means adding it here.
+    """
+    output_affecting_settings = (
+        "whisper_model",
+        "device",
+        "compute_type",
+        "language",
+        "beam_size",
+        "temperature",
+        "batch_size",
+        "hotwords",
+        "vad_filter",
+        "chunk_length",
+        "condition_on_previous_text",
+        "no_speech_threshold",
+        "language_detection_segments",
+        "multilingual",
+        "hallucination_silence_threshold",
+    )
+    parts = [f"{name}={getattr(settings, name)!r}" for name in output_affecting_settings]
+    return hashlib.sha256("\x00".join(parts).encode()).hexdigest()[:32]
 
 
 def _to_payload(segments: list[Segment], info: dict[str, Any]) -> dict[str, Any]:

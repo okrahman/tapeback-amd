@@ -14,6 +14,7 @@ Works with any video call platform: Google Meet, Zoom, Teams, Telegram, Discord,
 - **Live transcription** (opt-in): read the transcript while the meeting is still going — Whisper transcribes in the background every 60 seconds (set `TAPEBACK_LIVE=true`)
 - **Platform-agnostic**: captures OS-level audio, works with any app
 - **Local transcription**: faster-whisper on CPU or CUDA GPU
+- **Lemonade backend** (opt-in): transcribe through a [Lemonade Server](https://github.com/lemonade-sdk/lemonade) you run yourself — with automatic fallback to faster-whisper (`TAPEBACK_TRANSCRIPTION_BACKEND=lemonade`)
 - **Speaker diarization**: pyannote identifies who said what
 - **Stereo channel separation**: your mic (left) vs. others (right) for accurate "You" attribution
 - **Obsidian-native output**: Markdown with YAML frontmatter, wikilinks to audio files
@@ -168,6 +169,55 @@ Open the **Extensions** app, enable **Ubuntu AppIndicators** (or
 `tapeback tray` prints this hint to stderr on startup if it detects an
 affected session. See [issue #3](https://github.com/yastcher/tapeback/issues/3)
 for background.
+
+## Lemonade Server backend
+
+By default tapeback transcribes locally with faster-whisper. You can instead send
+recordings to a [Lemonade Server](https://github.com/lemonade-sdk/lemonade) instance
+you start and manage yourself:
+
+```bash
+export TAPEBACK_TRANSCRIPTION_BACKEND=lemonade
+# optional — defaults shown:
+export TAPEBACK_LEMONADE_URL=http://127.0.0.1:13305
+export TAPEBACK_LEMONADE_MODEL=Whisper-Large-v3-Turbo
+```
+
+Tapeback owns nothing about the server: you choose where it runs, on what hardware,
+and how it is served. None of that is tapeback configuration, and `tapeback status`
+will never name it — only the endpoint and model you configured.
+
+What the backend does with your audio:
+
+- Sends each channel as multipart `POST /v1/audio/transcriptions` requests asking for
+  `verbose_json`, with an explicit language once one is known. `Authorization: Bearer`
+  is sent only if you set `TAPEBACK_LEMONADE_API_KEY`, and the key is never written to
+  logs, cache keys, or error messages.
+- Splits long WAVs into bounded chunks (tapeback's own conservative transport bounds —
+  not a statement about the server), with a small contextual overlap between chunks
+  and versioned deduplication, so a recording of any length works and progress is
+  visible.
+- Detects the language from the first chunk that contains speech, normalizes it, and
+  pins it for the remaining chunks.
+- Reuses the resume cache under its own fingerprint, so a Lemonade result is never
+  confused with a faster-whisper one.
+
+Fallback, and what never falls back: when the server is unreachable, the model is
+missing or unloadable, the endpoint cannot serve timestamped segments (including
+text-only FLM-style backends — tapeback requires segment timestamps and rejects
+compact text output in full), or a request times out, the run switches to
+faster-whisper for that input and caches only the accepted result. Authentication
+rejections (401/403) and locally invalid configuration (bad URL, malformed key)
+do **not** fall back — retrying with another backend cannot fix them, so they fail
+loudly instead.
+
+Decoder-side knobs (`TAPEBACK_HOTWORDS`, beam size, temperature ladder, VAD) are
+faster-whisper-specific; the Lemonade backend ignores them rather than guessing at
+equivalents. `TAPEBACK_DEVICE` still applies to faster-whisper and diarization.
+
+`tapeback status` shows the configured backend, endpoint and model, and — for the
+status command only — tries the optional `/v1/health` and `/v1/system-info`
+diagnostics. Transcription itself never preflights the server.
 
 ## Speaker diarization
 
@@ -358,6 +408,13 @@ All settings via environment variables (prefix `TAPEBACK_`) or
 
 | Variable | Default | Description |
 |---|---|---|
+| `TAPEBACK_TRANSCRIPTION_BACKEND` | `faster-whisper` | `faster-whisper` (built-in local model) or `lemonade` (send WAVs to a [Lemonade Server](#lemonade-server-backend) you run yourself, with automatic fallback to faster-whisper on eligible failures) |
+| `TAPEBACK_LEMONADE_URL` | `http://127.0.0.1:13305` | Lemonade Server base URL (Lemonade backend only) |
+| `TAPEBACK_LEMONADE_MODEL` | `Whisper-Large-v3-Turbo` | Model identifier as the server knows it (Lemonade backend only) |
+| `TAPEBACK_LEMONADE_API_KEY` | *(off)* | Optional bearer token; sent only in the `Authorization` header, never logged or cached (Lemonade backend only) |
+| `TAPEBACK_LEMONADE_TIMEOUT_SECONDS` | `600` | Per-request read timeout. Hitting it falls back to faster-whisper rather than resubmitting (Lemonade backend only) |
+| `TAPEBACK_LEMONADE_CHUNK_SECONDS` | `300` | Tapeback's own conservative chunk duration for long WAVs — bounded memory and reportable progress, not a server limit. Changing it (or the overlap) invalidates Lemonade resume-cache entries (Lemonade backend only) |
+| `TAPEBACK_LEMONADE_OVERLAP_SECONDS` | `2.0` | Contextual overlap prepended to each chunk after the first, deduplicated against the previous chunk's core interval (Lemonade backend only) |
 | `TAPEBACK_WHISPER_MODEL` | `large-v3-turbo` | Whisper model (`tiny`, `base`, `small`, `medium`, `large-v3-turbo`) |
 | `TAPEBACK_LANGUAGE` | `auto` | Language code (`auto` for auto-detection, or `en`, `ru`, `fr`, etc.) |
 | `TAPEBACK_DEVICE` | `cuda` | `cuda` or `cpu` |
@@ -570,6 +627,33 @@ Fixes, in order of reliability:
 - **Probe more speech** before deciding: `TAPEBACK_LANGUAGE_DETECTION_SEGMENTS=4`.
 - **Mixed-language meetings** (real code-switching): `TAPEBACK_MULTILINGUAL=true`.
 - **Suppress silence hallucinations**: `TAPEBACK_HALLUCINATION_SILENCE_THRESHOLD=2.0`.
+
+### Lemonade: the run fell back to faster-whisper
+
+With `TAPEBACK_TRANSCRIPTION_BACKEND=lemonade`, an eligible failure switches that run
+to faster-whisper ("Lemonade transcription failed (...) — falling back to
+faster-whisper" in the status output) and the transcript is still produced. What the
+message means, by cause:
+
+- **Connection refused / timed out** — the server is not running or not reachable at
+  `TAPEBACK_LEMONADE_URL`. Start it, check the URL, and re-run.
+- **The model is missing or unloadable** — the server does not have
+  `TAPEBACK_LEMONADE_MODEL` loaded. Check `tapeback status` (it queries
+  `/v1/system-info`) or the server's own model list.
+- **"text without timestamped segments"** — the endpoint answered with prose only.
+  Tapeback needs segment timestamps for speaker labelling and timing, so compact,
+  text-only responses (FLM-style backends included) are rejected in full and the run
+  falls back. Point `TAPEBACK_LEMONADE_MODEL` at a Whisper model on the server.
+- **Inference timeout** — a request outlived `TAPEBACK_LEMONADE_TIMEOUT_SECONDS`. The
+  chunk is *not* resubmitted (the server may still be working on it); the run falls
+  back immediately. Raise the timeout only if the server is legitimately slow.
+
+Falling back is per-run and results are cached under the backend that produced them,
+so a Lemonade result is never reused as a faster-whisper one or the reverse.
+Authentication rejections (401/403) and locally invalid configuration (malformed
+`TAPEBACK_LEMONADE_URL` or `TAPEBACK_LEMONADE_API_KEY`) do **not** fall back — they
+fail the run loudly, because retrying with another backend cannot fix a credential or
+a typo.
 
 ## Uninstall
 

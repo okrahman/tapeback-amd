@@ -24,8 +24,8 @@ def _segment(start: float, end: float, text: str):
 
 @pytest.fixture
 def gpu_ready(monkeypatch):
-    monkeypatch.setattr("tapeback.transcriber.wait_for_clamp_release", lambda *_a, **_k: True)
-    monkeypatch.setattr("tapeback.transcriber.get_free_vram_mib", lambda: 4096)
+    monkeypatch.setattr("tapeback._fw_backend.wait_for_clamp_release", lambda *_a, **_k: True)
+    monkeypatch.setattr("tapeback._fw_backend.get_free_vram_mib", lambda: 4096)
 
 
 def _interrupting_segments(count_before_interrupt: int):
@@ -48,7 +48,7 @@ def test_interrupt_keeps_the_segments_already_decoded(settings, gpu_ready):
     """
     s = settings.model_copy(update={"device": "cuda"})
 
-    with patch("tapeback.transcriber.WhisperModel") as mock_model_cls:
+    with patch("tapeback._fw_backend.WhisperModel") as mock_model_cls:
         instance = mock_model_cls.return_value
         instance.transcribe.return_value = (_interrupting_segments(3), _info())
 
@@ -62,7 +62,7 @@ def test_interrupt_keeps_the_segments_already_decoded(settings, gpu_ready):
 def test_uninterrupted_run_is_not_marked_partial(settings, gpu_ready):
     s = settings.model_copy(update={"device": "cuda"})
 
-    with patch("tapeback.transcriber.WhisperModel") as mock_model_cls:
+    with patch("tapeback._fw_backend.WhisperModel") as mock_model_cls:
         instance = mock_model_cls.return_value
         instance.transcribe.return_value = (iter([_segment(0.0, 5.0, "готово")]), _info())
 
@@ -76,7 +76,7 @@ def test_interrupt_in_the_second_channel_keeps_the_first(settings, gpu_ready):
     """Monitor runs first; losing it because the mic was interrupted wastes the lot."""
     s = settings.model_copy(update={"device": "cuda"})
 
-    with patch("tapeback.transcriber.WhisperModel") as mock_model_cls:
+    with patch("tapeback._fw_backend.WhisperModel") as mock_model_cls:
         instance = mock_model_cls.return_value
         instance.transcribe.side_effect = [
             (iter([_segment(0.0, 5.0, "монитор")]), _info()),
@@ -96,7 +96,7 @@ def test_interrupt_in_the_first_channel_skips_the_second(settings, gpu_ready):
     """Ctrl+C means stop, so the remaining channel must not be started."""
     s = settings.model_copy(update={"device": "cuda"})
 
-    with patch("tapeback.transcriber.WhisperModel") as mock_model_cls:
+    with patch("tapeback._fw_backend.WhisperModel") as mock_model_cls:
         instance = mock_model_cls.return_value
         instance.transcribe.side_effect = [
             (_interrupting_segments(1), _info()),
@@ -155,7 +155,7 @@ def test_second_interrupt_still_propagates(settings, gpu_ready):
         yield _segment(0.0, 5.0, "one")
         raise KeyboardInterrupt
 
-    with patch("tapeback.transcriber.WhisperModel") as mock_model_cls:
+    with patch("tapeback._fw_backend.WhisperModel") as mock_model_cls:
         instance = mock_model_cls.return_value
         instance.transcribe.return_value = (_double_interrupt(), _info())
         transcriber = Transcriber(s)
@@ -164,7 +164,7 @@ def test_second_interrupt_still_propagates(settings, gpu_ready):
         # A later interrupt (e.g. during saving) is a fresh one and must not be eaten.
         instance.transcribe.return_value = (_double_interrupt(), _info())
         with (
-            patch.object(transcriber, "_collect_segments", side_effect=KeyboardInterrupt),
+            patch.object(transcriber._backend, "_collect_segments", side_effect=KeyboardInterrupt),
             pytest.raises(KeyboardInterrupt),
         ):
             transcriber.transcribe(Path("/fake/audio.wav"))

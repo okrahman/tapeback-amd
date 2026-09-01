@@ -52,8 +52,17 @@ def _noop_status(msg: str) -> None:
 
 
 def _gpu_telemetry_enabled(settings: Settings) -> bool:
-    """GPU sampling is only meaningful for a run that actually asked for the GPU."""
-    return settings.gpu_telemetry and settings.device == "cuda"
+    """GPU sampling is only meaningful for a run that actually asked for the GPU.
+
+    TAPEBACK_DEVICE stays applicable to faster-whisper and diarization, but with the
+    Lemonade backend the transcription GPU is the server's business, not ours — there
+    is no local inference to sample and no accelerator tapeback should name.
+    """
+    return (
+        settings.gpu_telemetry
+        and settings.device == "cuda"
+        and settings.transcription_backend == "faster-whisper"
+    )
 
 
 def stop_and_process(

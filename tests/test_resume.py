@@ -40,16 +40,18 @@ def _whisper_segment(start: float, end: float, text: str):
 
 
 def test_key_changes_when_the_audio_changes(cached_settings, audio, tmp_path):
-    first = _resume.resume_key(audio, cached_settings, "transcribe monitor")
+    fingerprint = _resume.settings_fingerprint(cached_settings)
+    first = _resume.resume_key(audio, fingerprint, "transcribe monitor")
     audio.write_bytes(b"different content, different size")
-    second = _resume.resume_key(audio, cached_settings, "transcribe monitor")
+    second = _resume.resume_key(audio, fingerprint, "transcribe monitor")
     assert first is not None
     assert first != second
 
 
 def test_key_changes_per_channel(cached_settings, audio):
-    assert _resume.resume_key(audio, cached_settings, "transcribe mic") != _resume.resume_key(
-        audio, cached_settings, "transcribe monitor"
+    fingerprint = _resume.settings_fingerprint(cached_settings)
+    assert _resume.resume_key(audio, fingerprint, "transcribe mic") != _resume.resume_key(
+        audio, fingerprint, "transcribe monitor"
     )
 
 
@@ -59,7 +61,7 @@ def test_key_changes_per_channel(cached_settings, audio):
 )
 def test_key_changes_when_an_output_affecting_setting_changes(cached_settings, audio, field):
     """A cached channel is only reusable if it would be produced the same way."""
-    base = _resume.resume_key(audio, cached_settings, "transcribe")
+    base = _resume.resume_key(audio, _resume.settings_fingerprint(cached_settings), "transcribe")
     changed = {
         "whisper_model": "tiny",
         "compute_type": "float32",
@@ -69,15 +71,17 @@ def test_key_changes_when_an_output_affecting_setting_changes(cached_settings, a
         "language": "de",
     }[field]
     other = cached_settings.model_copy(update={field: changed})
-    assert base != _resume.resume_key(audio, other, "transcribe")
+    assert base != _resume.resume_key(audio, _resume.settings_fingerprint(other), "transcribe")
 
 
 def test_key_is_none_for_missing_audio(cached_settings, tmp_path):
-    assert _resume.resume_key(tmp_path / "gone.wav", cached_settings, "transcribe") is None
+    fingerprint = _resume.settings_fingerprint(cached_settings)
+    missing = tmp_path / "gone.wav"
+    assert _resume.resume_key(missing, fingerprint, "transcribe") is None
 
 
 def test_round_trip_preserves_segments_and_words(cached_settings, audio, tmp_path):
-    key = _resume.resume_key(audio, cached_settings, "transcribe")
+    key = _resume.resume_key(audio, _resume.settings_fingerprint(cached_settings), "transcribe")
     assert key is not None
     directory = tmp_path / "resume"
     segments = [
@@ -103,7 +107,7 @@ def test_round_trip_preserves_segments_and_words(cached_settings, audio, tmp_pat
 
 def test_corrupt_entry_is_ignored(cached_settings, audio, tmp_path):
     """A half-written cache file must cost a redo, not a failed run."""
-    key = _resume.resume_key(audio, cached_settings, "transcribe")
+    key = _resume.resume_key(audio, _resume.settings_fingerprint(cached_settings), "transcribe")
     assert key is not None
     directory = tmp_path / "resume"
     directory.mkdir()
@@ -115,7 +119,7 @@ def test_corrupt_entry_is_ignored(cached_settings, audio, tmp_path):
 def test_second_run_reuses_the_first(cached_settings, audio):
     """The point: an interrupted run must not redo a channel it already finished."""
     messages: list[str] = []
-    with patch("tapeback.transcriber.WhisperModel") as mock_model_cls:
+    with patch("tapeback._fw_backend.WhisperModel") as mock_model_cls:
         instance = mock_model_cls.return_value
         instance.transcribe.return_value = (
             iter([_whisper_segment(0.0, 5.0, "готово")]),
@@ -141,7 +145,7 @@ def test_partial_results_are_not_cached(cached_settings, audio, tmp_path):
         yield _whisper_segment(0.0, 5.0, "начало")
         raise KeyboardInterrupt
 
-    with patch("tapeback.transcriber.WhisperModel") as mock_model_cls:
+    with patch("tapeback._fw_backend.WhisperModel") as mock_model_cls:
         instance = mock_model_cls.return_value
         instance.transcribe.return_value = (_interrupting(), _info())
         segments, info = Transcriber(cached_settings).transcribe(audio, stage="transcribe")
@@ -155,7 +159,7 @@ def test_cache_can_be_disabled(settings, audio, tmp_path):
     s = settings.model_copy(
         update={"device": "cpu", "resume_cache": False, "resume_cache_dir": tmp_path / "resume"}
     )
-    with patch("tapeback.transcriber.WhisperModel") as mock_model_cls:
+    with patch("tapeback._fw_backend.WhisperModel") as mock_model_cls:
         instance = mock_model_cls.return_value
         instance.transcribe.return_value = (iter([_whisper_segment(0.0, 5.0, "x")]), _info())
         Transcriber(s).transcribe(audio)

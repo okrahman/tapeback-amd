@@ -191,7 +191,7 @@ def test_live_transcriber_start_stop_lifecycle(tmp_path, tmp_vault):
 
     mock_model = mock_whisper_transcribe([(0.0, 0.5, "Test speech.")])
 
-    with patch("tapeback.transcriber.WhisperModel", return_value=mock_model):
+    with patch("tapeback._fw_backend.WhisperModel", return_value=mock_model):
         lt = LiveTranscriber(settings, "2026-04-18_10-00-00", mic_path, monitor_path)
         lt.start()
         # Let it run briefly — the thread will pick up the audio
@@ -234,7 +234,7 @@ def test_live_transcriber_no_crash_on_transcription_error(tmp_path, tmp_vault):
     mock_model = MagicMock()
     mock_model.transcribe.side_effect = RuntimeError("CUDA out of memory")
 
-    with patch("tapeback.transcriber.WhisperModel", return_value=mock_model):
+    with patch("tapeback._fw_backend.WhisperModel", return_value=mock_model):
         lt = LiveTranscriber(settings, "error-session", mic_path, monitor_path)
         lt.start()
         lt._stop_event.wait(timeout=0.1)
@@ -262,7 +262,7 @@ def test_live_transcriber_process_chunk_accumulates_segments(tmp_path, tmp_vault
 
     mock_model = mock_whisper_transcribe([(0.0, 1.0, "Hello world.")])
 
-    with patch("tapeback.transcriber.WhisperModel", return_value=mock_model):
+    with patch("tapeback._fw_backend.WhisperModel", return_value=mock_model):
         lt = LiveTranscriber(settings, "chunk-test", mic_path, monitor_path)
         lt._process_chunk()
 
