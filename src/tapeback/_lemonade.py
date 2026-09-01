@@ -20,6 +20,13 @@ Transport decisions that shape the output:
   explicitly). Empty leading chunks are ignored, not treated as the answer.
 - **Timestamps.** Servers return chunk-relative times; they are shifted into
   file-relative time before anything is returned or stored.
+- **Transport protection.** Remote endpoints require ``https://``: meeting audio
+  and the bearer credential must never travel in plaintext. Plain ``http://`` is
+  accepted only for strictly recognized loopback endpoints (``localhost``,
+  ``127.0.0.0/8``, ``::1``), and loopback requests bypass the process-wide proxy
+  configuration so an inherited ``http_proxy`` cannot capture them. Response
+  bodies are read under a hard size cap, so a broken or hostile endpoint cannot
+  exhaust client memory with an oversized body.
 
 Errors are a deliberate hierarchy (see `LemonadeFallbackError`): the façade falls
 back to faster-whisper only on fallback-eligible errors, and never on authentication,
@@ -29,6 +36,7 @@ configuration, or interrupt.
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
 import struct
 import urllib.error
@@ -99,6 +107,21 @@ DEDUP_POLICY_VERSION = 1
 # is ~9.6 MB, so this binds only for unusual formats — it is a memory guard, not a
 # claim about the server.
 _MAX_CHUNK_BYTES = 24 * 1024 * 1024
+
+# Fixed allowance reserved from the byte cap for the WAV container header and
+# multipart framing, so framing can never push a request past the cap even at
+# maximum overlap.
+_REQUEST_OVERHEAD_BYTES = 64 * 1024
+
+# A WAV whose chunk arithmetic yields more requests than this is treated as a
+# misconfiguration (chunk duration far too small for the recording) rather than
+# transcribed one sliver per request.
+_MAX_CHUNKS = 1000
+
+# Hard cap on one HTTP response body, success or error. A configured endpoint is
+# trusted with audio, not with the client's memory: this bounds what a broken or
+# hostile server can make tapeback buffer before parsing.
+_MAX_RESPONSE_BYTES = 4 * 1024 * 1024
 
 # Whisper's own language names (what a server echoing Whisper metadata returns)
 # mapped to ISO-639-1 codes. Anything already a two-letter code passes through.
@@ -337,6 +360,39 @@ def _multipart_body(
     return b"".join(parts), f"multipart/form-data; boundary={boundary}"
 
 
+# Opener for strictly-loopback endpoints. An empty ProxyHandler never consults
+# the process-wide proxy configuration, so an inherited http_proxy without a
+# matching NO_PROXY cannot route a "local" upload through it.
+_NO_PROXY_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+def _open_url(
+    request: urllib.request.Request, timeout: float, *, bypass_proxies: bool
+) -> Any:
+    """Open one URL, bypassing the inherited proxy configuration for loopback."""
+    if bypass_proxies:
+        return _NO_PROXY_OPENER.open(request, timeout=timeout)
+    return urllib.request.urlopen(request, timeout=timeout)
+
+
+def _read_bounded(fp: Any, limit: int) -> bytes:
+    """Read at most ``limit + 1`` bytes from ``fp``, so overflow is detectable.
+
+    A single ``read(n)`` is not a size bound: a stream may legitimately return a
+    short read while more data remains, so the read loops until the cap is
+    exceeded or the stream ends.
+    """
+    pieces: list[bytes] = []
+    remaining = limit + 1
+    while remaining > 0:
+        piece = fp.read(min(65536, remaining))
+        if not piece:
+            break
+        pieces.append(piece)
+        remaining -= len(piece)
+    return b"".join(pieces)
+
+
 @dataclass(frozen=True)
 class _Chunk:
     """One request's slice of the input WAV, in frame coordinates.
@@ -355,10 +411,24 @@ class _Chunk:
 
 
 def _wav_params(audio_path: Path) -> tuple[int, int, int, int] | None:
-    """(channels, sampwidth, framerate, n_frames) — None when not a readable WAV."""
+    """(channels, sampwidth, framerate, n_frames) — None when not a readable WAV.
+
+    A declared frame count that cannot fit in the actual file (a forged or
+    inconsistent RIFF header) is also rejected: trusting it would plan one
+    request per phantom frame.
+    """
     try:
         with wave.open(str(audio_path), "rb") as wf:
-            return wf.getnchannels(), wf.getsampwidth(), wf.getframerate(), wf.getnframes()
+            params = (
+                wf.getnchannels(),
+                wf.getsampwidth(),
+                wf.getframerate(),
+                wf.getnframes(),
+            )
+        declared_bytes = params[3] * max(1, params[0] * params[1])
+        if declared_bytes > audio_path.stat().st_size:
+            return None
+        return params
     except (wave.Error, OSError):
         return None
 
@@ -393,50 +463,98 @@ def _wrap_wav(frames: bytes, channels: int, sampwidth: int, framerate: int) -> b
     return header + frames
 
 
+@dataclass(frozen=True)
+class _ChunkPlan:
+    """Lazy chunk plan for one WAV: arithmetic only, no per-chunk objects.
+
+    ``total`` is computed once; each request's ``_Chunk`` is materialized just
+    before it is sent, so a pathologically small chunk duration or an absurd
+    frame count can never allocate one object per frame up front.
+    """
+
+    total: int
+    step: int
+    overlap: int
+    n_frames: int
+
+    def chunk(self, index: int) -> _Chunk:
+        """Materialize the ``index``-th chunk of the plan."""
+        core_start = index * self.step
+        core_end = min(core_start + self.step, self.n_frames)
+        audio_start = max(0, core_start - self.overlap) if index > 0 else 0
+        return _Chunk(index, self.total, audio_start, core_start, core_end)
+
+
 def _plan_chunks(
     channels: int, sampwidth: int, framerate: int, n_frames: int, settings: Settings
-) -> list[_Chunk]:
+) -> _ChunkPlan:
     """Split a WAV into core intervals using conservative internal bounds.
 
     The duration target and the byte cap both apply: whichever yields fewer frames
-    per request wins. Overlap is prepended to every chunk after the first and never
-    reaches past the start of the file. A single-chunk result is normal — the split
-    only exists for long recordings.
+    per request wins. The byte cap covers the WHOLE request payload — overlap is
+    prepended to every chunk after the first, and fixed container/multipart
+    framing is reserved — so no configured overlap can push a request past
+    ``_MAX_CHUNK_BYTES``. Chunks are planned lazily (see `_ChunkPlan`).
     """
     frame_bytes = max(1, channels * sampwidth)
     frames_per_duration = int(settings.lemonade_chunk_seconds * framerate)
-    frames_per_bytes = max(1, _MAX_CHUNK_BYTES // frame_bytes)
-    step = max(1, min(frames_per_duration, frames_per_bytes))
     overlap = int(settings.lemonade_overlap_seconds * framerate)
-
-    chunks: list[_Chunk] = []
-    core_start = 0
-    while core_start < n_frames:
-        core_end = min(core_start + step, n_frames)
-        audio_start = max(0, core_start - overlap) if chunks else 0
-        chunks.append(
-            _Chunk(
-                index=len(chunks),
-                total=0,  # filled in once the count is final
-                audio_start=audio_start,
-                core_start=core_start,
-                core_end=core_end,
-            )
+    frames_per_bytes = max(
+        1, (_MAX_CHUNK_BYTES - _REQUEST_OVERHEAD_BYTES) // frame_bytes - overlap
+    )
+    step = max(1, min(frames_per_duration, frames_per_bytes))
+    total = max(1, -(-n_frames // step))  # ceil division
+    if total > _MAX_CHUNKS:
+        raise LemonadeConfigurationError(
+            f"{n_frames} frames at {frame_bytes} bytes/frame would need {total} "
+            f"requests (limit {_MAX_CHUNKS}). The current chunk/overlap settings "
+            "would upload this recording one sliver at a time — raise "
+            "TAPEBACK_LEMONADE_CHUNK_SECONDS or lower "
+            "TAPEBACK_LEMONADE_OVERLAP_SECONDS."
         )
-        core_start = core_end
-    return [
-        _Chunk(chunk.index, len(chunks), chunk.audio_start, chunk.core_start, chunk.core_end)
-        for chunk in chunks
-    ]
+    return _ChunkPlan(total=total, step=step, overlap=overlap, n_frames=n_frames)
+
+
+def _is_loopback_host(hostname: str | None) -> bool:
+    """True only for strictly recognized loopback endpoints.
+
+    ``localhost`` (case-insensitive) and IP literals whose ``is_loopback`` is
+    true — the whole ``127.0.0.0/8`` range and ``::1``. Deliberately no DNS
+    resolution: a name that merely resolves to loopback is not recognized,
+    because "strictly recognized" is the entire basis for allowing plaintext.
+    """
+    if not hostname:
+        return False
+    host = hostname.strip().rstrip(".").lower()
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
 
 
 def _normalize_base_url(raw: str) -> str:
-    """Validate and normalize the server base URL. Bad syntax never reaches HTTP."""
+    """Validate and normalize the server base URL. Bad syntax never reaches HTTP.
+
+    Transport rule: remote endpoints require ``https://`` — the multipart body
+    carries the full recording and possibly the bearer credential, and plaintext
+    HTTP offers an on-path observer both. Plain ``http://`` is allowed only for
+    a strictly recognized loopback host, where the threat model is local and the
+    default local-server setup keeps working.
+    """
     candidate = raw.strip()
     parsed = urllib.parse.urlparse(candidate)
     if parsed.scheme not in ("http", "https") or not parsed.hostname:
         raise LemonadeConfigurationError(
             f"TAPEBACK_LEMONADE_URL is not a valid http(s) URL: {raw!r}"
+        )
+    if parsed.scheme == "http" and not _is_loopback_host(parsed.hostname):
+        raise LemonadeConfigurationError(
+            f"TAPEBACK_LEMONADE_URL uses plaintext http for the non-loopback host "
+            f"{parsed.hostname!r}: meeting audio and the bearer credential would "
+            "travel unprotected. Use https:// for remote servers (plain http is "
+            "allowed only for localhost, 127.0.0.0/8 and ::1)."
         )
     return candidate.rstrip("/")
 
@@ -560,6 +678,10 @@ class LemonadeBackend:
         self._settings = settings
         self._base_url = _normalize_base_url(settings.lemonade_url)
         self._transcription_url = f"{self._base_url}/v1/audio/transcriptions"
+        # Loopback traffic must never follow the inherited proxy configuration: a
+        # host with http_proxy set and no matching NO_PROXY would otherwise route
+        # the "local" upload through that proxy.
+        self._bypass_proxies = _is_loopback_host(urllib.parse.urlparse(self._base_url).hostname)
         key = settings.lemonade_api_key.get_secret_value()
         if key and (key != key.strip() or any(ch.isspace() or not ch.isprintable() for ch in key)):
             raise LemonadeConfigurationError(
@@ -630,7 +752,18 @@ class LemonadeBackend:
                 duration = self._transcribe_wav(audio_path, params, stage, on_status, state)
             else:
                 # Not a parseable WAV: send it whole. The pipeline supplies PCM WAV,
-                # so this is the tolerant path for unusual but valid inputs.
+                # so this is the tolerant path for unusual but valid inputs. The
+                # whole body is buffered for multipart assembly (peak ~2x for the
+                # copy), so it is bounded by the same cap as a chunk — a bigger
+                # non-chunkable input is refused here and can fall back to
+                # faster-whisper, which decodes formats the chunker cannot.
+                size = audio_path.stat().st_size
+                if size > _MAX_CHUNK_BYTES:
+                    raise LemonadeCapabilityError(
+                        f"Input is not a chunkable WAV and at {size} bytes exceeds "
+                        f"the single-request cap ({_MAX_CHUNK_BYTES} bytes) — refusing "
+                        "to buffer it for upload."
+                    )
                 on_status(f"  {stage}: single request (file is not a chunkable WAV)")
                 payload = self._request_transcription(
                     audio_path.read_bytes(), audio_path.name, state.pinned
@@ -664,10 +797,11 @@ class LemonadeBackend:
     ) -> float:
         """Send one request per chunk and merge the responses. Returns the duration."""
         channels, sampwidth, framerate, n_frames = params
-        chunks = _plan_chunks(channels, sampwidth, framerate, n_frames, self._settings)
+        plan = _plan_chunks(channels, sampwidth, framerate, n_frames, self._settings)
         progress = ProgressReporter(stage, n_frames / framerate, on_status)
         with wave.open(str(audio_path), "rb") as wf:
-            for chunk in chunks:
+            for index in range(plan.total):
+                chunk = plan.chunk(index)
                 if chunk.total > 1:
                     on_status(f"  {stage}: Lemonade chunk {chunk.index + 1}/{chunk.total}")
                 wf.setpos(chunk.audio_start)
@@ -744,16 +878,46 @@ class LemonadeBackend:
             return {"raw": raw.decode("utf-8", errors="replace")}
 
     def _send(self, request: urllib.request.Request) -> bytes:
-        """Perform one HTTP request, mapping every failure onto the error hierarchy."""
+        """Perform one HTTP request, mapping every failure onto the error hierarchy.
+
+        Response bodies — success and error alike — are read under
+        ``_MAX_RESPONSE_BYTES``: a socket timeout is not a size bound, and a
+        compromised or broken endpoint must not be able to exhaust client memory
+        remotely. Over-limit responses get a sanitized error with no body content.
+        """
         timeout = self._settings.lemonade_timeout_seconds
         try:
-            with urllib.request.urlopen(request, timeout=timeout) as response:
-                return response.read()
+            with _open_url(request, timeout, bypass_proxies=self._bypass_proxies) as response:
+                headers = getattr(response, "headers", None)
+                if headers is not None:
+                    content_length = headers.get("Content-Length")
+                    if (
+                        content_length
+                        and content_length.strip().isdigit()
+                        and int(content_length) > _MAX_RESPONSE_BYTES
+                    ):
+                        raise LemonadeUnavailableError(
+                            f"Lemonade declared a {int(content_length)}-byte response — "
+                            f"over the {_MAX_RESPONSE_BYTES}-byte response cap; "
+                            "refusing to read it."
+                        )
+                raw = _read_bounded(response, _MAX_RESPONSE_BYTES)
+            if len(raw) > _MAX_RESPONSE_BYTES:
+                raise LemonadeUnavailableError(
+                    f"Lemonade response exceeded the {_MAX_RESPONSE_BYTES}-byte response "
+                    "cap; refusing to buffer or parse it."
+                )
+            return raw
         except urllib.error.HTTPError as exc:
-            try:
-                payload = json.loads(exc.read().decode("utf-8", errors="replace"))
-            except (ValueError, OSError):
+            raw = _read_bounded(exc, _MAX_RESPONSE_BYTES)
+            if len(raw) > _MAX_RESPONSE_BYTES:
+                # Classify by status alone rather than buffer a giant error body.
                 payload = None
+            else:
+                try:
+                    payload = json.loads(raw.decode("utf-8", errors="replace"))
+                except (ValueError, OSError):
+                    payload = None
             raise classify_http_failure(exc.code, payload) from exc
         except TimeoutError as exc:
             # socket.timeout is TimeoutError on Python 3.10+: this is the

@@ -64,8 +64,13 @@ def seg(start, end, text="hello"):
 class _FakeResponse:
     def __init__(self, body):
         self._body = body
+        self._consumed = False
 
-    def read(self):
+    def read(self, n: int = -1):
+        # Emulate stream semantics: one read yields the body, further reads EOF.
+        if self._consumed:
+            return b""
+        self._consumed = True
         return self._body
 
     def __enter__(self):
@@ -76,6 +81,11 @@ class _FakeResponse:
 
 
 def install_urlopen(monkeypatch, bodies):
+    """Queue responses (bytes, exceptions, or pre-built responses) per request.
+
+    Routes BOTH HTTP paths tapeback can take — the default ``urlopen`` and the
+    loopback no-proxy opener — through the same fake.
+    """
     calls: list[object] = []
 
     def fake_urlopen(request, timeout=None):
@@ -83,10 +93,23 @@ def install_urlopen(monkeypatch, bodies):
         body = bodies[min(len(calls) - 1, len(bodies) - 1)]
         if isinstance(body, BaseException):
             raise body
-        return _FakeResponse(body)
+        if isinstance(body, (bytes, bytearray)):
+            return _FakeResponse(body)
+        return body  # a pre-built response-like object, passed through
 
-    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    _patch_urlopen(monkeypatch, fake_urlopen)
     return calls
+
+
+def _patch_urlopen(monkeypatch, fn):
+    """Route every tapeback HTTP path (default and loopback opener) through fn."""
+    monkeypatch.setattr("urllib.request.urlopen", fn)
+
+    class _FakeOpener:
+        def open(self, request, timeout=None):
+            return fn(request, timeout=timeout)
+
+    monkeypatch.setattr("tapeback._lemonade._NO_PROXY_OPENER", _FakeOpener())
 
 
 def fw_result(texts, language="ru"):
@@ -127,7 +150,7 @@ def test_mono_model_failure_falls_back_and_caches_under_fw_identity(
             io.BytesIO(json.dumps({"error": {"message": "Model X is not available"}}).encode()),
         )
 
-    monkeypatch.setattr("urllib.request.urlopen", failing)
+    _patch_urlopen(monkeypatch, failing)
 
     segments, _info = Transcriber(lemon_settings(tmp_path)).transcribe(audio)
 
@@ -150,8 +173,8 @@ def test_capability_error_reaches_the_facade_and_falls_back(tmp_path, monkeypatc
 
 
 def test_authentication_error_does_not_fall_back(tmp_path, monkeypatch, mock_fw, audio):
-    monkeypatch.setattr(
-        "urllib.request.urlopen",
+    _patch_urlopen(
+        monkeypatch,
         lambda request, timeout=None: (_ for _ in ()).throw(
             urllib.error.HTTPError("http://x", 401, "auth", Message(), io.BytesIO(b"{}"))
         ),
@@ -165,8 +188,8 @@ def test_authentication_error_does_not_fall_back(tmp_path, monkeypatch, mock_fw,
 
 
 def test_configuration_error_does_not_fall_back(tmp_path, monkeypatch, mock_fw, audio):
-    monkeypatch.setattr(
-        "urllib.request.urlopen",
+    _patch_urlopen(
+        monkeypatch,
         lambda request, timeout=None: (_ for _ in ()).throw(
             urllib.error.HTTPError("http://x", 400, "bad", Message(), io.BytesIO(b"{}"))
         ),
@@ -284,8 +307,8 @@ def test_fallback_results_are_stored_only_under_fw_fingerprints(tmp_path, monkey
     transcriber, _fw = _stereo_backend(tmp_path, monkeypatch, ok, LemonadeModelError("x"))
     transcriber.transcribe_stereo(mic, monitor)
 
-    lemonade_monitor_key = _resume.resume_key(monitor, "lemonade-fp", "transcribe monitor")
-    fw_monitor_key = _resume.resume_key(monitor, "fw-fingerprint", "transcribe monitor")
+    lemonade_monitor_key = transcriber._resume_key(monitor, "transcribe monitor", "lemonade-fp")
+    fw_monitor_key = transcriber._resume_key(monitor, "transcribe monitor", "fw-fingerprint")
     assert lemonade_monitor_key is not None and fw_monitor_key is not None
     resume_dir = tmp_path / "resume"
     assert _resume.load(lemonade_monitor_key, resume_dir) is None
@@ -308,7 +331,10 @@ def test_existing_cache_hits_survive_a_fallback(tmp_path, monkeypatch):
     """A complete fw cache entry is reused, not overwritten or discarded."""
     mic, monitor = _stereo(tmp_path)
     cached = fw_result(["cached-monitor"])
-    key = _resume.resume_key(monitor, "fw-fingerprint", "transcribe monitor")
+    settings = lemon_settings(tmp_path)
+    probe = Transcriber.__new__(Transcriber)
+    probe._settings = settings
+    key = probe._resume_key(monitor, "transcribe monitor", "fw-fingerprint")
     assert key is not None
     _resume.store(key, tmp_path / "resume", *cached)
 
@@ -366,7 +392,7 @@ def test_unavailable_error_falls_back(tmp_path, monkeypatch, mock_fw, audio):
     def unreachable(request, timeout=None):
         raise urllib.error.URLError(ConnectionRefusedError(111))
 
-    monkeypatch.setattr("urllib.request.urlopen", unreachable)
+    _patch_urlopen(monkeypatch, unreachable)
 
     segments, _ = Transcriber(lemon_settings(tmp_path)).transcribe(audio)
 
@@ -398,3 +424,130 @@ def test_fingerprint_changes_invalidate_lemonade_cache_independently(tmp_path, a
     )
     with patch.object(lemon, "DEDUP_POLICY_VERSION", lemon.DEDUP_POLICY_VERSION + 1):
         assert lemon.LemonadeBackend(lemon_settings(tmp_path)).cache_fingerprint() != baseline
+
+
+# --- fallback latch ---
+
+
+def test_fallback_latches_backend_for_transcriber_lifetime(tmp_path, monkeypatch, mock_fw, audio):
+    """After one eligible failure, the facade never submits to Lemonade again."""
+    calls = install_urlopen(monkeypatch, [urllib.error.URLError(ConnectionRefusedError(111))])
+    transcriber = Transcriber(lemon_settings(tmp_path))
+
+    segments, _info = transcriber.transcribe(audio)
+    assert [s.text for s in segments] == ["fallback"]
+    assert len(calls) == 1
+    assert transcriber._backend is mock_fw
+
+    transcriber.transcribe(audio)  # later calls: never touch Lemonade again
+    assert len(calls) == 1
+    # The second call is served from the fw-identity cache — zero Lemonade, zero new fw work.
+    assert mock_fw.transcribe.call_count == 1
+
+
+def test_stereo_fallback_latches_backend_for_transcriber_lifetime(tmp_path, monkeypatch, mock_fw):
+    mic, monitor = _stereo(tmp_path)
+    ok = fw_result(["lemonade-monitor"])
+    transcriber, _fw = _stereo_backend(tmp_path, monkeypatch, ok, LemonadeModelError("x"))
+    transcriber.transcribe_stereo(mic, monitor)
+
+    assert transcriber._backend is not None
+    assert transcriber._backend.cache_fingerprint() == "fw-fingerprint"
+
+
+# --- resume identity includes the effective language ---
+
+
+def test_language_change_invalidates_mono_resume_cache(tmp_path, monkeypatch, audio):
+    """A cached English result is never served to a run pinned to French."""
+    transcriber = Transcriber(lemon_settings(tmp_path))
+    install_urlopen(monkeypatch, [verbose_json([seg(0.0, 0.4, "hello en")], language="english")])
+    _segments, info = transcriber.transcribe(audio, language_override="english")
+    assert info["language"] == "en"
+
+    calls = install_urlopen(
+        monkeypatch, [verbose_json([seg(0.0, 0.4, "bonjour")], language="french")]
+    )
+    _segments, info = transcriber.transcribe(audio, language_override="french")
+
+    assert len(calls) == 1  # re-requested: the English cache entry must not match
+    assert info["language"] == "fr"
+    body = calls[0].data.decode("utf-8", errors="replace")
+    assert 'name="language"\r\n\r\nfr' in body
+
+
+def test_language_normalization_keeps_one_identity(tmp_path, monkeypatch, audio):
+    """'english' and 'English' overrides map to the same resume identity."""
+    transcriber = Transcriber(lemon_settings(tmp_path))
+    install_urlopen(monkeypatch, [verbose_json([seg(0.0, 0.4, "one")], language="english")])
+    transcriber.transcribe(audio, language_override="english")
+
+    calls = install_urlopen(monkeypatch, [verbose_json([seg(0.0, 0.4, "two")], language="english")])
+    _segments, info = transcriber.transcribe(audio, language_override="English")
+
+    assert len(calls) == 0  # cache hit — same normalized effective language
+    assert info["language"] == "en"
+
+
+def test_stereo_mic_cache_key_follows_monitor_language(tmp_path, monkeypatch):
+    """Mic cache must miss after the monitor changes the mic's effective language."""
+    mic = tmp_path / "mic.wav"
+    monitor_en = tmp_path / "monitor_en.wav"
+    monitor_fr = tmp_path / "monitor_fr.wav"
+    write_wav(mic, 0.5)
+    write_wav(monitor_en, 0.5)
+    write_wav(monitor_fr, 0.5)
+    transcriber = Transcriber(lemon_settings(tmp_path))
+
+    install_urlopen(
+        monkeypatch,
+        [
+            verbose_json([seg(0.0, 0.4, "en")], language="english"),
+            verbose_json([seg(0.0, 0.4, "en-mic")], language="english"),
+        ],
+    )
+    transcriber.transcribe_stereo(mic, monitor_en)
+
+    # A new monitor detects French: the English-constrained mic entry is stale.
+    calls = install_urlopen(
+        monkeypatch,
+        [
+            verbose_json([seg(0.0, 0.4, "fr")], language="french"),
+            verbose_json([seg(0.0, 0.4, "fr-mic")], language="french"),
+        ],
+    )
+    transcriber.transcribe_stereo(mic, monitor_fr)
+
+    assert len(calls) == 2  # mic re-requested under French, not served the en cache
+    body = calls[1].data.decode("utf-8", errors="replace")
+    assert 'name="language"\r\n\r\nfr' in body
+
+
+def test_fallback_stereo_mic_key_follows_monitor_language(tmp_path, monkeypatch, mock_fw):
+    """The faster-whisper fallback honors the same language-scoped mic identity."""
+    mic = tmp_path / "mic.wav"
+    monitor_en = tmp_path / "monitor_en.wav"
+    monitor_fr = tmp_path / "monitor_fr.wav"
+    write_wav(mic, 0.5)
+    write_wav(monitor_en, 0.5)
+    write_wav(monitor_fr, 0.5)
+
+    install_urlopen(monkeypatch, [urllib.error.URLError(ConnectionRefusedError(111))])
+    transcriber = Transcriber(lemon_settings(tmp_path))
+
+    fw_calls: list[tuple[str, str, str | None]] = []
+
+    def fake_fw_transcribe(path, stage="transcribe", on_status=None, language_override=None):
+        fw_calls.append((Path(path).name, stage, language_override))
+        language = "fr" if "fr" in Path(path).name or language_override == "fr" else "en"
+        return fw_result([f"fw-{stage}"], language=language)
+
+    mock_fw.transcribe.side_effect = fake_fw_transcribe
+
+    transcriber.transcribe_stereo(mic, monitor_en)  # lemonade fails -> fw both channels
+    transcriber.transcribe_stereo(mic, monitor_fr)  # monitor now establishes French
+
+    mic_calls = [c for c in fw_calls if c[1] == "transcribe mic"]
+    assert len(fw_calls) == 4  # monitor+mic per stereo run, mic cache never cross-hit
+    assert mic_calls[0] == ("mic.wav", "transcribe mic", "en")
+    assert mic_calls[-1] == ("mic.wav", "transcribe mic", "fr")

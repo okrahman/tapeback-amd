@@ -7,6 +7,7 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import pytest
 
+import tapeback.live as live_mod
 from tapeback.live import (
     LiveTranscriber,
     adjust_timestamps,
@@ -16,6 +17,7 @@ from tapeback.live import (
 )
 from tapeback.models import Segment, Word
 from tapeback.settings import Settings
+from tapeback.transcriber import Transcriber
 from tests.fixtures import create_mono_wav, mock_whisper_transcribe
 
 # --- find_data_offset ---
@@ -301,3 +303,70 @@ def test_write_chunk_wav_creates_valid_wav(tmp_path):
         assert wf.getframerate() == 16000
         assert wf.getsampwidth() == 2
         assert wf.getnframes() == 5
+
+
+# --- Lemonade fallback latch in live mode ---
+
+
+def test_live_mic_timeout_latches_and_never_resubmits_to_lemonade(tmp_path, tmp_vault, monkeypatch):
+    """A Lemonade timeout in live mode latches the facade to faster-whisper.
+
+    The paired monitor call in the same interval, and every later interval, must
+    never submit to Lemonade again — no mixed-backend live transcript and no
+    pile-up of timed-out server jobs.
+    """
+    settings = Settings(
+        vault_path=tmp_vault,
+        transcription_backend="lemonade",
+        resume_cache_dir=tmp_path / "resume",
+        live_min_chunk=0.1,
+        live_interval=60,
+    )
+    mic_path = tmp_path / "mic.wav"
+    monitor_path = tmp_path / "monitor.wav"
+    create_mono_wav(mic_path, duration=0.5, sample_rate=48000)
+    create_mono_wav(monitor_path, duration=0.5, sample_rate=48000)
+
+    lemonade_calls: list[object] = []
+
+    def fake_urlopen(request, timeout=None):
+        lemonade_calls.append(request)
+        raise TimeoutError("read timed out")
+
+    class _FakeOpener:
+        def open(self, request, timeout=None):
+            return fake_urlopen(request, timeout=timeout)
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    monkeypatch.setattr("tapeback._lemonade._NO_PROXY_OPENER", _FakeOpener())
+
+    fw = MagicMock()
+    fw.cache_fingerprint.return_value = "fw-fingerprint"
+
+    def fw_transcribe(path, **kwargs):
+        return [Segment(start=0.0, end=0.4, text="fw text")], {
+            "language": "en",
+            "duration": 0.5,
+            "partial": False,
+        }
+
+    fw.transcribe.side_effect = fw_transcribe
+    monkeypatch.setattr(Transcriber, "_new_fw_backend", lambda self: fw)
+    monkeypatch.setattr(live_mod, "load_transcriber", lambda s: Transcriber(s))
+
+    lt = LiveTranscriber(settings, "latch-session", mic_path, monitor_path)
+    lt._process_chunk()  # mic times out on Lemonade -> fallback + latch; monitor via fw
+
+    assert len(lemonade_calls) == 1  # only the first mic attempt reached Lemonade
+
+    # Grow both channels so the next interval has new audio to process.
+    with open(mic_path, "ab") as f:
+        f.write(b"\x00\x00" * 16000)
+    with open(monitor_path, "ab") as f:
+        f.write(b"\x00\x00" * 16000)
+
+    lt._process_chunk()  # later interval: everything via the latched fw backend
+
+    assert len(lemonade_calls) == 1  # still exactly one Lemonade request, ever
+    texts = [s.text for s in lt._segments]
+    assert texts and all(t == "fw text" for t in texts)  # both channels came from fw

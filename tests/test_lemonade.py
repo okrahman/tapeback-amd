@@ -2,6 +2,7 @@
 
 import io
 import json
+import struct
 import urllib.error
 import wave
 from email.message import Message
@@ -11,6 +12,7 @@ from typing import Any
 import pytest
 from pydantic import SecretStr
 
+import tapeback._lemonade as lemon
 from tapeback._lemonade import (
     DEDUP_POLICY_VERSION,
     LemonadeAuthenticationError,
@@ -67,8 +69,13 @@ def seg(start, end, text="hello"):
 class _FakeResponse:
     def __init__(self, body: bytes) -> None:
         self._body = body
+        self._consumed = False
 
-    def read(self) -> bytes:
+    def read(self, n: int = -1) -> bytes:
+        # Emulate stream semantics: one read yields the body, further reads EOF.
+        if self._consumed:
+            return b""
+        self._consumed = True
         return self._body
 
     def __enter__(self):
@@ -79,7 +86,12 @@ class _FakeResponse:
 
 
 def install_urlopen(monkeypatch, bodies):
-    """Queue responses (bytes or exception instances) for successive requests."""
+    """Queue responses (bytes or exception instances) for successive requests.
+
+    Routes BOTH HTTP paths tapeback can take — the default ``urlopen`` and the
+    loopback no-proxy opener — through the same fake, so tests intercept every
+    request regardless of which opener the backend chose.
+    """
     calls: list[object] = []
 
     def fake_urlopen(request, timeout=None):
@@ -88,9 +100,16 @@ def install_urlopen(monkeypatch, bodies):
         body = bodies[index]
         if isinstance(body, BaseException):
             raise body
-        return _FakeResponse(body)
+        if isinstance(body, (bytes, bytearray)):
+            return _FakeResponse(body)
+        return body  # a pre-built response-like object, passed through
+
+    class _FakeOpener:
+        def open(self, request, timeout=None):
+            return fake_urlopen(request, timeout=timeout)
 
     monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    monkeypatch.setattr("tapeback._lemonade._NO_PROXY_OPENER", _FakeOpener())
     return calls
 
 
@@ -133,7 +152,7 @@ def test_describe_names_model_and_endpoint(tmp_path):
         ("lemonade_model", "Whisper-Small"),
         ("language", "de"),
         ("lemonade_chunk_seconds", 120.0),
-        ("lemonade_overlap_seconds", 4.0),
+        ("lemonade_overlap_seconds", 0.9),
     ],
 )
 def test_fingerprint_changes_with_every_output_shaping_setting(tmp_path, field, value):
@@ -161,8 +180,8 @@ def test_fingerprint_tracks_the_dedup_policy_version(tmp_path, monkeypatch):
 
 
 def test_url_normalization_makes_trailing_slash_equivalent(tmp_path):
-    backend = LemonadeBackend(lemon_settings(tmp_path, lemonade_url="http://h:1/"))
-    other = LemonadeBackend(lemon_settings(tmp_path, lemonade_url="http://h:1"))
+    backend = LemonadeBackend(lemon_settings(tmp_path, lemonade_url="http://127.0.0.1:1/"))
+    other = LemonadeBackend(lemon_settings(tmp_path, lemonade_url="http://127.0.0.1:1"))
     assert backend.cache_fingerprint() == other.cache_fingerprint()
 
 
@@ -506,3 +525,240 @@ def test_health_and_system_info_are_gets_with_auth(tmp_path, monkeypatch):
     assert calls[0].full_url.endswith("/v1/health")
     assert calls[1].full_url.endswith("/v1/system-info")
     assert all(c.headers["Authorization"] == "Bearer tok" for c in calls)
+
+
+# --- transport protection ---
+
+
+def test_plain_http_remote_host_is_rejected(tmp_path):
+    """Plaintext HTTP to a remote host would expose audio and credentials."""
+    with pytest.raises(LemonadeConfigurationError) as excinfo:
+        LemonadeBackend(lemon_settings(tmp_path, lemonade_url="http://remote-host:8000"))
+    assert "https" in str(excinfo.value)
+
+
+def test_https_remote_host_is_accepted(tmp_path):
+    backend = LemonadeBackend(lemon_settings(tmp_path, lemonade_url="https://remote-host:8000"))
+    assert backend._base_url == "https://remote-host:8000"
+    assert backend._bypass_proxies is False
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://127.0.0.1:13305",
+        "http://localhost:13305",
+        "http://127.7.0.1:13305",
+        "http://[::1]:13305",
+        "http://LOCALHOST:13305",
+    ],
+)
+def test_loopback_http_is_accepted_and_bypasses_proxies(tmp_path, url):
+    backend = LemonadeBackend(lemon_settings(tmp_path, lemonade_url=url))
+    assert backend._bypass_proxies is True
+
+
+def test_loopback_requests_bypass_proxy_configuration(tmp_path, monkeypatch):
+    """An inherited proxy must never see loopback traffic.
+
+    getproxies() raises if consulted: the no-proxy opener never asks for the
+    process-wide proxy configuration, so a transcription against 127.0.0.1 can
+    only succeed when the proxy layer is truly bypassed.
+    """
+    wav = tmp_path / "a.wav"
+    write_wav(wav, 0.5)
+
+    def no_proxies_here():
+        raise AssertionError("loopback request consulted the proxy configuration")
+
+    monkeypatch.setattr("urllib.request.getproxies", no_proxies_here)
+    calls = install_urlopen(monkeypatch, [verbose_json([seg(0.0, 0.4)])])
+
+    LemonadeBackend(lemon_settings(tmp_path)).transcribe(wav)
+
+    assert len(calls) == 1
+
+
+def test_remote_https_keeps_default_proxy_path(tmp_path, monkeypatch):
+    """Non-loopback HTTPS goes through urllib.request.urlopen (system proxies allowed)."""
+    wav = tmp_path / "a.wav"
+    write_wav(wav, 0.5)
+    calls = install_urlopen(monkeypatch, [verbose_json([seg(0.0, 0.4)])])
+    backend = LemonadeBackend(lemon_settings(tmp_path, lemonade_url="https://example.test"))
+
+    backend.transcribe(wav)
+
+    assert backend._bypass_proxies is False
+    assert len(calls) == 1
+
+
+# --- response size cap ---
+
+
+class _StreamingResponse:
+    """A response with no Content-Length that yields data in 1 KiB reads."""
+
+    def __init__(self, size: int) -> None:
+        self._remaining = size
+
+    def read(self, n: int = -1) -> bytes:
+        if self._remaining <= 0:
+            return b""
+        take = min(1024, self._remaining)
+        if n is not None and 0 < n < take:
+            take = n
+        self._remaining -= take
+        return b"x" * take
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+
+class _HugeLengthResponse:
+    """A response declaring a Content-Length far over the cap; reading it is a bug."""
+
+    def __init__(self) -> None:
+        self.headers = Message()
+        self.headers["Content-Length"] = "999999999"
+
+    def read(self, n: int = -1) -> bytes:  # pragma: no cover — must never be called
+        raise AssertionError("an over-limit Content-Length must not be read")
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+
+def test_oversized_content_length_is_refused_unread(tmp_path, monkeypatch):
+    wav = tmp_path / "a.wav"
+    write_wav(wav, 0.5)
+    monkeypatch.setattr(lemon, "_MAX_RESPONSE_BYTES", 1024)
+    install_urlopen(monkeypatch, [_HugeLengthResponse()])
+
+    with pytest.raises(LemonadeUnavailableError) as excinfo:
+        LemonadeBackend(lemon_settings(tmp_path)).transcribe(wav)
+
+    assert "response cap" in str(excinfo.value)
+
+
+def test_streamed_oversized_response_is_refused(tmp_path, monkeypatch):
+    wav = tmp_path / "a.wav"
+    write_wav(wav, 0.5)
+    monkeypatch.setattr(lemon, "_MAX_RESPONSE_BYTES", 1024)
+    install_urlopen(monkeypatch, [_StreamingResponse(5000)])
+
+    with pytest.raises(LemonadeUnavailableError):
+        LemonadeBackend(lemon_settings(tmp_path)).transcribe(wav)
+
+
+def test_streamed_response_reads_at_most_limit_plus_one(tmp_path, monkeypatch):
+    """The read is capped: a hostile endpoint cannot stream unbounded bytes in."""
+    wav = tmp_path / "a.wav"
+    write_wav(wav, 0.5)
+    limit = 1024
+    monkeypatch.setattr(lemon, "_MAX_RESPONSE_BYTES", limit)
+    response = _StreamingResponse(10_000_000)
+    install_urlopen(monkeypatch, [response])
+
+    with pytest.raises(LemonadeUnavailableError):
+        LemonadeBackend(lemon_settings(tmp_path)).transcribe(wav)
+
+    # Only ~limit+1 bytes were pulled, never the whole 10 MB.
+    assert response._remaining >= 10_000_000 - limit - 2048
+
+
+def test_error_body_over_the_cap_is_classified_by_status(tmp_path, monkeypatch):
+    """A giant HTTP error page is not buffered; the status alone still classifies."""
+    wav = tmp_path / "a.wav"
+    write_wav(wav, 0.5)
+    monkeypatch.setattr(lemon, "_MAX_RESPONSE_BYTES", 1024)
+    install_urlopen(monkeypatch, [http_error(500, {"message": "x" * 5000})])
+
+    with pytest.raises(LemonadeUnavailableError):
+        LemonadeBackend(lemon_settings(tmp_path)).transcribe(wav)
+
+
+def test_response_just_under_the_cap_parses(tmp_path, monkeypatch):
+    wav = tmp_path / "a.wav"
+    write_wav(wav, 0.5)
+    monkeypatch.setattr(lemon, "_MAX_RESPONSE_BYTES", 65536)
+    install_urlopen(monkeypatch, [verbose_json([seg(0.0, 0.4)])])
+
+    segments, _info = LemonadeBackend(lemon_settings(tmp_path)).transcribe(wav)
+
+    assert [s.text for s in segments] == ["hello"]
+
+
+# --- request memory bounds ---
+
+
+def test_byte_cap_covers_overlap_and_framing(tmp_path, monkeypatch):
+    """Every uploaded chunk stays inside the byte cap even with overlap."""
+    wav = tmp_path / "wide.wav"
+    with wave.open(str(wav), "wb") as wf:
+        wf.setnchannels(8)
+        wf.setsampwidth(3)
+        wf.setframerate(16000)
+        wf.writeframes(b"\x00" * (8 * 3 * 16000 * 5))  # 5 s, 24 bytes per frame
+
+    monkeypatch.setattr(lemon, "_MAX_CHUNK_BYTES", 200_000)
+    monkeypatch.setattr(lemon, "_REQUEST_OVERHEAD_BYTES", 1_000)
+    calls = install_urlopen(monkeypatch, [verbose_json([seg(0.0, 0.4)])])
+
+    LemonadeBackend(
+        lemon_settings(tmp_path, lemonade_chunk_seconds=300.0, lemonade_overlap_seconds=0.2)
+    ).transcribe(wav)
+
+    assert len(calls) > 1  # the byte cap binds, not the duration target
+    for request in calls:
+        body = request.data
+        start = body.index(b"audio/wav\r\n\r\n") + len(b"audio/wav\r\n\r\n")
+        end = body.rindex(b"\r\n--tapeback-")
+        assert end - start <= lemon._MAX_CHUNK_BYTES
+
+
+def test_forged_frame_count_is_treated_as_non_chunkable(tmp_path, monkeypatch):
+    """A RIFF header declaring more data than the file holds must not be trusted."""
+    wav = tmp_path / "forged.wav"
+    write_wav(wav, 0.1)
+    data = bytearray(wav.read_bytes())
+    data[40:44] = struct.pack("<I", 0xFFFFFFF0)  # data-chunk size field
+    wav.write_bytes(bytes(data))
+
+    calls = install_urlopen(monkeypatch, [verbose_json([seg(0.0, 0.4)])])
+
+    LemonadeBackend(lemon_settings(tmp_path)).transcribe(wav)
+
+    assert len(calls) == 1  # one whole-file request, not one per phantom frame
+
+
+def test_oversized_non_wav_input_is_refused_not_buffered(tmp_path, monkeypatch):
+    """A non-chunkable input over the single-request cap falls back instead of OOM."""
+    big = tmp_path / "raw.bin"
+    big.write_bytes(b"\x00" * 4096)
+    monkeypatch.setattr(lemon, "_MAX_CHUNK_BYTES", 1024)
+    calls = install_urlopen(monkeypatch, [verbose_json([seg(0.0, 0.4)])])
+
+    with pytest.raises(LemonadeCapabilityError):
+        LemonadeBackend(lemon_settings(tmp_path)).transcribe(big)
+
+    assert calls == []
+
+
+def test_too_many_chunks_is_a_configuration_error(tmp_path, monkeypatch):
+    """A chunk plan past the request-count limit is refused before any upload."""
+    wav = tmp_path / "long.wav"
+    write_wav(wav, 5.0)  # 1 s chunks -> 5 chunks
+    monkeypatch.setattr(lemon, "_MAX_CHUNKS", 3)
+    calls = install_urlopen(monkeypatch, [verbose_json([seg(0.0, 0.4)])])
+
+    with pytest.raises(LemonadeConfigurationError) as excinfo:
+        LemonadeBackend(lemon_settings(tmp_path)).transcribe(wav)
+
+    assert "TAPEBACK_LEMONADE_CHUNK_SECONDS" in str(excinfo.value)
+    assert calls == []

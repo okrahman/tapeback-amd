@@ -163,8 +163,10 @@ class Settings(BaseSettings):
     lemonade_timeout_seconds: float = Field(default=600.0, gt=0.0)
     # Conservative internal chunk duration for long WAVs. Chosen to keep one request's
     # audio bounded in memory and progress reportable — these are tapeback's own
-    # transport bounds, not statements about Lemonade Server limits.
-    lemonade_chunk_seconds: float = Field(default=300.0, gt=0.0)
+    # transport bounds, not statements about Lemonade Server limits. Finite bounds:
+    # a value past an hour has no transport purpose (the byte cap binds first), and
+    # the overlap cross-check below needs a strictly larger chunk.
+    lemonade_chunk_seconds: float = Field(default=300.0, gt=0.0, le=3600.0)
     # Seconds of contextual overlap prepended to every chunk after the first, so a
     # segment cut by a chunk boundary is still heard whole by one of the requests.
     lemonade_overlap_seconds: float = Field(default=2.0, ge=0.0)
@@ -223,6 +225,21 @@ class Settings(BaseSettings):
             raise ValueError(
                 f"live_min_chunk ({self.live_min_chunk}s) must be <= "
                 f"live_interval ({self.live_interval}s); otherwise cycles starve."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_lemonade_overlap(self) -> "Settings":
+        """Chunk overlap must stay strictly inside one chunk.
+
+        Overlap >= chunk would make every chunk request carry the whole previous
+        chunk again — duplicate audio in every upload and no forward progress.
+        """
+        if self.lemonade_overlap_seconds >= self.lemonade_chunk_seconds:
+            raise ValueError(
+                f"lemonade_overlap_seconds ({self.lemonade_overlap_seconds}s) must be "
+                f"smaller than lemonade_chunk_seconds ({self.lemonade_chunk_seconds}s); "
+                "overlap >= chunk would re-send each chunk in full."
             )
         return self
 

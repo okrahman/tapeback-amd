@@ -193,6 +193,14 @@ What the backend does with your audio:
   `verbose_json`, with an explicit language once one is known. `Authorization: Bearer`
   is sent only if you set `TAPEBACK_LEMONADE_API_KEY`, and the key is never written to
   logs, cache keys, or error messages.
+- Protects the transport: remote endpoints require `https://` — the request body is
+  the full recording and possibly the bearer credential, and plaintext HTTP offers an
+  on-path observer both. Plain `http://` is accepted only for strictly recognized
+  loopback endpoints (`localhost`, `127.0.0.0/8`, `::1`), and those requests bypass
+  the process-wide proxy configuration, so an inherited `http_proxy` without a
+  matching `NO_PROXY` cannot capture a "local" upload. Response bodies are read under
+  a hard size cap; a broken or hostile endpoint cannot exhaust tapeback's memory with
+  an oversized body.
 - Splits long WAVs into bounded chunks (tapeback's own conservative transport bounds —
   not a statement about the server), with a small contextual overlap between chunks
   and versioned deduplication, so a recording of any length works and progress is
@@ -409,12 +417,12 @@ All settings via environment variables (prefix `TAPEBACK_`) or
 | Variable | Default | Description |
 |---|---|---|
 | `TAPEBACK_TRANSCRIPTION_BACKEND` | `faster-whisper` | `faster-whisper` (built-in local model) or `lemonade` (send WAVs to a [Lemonade Server](#lemonade-server-backend) you run yourself, with automatic fallback to faster-whisper on eligible failures) |
-| `TAPEBACK_LEMONADE_URL` | `http://127.0.0.1:13305` | Lemonade Server base URL (Lemonade backend only) |
+| `TAPEBACK_LEMONADE_URL` | `http://127.0.0.1:13305` | Lemonade Server base URL. Plaintext `http://` is allowed only for loopback hosts (`localhost`, `127.0.0.0/8`, `::1`); remote endpoints must use `https://` (Lemonade backend only) |
 | `TAPEBACK_LEMONADE_MODEL` | `Whisper-Large-v3-Turbo` | Model identifier as the server knows it (Lemonade backend only) |
 | `TAPEBACK_LEMONADE_API_KEY` | *(off)* | Optional bearer token; sent only in the `Authorization` header, never logged or cached (Lemonade backend only) |
 | `TAPEBACK_LEMONADE_TIMEOUT_SECONDS` | `600` | Per-request read timeout. Hitting it falls back to faster-whisper rather than resubmitting (Lemonade backend only) |
-| `TAPEBACK_LEMONADE_CHUNK_SECONDS` | `300` | Tapeback's own conservative chunk duration for long WAVs — bounded memory and reportable progress, not a server limit. Changing it (or the overlap) invalidates Lemonade resume-cache entries (Lemonade backend only) |
-| `TAPEBACK_LEMONADE_OVERLAP_SECONDS` | `2.0` | Contextual overlap prepended to each chunk after the first, deduplicated against the previous chunk's core interval (Lemonade backend only) |
+| `TAPEBACK_LEMONADE_CHUNK_SECONDS` | `300` | Tapeback's own conservative chunk duration for long WAVs (0 < value ≤ 3600) — bounded memory and reportable progress, not a server limit. Changing it (or the overlap) invalidates Lemonade resume-cache entries (Lemonade backend only) |
+| `TAPEBACK_LEMONADE_OVERLAP_SECONDS` | `2.0` | Contextual overlap prepended to each chunk after the first, deduplicated against the previous chunk's core interval. Must be smaller than the chunk duration (Lemonade backend only) |
 | `TAPEBACK_WHISPER_MODEL` | `large-v3-turbo` | Whisper model (`tiny`, `base`, `small`, `medium`, `large-v3-turbo`) |
 | `TAPEBACK_LANGUAGE` | `auto` | Language code (`auto` for auto-detection, or `en`, `ru`, `fr`, etc.) |
 | `TAPEBACK_DEVICE` | `cuda` | `cuda` or `cpu` |
@@ -630,9 +638,12 @@ Fixes, in order of reliability:
 
 ### Lemonade: the run fell back to faster-whisper
 
-With `TAPEBACK_TRANSCRIPTION_BACKEND=lemonade`, an eligible failure switches that run
-to faster-whisper ("Lemonade transcription failed (...) — falling back to
-faster-whisper" in the status output) and the transcript is still produced. What the
+With `TAPEBACK_TRANSCRIPTION_BACKEND=lemonade`, an eligible failure switches the
+transcription to faster-whisper ("Lemonade transcription failed (...) — falling back to
+faster-whisper" in the status output) and the transcript is still produced. The facade
+also latches to faster-whisper for the rest of the run — in live transcription this
+means the failed server is never asked for anything again, so one live interval can
+never mix a faster-whisper channel with a later Lemonade one. What the
 message means, by cause:
 
 - **Connection refused / timed out** — the server is not running or not reachable at
