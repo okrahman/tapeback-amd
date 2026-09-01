@@ -1,13 +1,18 @@
 """Live transcription tests — LiveTranscriber, WAV parsing, resampling, dedup."""
 
+import io
+import json
 import struct
+import urllib.error
 import wave
+from email.message import Message
 from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
 
 import tapeback.live as live_mod
+from tapeback._lemonade import LemonadeAuthenticationError
 from tapeback.live import (
     LiveTranscriber,
     adjust_timestamps,
@@ -19,6 +24,65 @@ from tapeback.models import Segment, Word
 from tapeback.settings import Settings
 from tapeback.transcriber import Transcriber
 from tests.fixtures import create_mono_wav, mock_whisper_transcribe
+
+
+class _FakeResponse:
+    """A urllib response that yields its body once, then EOF."""
+
+    def __init__(self, body: bytes):
+        self._body = body
+        self._consumed = False
+
+    def read(self, n: int = -1):
+        if self._consumed:
+            return b""
+        self._consumed = True
+        return self._body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+
+def _lemon_verbose_json(text: str, language: str = "russian") -> bytes:
+    """A successful Lemonade verbose_json response body."""
+    return json.dumps(
+        {
+            "text": text,
+            "segments": [{"start": 0.0, "end": 0.4, "text": text, "words": []}],
+            "language": language,
+            "language_probability": 0.9,
+        }
+    ).encode()
+
+
+def _install_urlopen(monkeypatch, bodies: list[object]) -> list[object]:
+    """Queue urllib responses (bytes or exceptions); repeat the last for later requests.
+
+    Routes BOTH tapeback HTTP paths (default urlopen and the loopback no-proxy
+    opener) through the same fake, and returns the recorded request list.
+    """
+    calls: list[object] = []
+
+    def fake_urlopen(request, timeout=None):
+        calls.append(request)
+        body = bodies[min(len(calls) - 1, len(bodies) - 1)]
+        if isinstance(body, BaseException):
+            raise body
+        if isinstance(body, (bytes, bytearray)):
+            return _FakeResponse(body)
+        return body  # a pre-built response-like object
+
+    class _FakeOpener:
+        def open(self, request, timeout=None):
+            return fake_urlopen(request, timeout=timeout)
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    monkeypatch.setattr("tapeback._lemonade._DEFAULT_OPENER", _FakeOpener())
+    monkeypatch.setattr("tapeback._lemonade._NO_PROXY_OPENER", _FakeOpener())
+    return calls
 
 # --- find_data_offset ---
 
@@ -311,9 +375,10 @@ def test_write_chunk_wav_creates_valid_wav(tmp_path):
 def test_live_mic_timeout_latches_and_never_resubmits_to_lemonade(tmp_path, tmp_vault, monkeypatch):
     """A Lemonade timeout in live mode latches the facade to faster-whisper.
 
-    The paired monitor call in the same interval, and every later interval, must
-    never submit to Lemonade again — no mixed-backend live transcript and no
-    pile-up of timed-out server jobs.
+    The paired monitor/mic call in the same interval, and every later interval,
+    must never submit to Lemonade again — no mixed-backend live transcript and no
+    pile-up of timed-out server jobs. The monitor transcribes first, so this
+    exercises the FIRST channel failing; the sibling test below covers the second.
     """
     settings = Settings(
         vault_path=tmp_vault,
@@ -371,3 +436,102 @@ def test_live_mic_timeout_latches_and_never_resubmits_to_lemonade(tmp_path, tmp_
     assert len(lemonade_calls) == 1  # still exactly one Lemonade request, ever
     texts = [s.text for s in lt._segments]
     assert texts and all(t == "fw text" for t in texts)  # both channels came from fw
+
+
+def test_live_second_channel_fallback_leaves_no_mixed_interval(
+    tmp_path, tmp_vault, monkeypatch
+):
+    """A fallback on an interval's SECOND channel must not commit a Lemonade first
+    channel beside faster-whisper output.
+
+    Regression: mic and monitor were two independent mono calls; a monitor timeout
+    retried only the monitor through faster-whisper and the already-successful
+    Lemonade mic segments were committed beside it. The pair now transcribes as ONE
+    transaction, so a second-channel fallback discards both and resolves both through
+    faster-whisper.
+    """
+    settings = Settings(
+        vault_path=tmp_vault,
+        transcription_backend="lemonade",
+        resume_cache_dir=tmp_path / "resume",
+        live_min_chunk=0.1,
+        live_interval=60,
+    )
+    mic_path = tmp_path / "mic.wav"
+    monitor_path = tmp_path / "monitor.wav"
+    create_mono_wav(mic_path, duration=0.5, sample_rate=48000)
+    create_mono_wav(monitor_path, duration=0.5, sample_rate=48000)
+
+    # Stereo transcribes the monitor first: it succeeds on Lemonade, then the mic
+    # times out — the fallback must redo BOTH channels on faster-whisper.
+    lemonade_calls = _install_urlopen(
+        monkeypatch,
+        [_lemon_verbose_json("lemonade-monitor"), TimeoutError("read timed out")],
+    )
+
+    fw = MagicMock()
+    fw.cache_fingerprint.return_value = "fw-fingerprint"
+
+    def fw_transcribe(path, **kwargs):
+        return [Segment(start=0.0, end=0.4, text="fw text")], {
+            "language": "en",
+            "duration": 0.5,
+            "partial": False,
+        }
+
+    fw.transcribe.side_effect = fw_transcribe
+    monkeypatch.setattr(Transcriber, "_new_fw_backend", lambda self: fw)
+    monkeypatch.setattr(live_mod, "load_transcriber", lambda s: Transcriber(s))
+
+    lt = LiveTranscriber(settings, "pair-fallback", mic_path, monitor_path)
+    lt._process_chunk()
+
+    assert len(lemonade_calls) == 2  # monitor -> Lemonade ok, mic -> Lemonade timeout
+    assert [s.text for s in lt._segments] == ["fw text", "fw text"]  # never mixed
+    assert lt._transcriber._backend is fw  # latched for every later interval
+
+
+def test_live_channel_error_rolls_back_both_cursors(tmp_path, tmp_vault, monkeypatch):
+    """An error on one channel must not advance the other channel's cursor, or the
+    successful interval is permanently dropped.
+
+    Regression: the mic cursor advanced as soon as the mic mono call returned; a later
+    monitor auth/config error exited before segments were committed, so the next cycle
+    started past that mic audio and never re-read it.
+    """
+    settings = Settings(
+        vault_path=tmp_vault,
+        transcription_backend="lemonade",
+        resume_cache_dir=tmp_path / "resume",
+        live_min_chunk=0.1,
+        live_interval=60,
+    )
+    mic_path = tmp_path / "mic.wav"
+    monitor_path = tmp_path / "monitor.wav"
+    create_mono_wav(mic_path, duration=0.5, sample_rate=48000)
+    create_mono_wav(monitor_path, duration=0.5, sample_rate=48000)
+
+    auth_error = urllib.error.HTTPError("http://x", 401, "auth", Message(), io.BytesIO(b"{}"))
+    # The monitor is the first channel of the pair; a non-fallback auth error must
+    # propagate out of _process_chunk with both cursors untouched.
+    _install_urlopen(monkeypatch, [auth_error])
+    monkeypatch.setattr(live_mod, "load_transcriber", lambda s: Transcriber(s))
+
+    lt = LiveTranscriber(settings, "rollback", mic_path, monitor_path)
+    with pytest.raises(LemonadeAuthenticationError):
+        lt._process_chunk()
+
+    assert lt._mic_byte_offset == 0
+    assert lt._monitor_byte_offset == 0
+    assert lt._segments == []
+
+    # The server recovers: the same interval is re-read and nothing was lost.
+    _install_urlopen(
+        monkeypatch, [_lemon_verbose_json("monitor"), _lemon_verbose_json("mic")]
+    )
+    lt._process_chunk()
+
+    assert lt._mic_byte_offset > 0
+    assert lt._monitor_byte_offset > 0
+    assert len(lt._segments) == 2
+    assert {"You", "Other"} == {s.speaker for s in lt._segments}

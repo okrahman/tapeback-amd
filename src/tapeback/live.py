@@ -224,7 +224,16 @@ class LiveTranscriber:
             )
 
     def _process_chunk(self) -> None:
-        """Read new audio from both channels, transcribe, update markdown."""
+        """Read new audio from both channels, transcribe, update markdown.
+
+        Both channels of one interval are transcribed as ONE backend transaction
+        (monitor first, see `_transcribe_pair`), so a Lemonade fallback triggered by
+        the second channel can never mix a Lemonade first channel with a faster-whisper
+        second channel in one interval. Byte cursors and accumulated segments are
+        committed atomically: a raise while transcribing leaves both cursors in place,
+        so the next cycle re-reads the same audio and recovers the interval instead of
+        silently dropping it.
+        """
         min_bytes = int(
             self._settings.live_min_chunk * self._settings.sample_rate * BYTES_PER_SAMPLE
         )
@@ -251,30 +260,36 @@ class LiveTranscriber:
             return
 
         transcriber = self._ensure_transcriber()
-        new_segments: list[Segment] = []
+        mic_segments: list[Segment] = []
+        monitor_segments: list[Segment] = []
 
-        if mic_pcm is not None:
-            mic_segs = self._transcribe_chunk(
+        if mic_pcm is not None and monitor_pcm is not None:
+            mic_segments, monitor_segments = self._transcribe_pair(
+                transcriber, mic_pcm, monitor_pcm, overlap_bytes
+            )
+        elif mic_pcm is not None:
+            mic_segments = self._transcribe_chunk(
                 transcriber, mic_pcm, self._mic_byte_offset, overlap_bytes, is_mic=True
             )
-            new_segments.extend(mic_segs)
-            self._mic_byte_offset = mic_new_offset
-
-        if monitor_pcm is not None:
-            monitor_segs = self._transcribe_chunk(
+        else:
+            monitor_segments = self._transcribe_chunk(
                 transcriber,
                 monitor_pcm,
                 self._monitor_byte_offset,
                 overlap_bytes,
                 is_mic=False,
             )
-            new_segments.extend(monitor_segs)
-            self._monitor_byte_offset = monitor_new_offset
 
-        if new_segments:
-            self._segments.extend(new_segments)
+        if mic_segments or monitor_segments:
+            self._segments.extend(mic_segments)
+            self._segments.extend(monitor_segments)
             self._segments.sort(key=lambda s: s.start)
 
+        # Commit both cursors only once the whole interval succeeded — never between
+        # the two channels, or an error in the second would skip the first's audio
+        # forever.
+        self._mic_byte_offset = mic_new_offset
+        self._monitor_byte_offset = monitor_new_offset
         self._write_live_markdown()
 
     def _read_new_pcm(
@@ -340,17 +355,76 @@ class LiveTranscriber:
         if len(samples_16k) == 0:
             return []
 
-        # Write temp WAV for faster-whisper
+        # Write temp WAV for the backend
         suffix = "mic" if is_mic else "monitor"
         chunk_path = self._mic_path.parent / f"chunk_{suffix}.wav"
         self._write_chunk_wav(samples_16k, chunk_path)
 
-        # Transcribe
-        segments, _info = transcriber.transcribe(chunk_path)
+        try:
+            # The temp WAV is ephemeral — it never outlives this call — so resume IO
+            # is disabled: storing an entry for a file that is deleted before it can
+            # ever be reused is pure waste (and risks key collisions across sessions).
+            segments, _info = transcriber.transcribe(chunk_path, use_resume=False)
+        finally:
+            chunk_path.unlink(missing_ok=True)
 
-        # Clean up temp file
-        chunk_path.unlink(missing_ok=True)
+        return self._finalize_segments(segments, byte_offset, overlap_bytes, is_mic=is_mic)
 
+    def _transcribe_pair(
+        self,
+        transcriber: Transcriber,
+        mic_pcm: bytes,
+        monitor_pcm: bytes,
+        overlap_bytes: int,
+    ) -> tuple[list[Segment], list[Segment]]:
+        """Transcribe one mic/monitor pair as ONE backend transaction.
+
+        The monitor channel goes first so its detected language is reused for the
+        gated mic — the mic is near silence while the user listens, so auto-detection
+        has almost nothing to work from. The facade treats the pair transactionally:
+        a Lemonade fallback on either channel retries BOTH through faster-whisper, so
+        one interval can never mix one Lemonade channel with one faster-whisper
+        channel. Both temp WAVs are ephemeral, so resume IO is disabled for the pair.
+        """
+        mic_samples_16k = resample_48k_to_16k(mic_pcm)
+        monitor_samples_16k = resample_48k_to_16k(monitor_pcm)
+        mic_path = self._mic_path.parent / "chunk_mic.wav"
+        monitor_path = self._mic_path.parent / "chunk_monitor.wav"
+        self._write_chunk_wav(mic_samples_16k, mic_path)
+        self._write_chunk_wav(monitor_samples_16k, monitor_path)
+
+        try:
+            mic_segments, monitor_segments, _info = transcriber.transcribe_stereo(
+                mic_path,
+                monitor_path,
+                use_resume=False,
+                skip_mic_on_monitor_partial=False,
+            )
+        finally:
+            mic_path.unlink(missing_ok=True)
+            monitor_path.unlink(missing_ok=True)
+
+        mic_segments = self._finalize_segments(
+            mic_segments, self._mic_byte_offset, overlap_bytes, is_mic=True
+        )
+        monitor_segments = self._finalize_segments(
+            monitor_segments, self._monitor_byte_offset, overlap_bytes, is_mic=False
+        )
+        return mic_segments, monitor_segments
+
+    def _finalize_segments(
+        self,
+        segments: list[Segment],
+        byte_offset: int,
+        overlap_bytes: int,
+        *,
+        is_mic: bool,
+    ) -> list[Segment]:
+        """Shift to absolute wall-clock time, assign the speaker, dedup the overlap.
+
+        Shared by the single-channel and pair paths so one interval's two channels
+        follow identical timeline/speaker/dedup rules.
+        """
         # Calculate absolute time offset
         read_start = max(0, byte_offset - overlap_bytes)
         chunk_start_seconds = read_start / (self._settings.sample_rate * BYTES_PER_SAMPLE)
@@ -373,9 +447,7 @@ class LiveTranscriber:
 
         # Deduplicate overlap with existing segments
         overlap_boundary = byte_offset / (self._settings.sample_rate * BYTES_PER_SAMPLE)
-        segments = deduplicate_overlap(self._segments, segments, overlap_boundary)
-
-        return segments
+        return deduplicate_overlap(self._segments, segments, overlap_boundary)
 
     @staticmethod
     def _write_chunk_wav(samples_16k: np.ndarray, path: Path) -> None:

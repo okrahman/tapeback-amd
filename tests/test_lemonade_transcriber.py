@@ -366,6 +366,132 @@ def test_stereo_resume_hit_skips_work_entirely(tmp_path, monkeypatch):
     assert [s.text for s in mic_segments] == ["text"]
 
 
+def test_stereo_mic_partial_still_commits_complete_monitor(tmp_path, monkeypatch):
+    """Interrupting the mic (second channel) must still save the completed monitor.
+
+    Regression: the all-or-none commit stored NEITHER channel when the mic came back
+    partial, so a re-run retranscribed the whole monitor — directly contradicting
+    _resume.py's contract that interrupting the second channel saves the first.
+    """
+    mic, monitor = _stereo(tmp_path)
+    ok = fw_result(["ok"])
+    partial = (fw_result(["half"])[0], {"language": "ru", "duration": 1.0, "partial": True})
+    transcriber, fw = _stereo_backend(tmp_path, monkeypatch, ok, partial)
+
+    mic_segments, monitor_segments, info = transcriber.transcribe_stereo(mic, monitor)
+
+    assert len(mic_segments) == 1
+    assert len(monitor_segments) == 1
+    assert info["partial"] is True
+    assert fw.transcribe.call_count == 0
+
+    resume_dir = tmp_path / "resume"
+    monitor_key = transcriber._resume_key(monitor, "transcribe monitor", "lemonade-fp")
+    mic_key = transcriber._resume_key(
+        mic, "transcribe mic", "lemonade-fp", transcriber._effective_language("ru")
+    )
+    assert monitor_key is not None and mic_key is not None
+    cached = _resume.load(monitor_key, resume_dir)
+    assert cached is not None
+    assert [s.text for s in cached[0]] == ["ok"]
+    assert _resume.load(mic_key, resume_dir) is None
+
+
+def test_fallback_stereo_mic_partial_still_commits_monitor(tmp_path, monkeypatch):
+    """The fallback path applies the same per-channel rule: a complete faster-whisper
+    monitor is cached even when the faster-whisper mic interrupts mid-fallback."""
+    mic, monitor = _stereo(tmp_path)
+    ok = fw_result(["lemonade-monitor"])
+    transcriber, fw = _stereo_backend(tmp_path, monkeypatch, ok, LemonadeModelError("x"))
+
+    partial = (fw_result(["fw-half"])[0], {"language": "ru", "duration": 1.0, "partial": True})
+    fw.transcribe.side_effect = [
+        fw_result(["fw-monitor"], language="ru"),
+        partial,
+    ]
+
+    _mic_segments, monitor_segments, info = transcriber.transcribe_stereo(mic, monitor)
+
+    assert info["partial"] is True
+    assert [s.text for s in monitor_segments] == ["fw-monitor"]
+
+    resume_dir = tmp_path / "resume"
+    monitor_key = transcriber._resume_key(monitor, "transcribe monitor", "fw-fingerprint")
+    mic_key = transcriber._resume_key(
+        mic, "transcribe mic", "fw-fingerprint", transcriber._effective_language("ru")
+    )
+    assert monitor_key is not None and mic_key is not None
+    cached = _resume.load(monitor_key, resume_dir)
+    assert cached is not None
+    assert [s.text for s in cached[0]] == ["fw-monitor"]
+    assert _resume.load(mic_key, resume_dir) is None
+
+
+def test_stereo_use_resume_false_skips_resume_io(tmp_path, monkeypatch):
+    """Live mode must not read or write resume entries for ephemeral chunk WAVs."""
+    mic, monitor = _stereo(tmp_path)
+    ok = fw_result(["text"])
+    transcriber, _fw = _stereo_backend(tmp_path, monkeypatch, ok, ok)
+
+    _mic_segments, _monitor_segments, info = transcriber.transcribe_stereo(
+        mic, monitor, use_resume=False
+    )
+
+    assert info["partial"] is False
+    assert list((tmp_path / "resume").glob("*.json")) == []
+
+    # Seeded entries are equally ignored: use_resume=False means read nothing either.
+    seed = fw_result(["cached"])
+    settings = lemon_settings(tmp_path)
+    probe = Transcriber.__new__(Transcriber)
+    probe._settings = settings
+    key = probe._resume_key(monitor, "transcribe monitor", "lemonade-fp")
+    assert key is not None
+    _resume.store(key, tmp_path / "resume", *seed)
+
+    backend = _backend_mock([ok, ok])
+    second = _install_backend(monkeypatch, backend, settings)
+    _mic_segments, monitor_segments, _info = second.transcribe_stereo(
+        mic, monitor, use_resume=False
+    )
+    assert [s.text for s in monitor_segments] == ["text"]  # NOT the seeded cache
+    assert backend.transcribe.call_count == 2
+    assert len(list((tmp_path / "resume").glob("*.json"))) == 1  # seed untouched
+
+
+def test_stereo_skip_mic_false_keeps_mic_on_monitor_partial(tmp_path, monkeypatch):
+    """Live mode must keep this interval's mic even when the monitor is interrupted —
+    an interrupted monitor in the background thread does not mean the user stopped."""
+    mic, monitor = _stereo(tmp_path)
+    partial = (fw_result(["half"])[0], {"language": "ru", "duration": 1.0, "partial": True})
+    ok = fw_result(["mic"])
+    transcriber, fw = _stereo_backend(tmp_path, monkeypatch, partial, ok)
+
+    mic_segments, monitor_segments, info = transcriber.transcribe_stereo(
+        mic, monitor, skip_mic_on_monitor_partial=False
+    )
+
+    assert len(monitor_segments) == 1
+    assert [s.text for s in mic_segments] == ["mic"]
+    assert info["partial"] is True  # an interrupted monitor still marks the run partial
+    assert fw.transcribe.call_count == 0
+
+    # The complete mic is cached; the partial monitor never is.
+    resume_dir = tmp_path / "resume"
+    entries = list(resume_dir.glob("*.json"))
+    assert len(entries) == 1
+    mic_key = transcriber._resume_key(
+        mic, "transcribe mic", "lemonade-fp", transcriber._effective_language("ru")
+    )
+    assert mic_key is not None
+    cached = _resume.load(mic_key, resume_dir)
+    assert cached is not None
+    assert [s.text for s in cached[0]] == ["mic"]
+    monitor_key = transcriber._resume_key(monitor, "transcribe monitor", "lemonade-fp")
+    assert monitor_key is not None
+    assert _resume.load(monitor_key, resume_dir) is None
+
+
 # --- lazy loading and misc facade behaviour ---
 
 

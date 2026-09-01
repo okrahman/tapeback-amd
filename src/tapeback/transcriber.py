@@ -21,7 +21,16 @@ configured backend with the faster-whisper backend for the **lifetime of this
 Transcriber**. A long-lived caller (live transcription) therefore never mixes
 one faster-whisper channel with a later Lemonade channel, never resubmits work
 to a Lemonade server that just timed out, and cannot see Lemonade "recover"
-mid-session into a mixed-backend transcript.
+mid-session into a mixed-backend transcript. `transcribe_stereo` goes further:
+the two channels of one run are one backend transaction, so a fallback on either
+channel retries **both** through faster-whisper — one run can never mix one
+Lemonade channel with one faster-whisper channel.
+
+Transactional storage is per channel, not all-or-none: a newly complete
+same-backend channel is cached even when its sibling is partial, so an
+interrupted run reuses everything it managed to finish. The only all-or-none
+invalidation is backend-mixing: a fallback discards every staged Lemonade
+result, and partial output is never cached.
 """
 
 from __future__ import annotations
@@ -85,6 +94,7 @@ class Transcriber:
         stage: str = "transcribe",
         on_status: Callable[[str], None] = _noop_status,
         language_override: str | None = None,
+        use_resume: bool = True,
     ) -> tuple[list[Segment], TranscriptionInfo]:
         """Transcribe one audio file through the configured backend.
 
@@ -96,11 +106,17 @@ class Transcriber:
         fallback-eligible Lemonade failure the whole input is retried through
         faster-whisper — and the facade latches to faster-whisper for the
         lifetime of this Transcriber — with only the accepted faster-whisper
-        result cached.
+        result cached. `use_resume=False` disables resume IO entirely; live mode
+        uses it for ephemeral chunk WAVs that are deleted before any cache entry
+        could ever be reused.
         """
         fingerprint = self._backend.cache_fingerprint()
         language_token = self._effective_language(language_override)
-        key = self._resume_key(audio_path, stage, fingerprint, language_token)
+        key = (
+            self._resume_key(audio_path, stage, fingerprint, language_token)
+            if use_resume
+            else None
+        )
         cached = self._load_resume(key, stage, on_status)
         if cached is not None:
             return cached
@@ -113,7 +129,9 @@ class Transcriber:
                 language_override=language_override,
             )
         except LemonadeFallbackError as exc:
-            return self._fallback_transcribe(audio_path, stage, on_status, language_override, exc)
+            return self._fallback_transcribe(
+                audio_path, stage, on_status, language_override, exc, use_resume=use_resume
+            )
 
         self._store_resume(key, segments, info)
         return segments, info
@@ -140,6 +158,8 @@ class Transcriber:
         on_status: Callable[[str], None],
         language_override: str | None,
         exc: LemonadeFallbackError,
+        *,
+        use_resume: bool = True,
     ) -> tuple[list[Segment], TranscriptionInfo]:
         """Resolve one channel through faster-whisper after an eligible Lemonade failure.
 
@@ -149,7 +169,8 @@ class Transcriber:
         The faster-whisper identity is recomputed here, not assumed: its device can
         resolve differently (VRAM, thermal clamp) from anything the Lemonade backend
         knew about. Only the result this run actually accepts gets cached, under the
-        faster-whisper fingerprint and the effective language.
+        faster-whisper fingerprint and the effective language — unless the caller
+        opted out of resume IO.
         """
         on_status(f"Lemonade transcription failed ({exc}) — falling back to faster-whisper.")
         fw = self._new_fw_backend()
@@ -161,11 +182,12 @@ class Transcriber:
             on_status=on_status,
             language_override=language_override,
         )
-        self._store_resume(
-            self._resume_key(audio_path, stage, fw.cache_fingerprint(), language_token),
-            segments,
-            info,
-        )
+        if use_resume:
+            self._store_resume(
+                self._resume_key(audio_path, stage, fw.cache_fingerprint(), language_token),
+                segments,
+                info,
+            )
         return segments, info
 
     def transcribe_stereo(
@@ -174,6 +196,8 @@ class Transcriber:
         monitor_16k: Path,
         *,
         on_status: Callable[[str], None] = _noop_status,
+        use_resume: bool = True,
+        skip_mic_on_monitor_partial: bool = True,
     ) -> tuple[list[Segment], list[Segment], TranscriptionInfo]:
         """Transcribe both channels as ONE backend transaction.
 
@@ -187,19 +211,28 @@ class Transcriber:
         guessed wrong often enough to produce notes labelled `language: en` whose text
         was Russian.
 
-        Transactional caching: resume entries may be READ before work starts, but any
-        newly generated channel result is staged in memory and committed only when
-        both channels complete. A partial run — interrupt, or a fallback to
-        faster-whisper — commits nothing, and the fallback discards every staged
-        Lemonade result before resolving both channels through faster-whisper, so a
-        mixed one-Lemonade-one-faster-whisper stereo result can never be returned or
-        cached. The mic cache is read only AFTER the monitor result establishes the
+        One backend transaction: if either channel hits a fallback-eligible Lemonade
+        failure, every staged Lemonade result is discarded and BOTH channels resolve
+        through faster-whisper — one Lemonade channel and one faster-whisper channel in
+        a single transcript is unrepresentable. Resume entries may be READ before work
+        starts; newly generated channel results are staged in memory, then committed PER
+        CHANNEL once both transcribe: a complete same-backend channel is cached even
+        when its sibling is partial (an interrupted run reuses finished work), while
+        partial output is never cached. `skip_mic_on_monitor_partial` mirrors the
+        offline Ctrl+C rule (stop, not "stop this channel"); live mode passes False
+        because an interrupted monitor in the background thread does not mean the user
+        stopped. `use_resume=False` disables resume IO for ephemeral inputs (live chunk
+        WAVs). The mic cache is read only AFTER the monitor result establishes the
         mic's effective language, because that language is part of the mic's resume
         identity.
         """
         fingerprint = self._backend.cache_fingerprint()
-        monitor_key = self._resume_key(
-            monitor_16k, "transcribe monitor", fingerprint, self._effective_language(None)
+        monitor_key = (
+            self._resume_key(
+                monitor_16k, "transcribe monitor", fingerprint, self._effective_language(None)
+            )
+            if use_resume
+            else None
         )
 
         # Resume reads happen up front; nothing is written until the transaction ends.
@@ -213,21 +246,34 @@ class Transcriber:
                         monitor_16k, stage="transcribe monitor", on_status=on_status
                     )
             except LemonadeFallbackError as exc:
-                return self._fallback_stereo(mic_16k, monitor_16k, on_status, exc)
+                return self._fallback_stereo(
+                    mic_16k,
+                    monitor_16k,
+                    on_status,
+                    exc,
+                    use_resume=use_resume,
+                    skip_mic_on_monitor_partial=skip_mic_on_monitor_partial,
+                )
             staged.append((monitor_key, *monitor_result))
 
         mic_partial = False
         mic_result: tuple[list[Segment], TranscriptionInfo] | None = None
-        if monitor_result[1].get("partial"):
+        if monitor_result[1].get("partial") and skip_mic_on_monitor_partial:
             # Ctrl+C means stop, not "stop this channel". Starting the second one would
-            # make the user interrupt twice; the monitor's work is already kept.
+            # make the user interrupt twice; the monitor's work is already kept. Live
+            # mode passes skip_mic_on_monitor_partial=False: an interrupted monitor in
+            # the background thread does not mean the user stopped.
             on_status("Skipping the mic channel — transcription was interrupted.")
             mic_partial = True
-        else:
+        if mic_result is None and not mic_partial:
             detected = monitor_result[1].get("language")
             mic_language = str(detected) if detected else None
-            mic_key = self._resume_key(
-                mic_16k, "transcribe mic", fingerprint, self._effective_language(mic_language)
+            mic_key = (
+                self._resume_key(
+                    mic_16k, "transcribe mic", fingerprint, self._effective_language(mic_language)
+                )
+                if use_resume
+                else None
             )
             mic_result = self._load_resume(mic_key, "transcribe mic", on_status)
             if mic_result is None:
@@ -241,18 +287,27 @@ class Transcriber:
                             language_override=mic_language,
                         )
                 except LemonadeFallbackError as exc:
-                    return self._fallback_stereo(mic_16k, monitor_16k, on_status, exc)
+                    return self._fallback_stereo(
+                        mic_16k,
+                        monitor_16k,
+                        on_status,
+                        exc,
+                        use_resume=use_resume,
+                        skip_mic_on_monitor_partial=skip_mic_on_monitor_partial,
+                    )
                 staged.append((mic_key, *mic_result))
 
         mic_segments, monitor_segments, info = self._assemble_stereo(
             mic_result, monitor_result, mic_partial
         )
 
-        # Commit only a complete transaction: a partial run abandons everything it
-        # staged, so a truncated result can never masquerade as a finished channel.
-        if not info.get("partial"):
-            for key, segs, channel_info in staged:
-                self._store_resume(key, segs, channel_info)
+        # Per-channel commit: a complete same-backend channel is cached even when its
+        # sibling was interrupted, so a re-run never redoes finished work. Partial
+        # output is never cached (see _store_resume). The only all-or-none invalidation
+        # is backend-mixing, handled above by _fallback_stereo discarding staged
+        # Lemonade results.
+        for key, segs, channel_info in staged:
+            self._store_resume(key, segs, channel_info)
         return mic_segments, monitor_segments, info
 
     def _fallback_stereo(
@@ -261,13 +316,18 @@ class Transcriber:
         monitor_16k: Path,
         on_status: Callable[[str], None],
         exc: LemonadeFallbackError,
+        *,
+        use_resume: bool = True,
+        skip_mic_on_monitor_partial: bool = True,
     ) -> tuple[list[Segment], list[Segment], TranscriptionInfo]:
         """Discard all staged Lemonade output and resolve BOTH channels on faster-whisper.
 
         Both channels, even ones Lemonade already finished: returning one Lemonade
         channel and one faster-whisper channel would mix decoders inside one
-        transcript. Staged faster-whisper results commit only once both channels
-        complete, under faster-whisper fingerprints. This also LATCHES the facade
+        transcript. Once transcribes finish, staged faster-whisper results commit PER
+        CHANNEL (partial output is never cached, a complete sibling is), under
+        faster-whisper fingerprints. `use_resume` and `skip_mic_on_monitor_partial`
+        behave exactly as in `transcribe_stereo`. This also LATCHES the facade
         to faster-whisper for the lifetime of the Transcriber.
         """
         on_status(
@@ -277,8 +337,12 @@ class Transcriber:
         fw = self._new_fw_backend()
         self._backend = fw
         fw_fingerprint = fw.cache_fingerprint()
-        monitor_key = self._resume_key(
-            monitor_16k, "transcribe monitor", fw_fingerprint, self._effective_language(None)
+        monitor_key = (
+            self._resume_key(
+                monitor_16k, "transcribe monitor", fw_fingerprint, self._effective_language(None)
+            )
+            if use_resume
+            else None
         )
         staged: list[tuple[_resume.ResumeKey | None, list[Segment], TranscriptionInfo]] = []
 
@@ -290,18 +354,25 @@ class Transcriber:
                 )
             staged.append((monitor_key, *monitor_result))
 
-        mic_partial = bool(monitor_result[1].get("partial"))
-        mic_result = None
-        if mic_partial:
+        mic_partial = False
+        mic_result: tuple[list[Segment], TranscriptionInfo] | None = None
+        if monitor_result[1].get("partial") and skip_mic_on_monitor_partial:
+            # Same rule as transcribe_stereo: live mode keeps its mic even when the
+            # monitor was interrupted inside this interval.
             on_status("Skipping the mic channel — transcription was interrupted.")
-        else:
+            mic_partial = True
+        if mic_result is None and not mic_partial:
             detected = monitor_result[1].get("language")
             mic_language = str(detected) if detected else None
-            mic_key = self._resume_key(
-                mic_16k,
-                "transcribe mic",
-                fw_fingerprint,
-                self._effective_language(mic_language),
+            mic_key = (
+                self._resume_key(
+                    mic_16k,
+                    "transcribe mic",
+                    fw_fingerprint,
+                    self._effective_language(mic_language),
+                )
+                if use_resume
+                else None
             )
             mic_result = self._load_resume(mic_key, "transcribe mic", on_status)
             if mic_result is None:
@@ -318,9 +389,10 @@ class Transcriber:
         mic_segments, monitor_segments, info = self._assemble_stereo(
             mic_result, monitor_result, mic_partial
         )
-        if not info.get("partial"):
-            for key, segs, channel_info in staged:
-                self._store_resume(key, segs, channel_info)
+        # Per-channel commit — same rule as transcribe_stereo: partial output is never
+        # cached, but a complete same-backend sibling is.
+        for key, segs, channel_info in staged:
+            self._store_resume(key, segs, channel_info)
         return mic_segments, monitor_segments, info
 
     def _assemble_stereo(
