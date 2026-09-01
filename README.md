@@ -224,7 +224,8 @@ What the backend does with your audio:
 Fallback, and what never falls back: when the server is unreachable, the model is
 missing or unloadable, the endpoint cannot serve timestamped segments (including
 text-only FLM-style backends — tapeback requires segment timestamps and rejects
-compact text output in full), or a request times out, the run switches to
+compact text output in full), or a request times out (a proxy/server `408 Request
+Timeout` counts as one), the run switches to
 faster-whisper for that input and caches only the accepted result. Authentication
 rejections (401/403) and locally invalid configuration (bad URL, malformed key)
 do **not** fall back — retrying with another backend cannot fix them, so they fail
@@ -439,7 +440,7 @@ All settings via environment variables (prefix `TAPEBACK_`) or
 | `TAPEBACK_LEMONADE_URL` | `http://127.0.0.1:13305` | Lemonade Server base URL. Must be a bare URL — no embedded credentials (`user:pass@host`), query string, or fragment. Plaintext `http://` is allowed only for loopback hosts (`localhost`, `127.0.0.0/8`, `::1`); remote endpoints must use `https://` (Lemonade backend only) |
 | `TAPEBACK_LEMONADE_MODEL` | `Whisper-Large-v3-Turbo` | Model identifier as the server knows it (Lemonade backend only) |
 | `TAPEBACK_LEMONADE_API_KEY` | *(off)* | Optional bearer token; sent only in the `Authorization` header, never logged or cached (Lemonade backend only) |
-| `TAPEBACK_LEMONADE_TIMEOUT_SECONDS` | `600` | Per-request read timeout. Hitting it falls back to faster-whisper rather than resubmitting (Lemonade backend only) |
+| `TAPEBACK_LEMONADE_TIMEOUT_SECONDS` | `600` | Total end-to-end request deadline — connect, upload, and every response read share one budget, each blocking operation getting the remaining time. Hitting it falls back to faster-whisper rather than resubmitting. Live transcription caps requests at 45 s so stopping can never return with a request still in flight (Lemonade backend only) |
 | `TAPEBACK_LEMONADE_DIAGNOSTICS_TIMEOUT_SECONDS` | `10` | Per-request timeout for the `tapeback status` health/system-info probes only — deliberately short so a stalled endpoint cannot hang status for minutes. Transcription keeps the generous inference timeout above (Lemonade backend only) |
 | `TAPEBACK_LEMONADE_CHUNK_SECONDS` | `300` | Tapeback's own conservative chunk duration for long WAVs (0 < value ≤ 3600) — bounded memory and reportable progress, not a server limit. Changing it (or the overlap) invalidates Lemonade resume-cache entries (Lemonade backend only) |
 | `TAPEBACK_LEMONADE_OVERLAP_SECONDS` | `2.0` | Contextual overlap prepended to each chunk after the first, deduplicated against the previous chunk's core interval. Must be smaller than the chunk duration (Lemonade backend only) |
@@ -480,6 +481,12 @@ All settings via environment variables (prefix `TAPEBACK_`) or
 | `TAPEBACK_LIVE_INTERVAL` | `60` | Seconds between transcription cycles |
 | `TAPEBACK_LIVE_OVERLAP` | `2.0` | Seconds of overlap between chunks |
 | `TAPEBACK_LIVE_MIN_CHUNK` | `5.0` | Minimum new audio (seconds) to trigger transcription |
+
+`stop()` is a hard lifecycle boundary: when it returns, the live worker is verifiably
+dead — no further request can be issued and no live note can be written afterwards.
+With the Lemonade backend, live requests are additionally capped at 45 s (well under
+the general inference timeout; a live interval is one small pair transaction), so a
+stalled request can never outlast the shutdown wait.
 
 ### Audio
 
@@ -675,9 +682,10 @@ message means, by cause:
   Tapeback needs segment timestamps for speaker labelling and timing, so compact,
   text-only responses (FLM-style backends included) are rejected in full and the run
   falls back. Point `TAPEBACK_LEMONADE_MODEL` at a Whisper model on the server.
-- **Inference timeout** — a request outlived `TAPEBACK_LEMONADE_TIMEOUT_SECONDS`. The
-  chunk is *not* resubmitted (the server may still be working on it); the run falls
-  back immediately. Raise the timeout only if the server is legitimately slow.
+- **Inference timeout** — a request outlived `TAPEBACK_LEMONADE_TIMEOUT_SECONDS`, or the
+  server/proxy answered `408 Request Timeout`. The chunk is *not* resubmitted (the
+  server may still be working on it); the run falls back immediately. Raise the
+  timeout only if the server is legitimately slow.
 
 Falling back is per-run and results are cached under the backend that produced them,
 so a Lemonade result is never reused as a faster-whisper one or the reverse.
