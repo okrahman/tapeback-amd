@@ -123,9 +123,7 @@ def test_interrupt_in_the_first_channel_skips_the_second(settings, gpu_ready):
     assert instance.transcribe.call_count == 1
 
 
-def test_interrupt_in_second_channel_commits_monitor_resume_entry(
-    settings, gpu_ready, tmp_path
-):
+def test_interrupt_in_second_channel_commits_monitor_resume_entry(settings, gpu_ready, tmp_path):
     """A complete monitor must be cached even though the mic (second channel)
     interrupted, so a re-run reuses it and only redoes the mic.
 

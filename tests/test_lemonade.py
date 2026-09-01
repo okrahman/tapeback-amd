@@ -809,12 +809,40 @@ def test_oversized_non_wav_input_is_refused_not_buffered(tmp_path, monkeypatch):
     big = tmp_path / "raw.bin"
     big.write_bytes(b"\x00" * 4096)
     monkeypatch.setattr(lemon, "_MAX_CHUNK_BYTES", 1024)
+    monkeypatch.setattr(lemon, "_REQUEST_OVERHEAD_BYTES", 128)
     calls = install_urlopen(monkeypatch, [verbose_json([seg(0.0, 0.4)])])
 
-    with pytest.raises(LemonadeCapabilityError):
+    with pytest.raises(LemonadeCapabilityError) as excinfo:
         LemonadeBackend(lemon_settings(tmp_path)).transcribe(big)
 
+    assert "single-request cap (896 bytes)" in str(excinfo.value)
     assert calls == []
+
+
+def test_non_wav_input_respects_request_overhead_reservation(tmp_path, monkeypatch):
+    """Non-chunkable inputs reserve _REQUEST_OVERHEAD_BYTES from _MAX_CHUNK_BYTES."""
+    max_chunk = 2048
+    overhead = 512
+    max_payload = max_chunk - overhead
+
+    monkeypatch.setattr(lemon, "_MAX_CHUNK_BYTES", max_chunk)
+    monkeypatch.setattr(lemon, "_REQUEST_OVERHEAD_BYTES", overhead)
+
+    # Payload exactly at max_payload is accepted
+    fit = tmp_path / "fit.bin"
+    fit.write_bytes(b"\x00" * max_payload)
+    calls = install_urlopen(monkeypatch, [verbose_json([seg(0.0, 0.4)])])
+    segments, _info = LemonadeBackend(lemon_settings(tmp_path)).transcribe(fit)
+    assert len(segments) == 1
+    assert len(calls) == 1
+
+    # Payload 1 byte over max_payload is refused before upload
+    too_big = tmp_path / "too_big.bin"
+    too_big.write_bytes(b"\x00" * (max_payload + 1))
+    calls_too_big = install_urlopen(monkeypatch, [verbose_json([seg(0.0, 0.4)])])
+    with pytest.raises(LemonadeCapabilityError):
+        LemonadeBackend(lemon_settings(tmp_path)).transcribe(too_big)
+    assert calls_too_big == []
 
 
 def test_too_many_chunks_is_a_configuration_error(tmp_path, monkeypatch):
@@ -1117,10 +1145,22 @@ def test_real_server_redirect_is_never_followed(tmp_path):
     urllib's default handler followed a 302, converted the POST to a GET, and
     kept the bearer header on the server-chosen target.
     """
-    victim_requests: list[tuple[str, str | None]] = []
+    victim_requests: list[tuple[str, str, str | None]] = []
     redirector_requests: list[tuple[str, str | None]] = []
 
-    victim = HTTPServer(("127.0.0.1", 0), BaseHTTPRequestHandler)
+    class _Victim(BaseHTTPRequestHandler):
+        def _respond(self) -> None:
+            victim_requests.append((self.command, self.path, self.headers.get("Authorization")))
+            self.send_response(200)
+            self.end_headers()
+
+        do_POST = _respond
+        do_GET = _respond
+
+        def log_message(self, format: str, *args: object) -> None:  # silence test output
+            pass
+
+    victim = HTTPServer(("127.0.0.1", 0), _Victim)
 
     class _Redirector(BaseHTTPRequestHandler):
         def _respond(self) -> None:

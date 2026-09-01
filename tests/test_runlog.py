@@ -11,6 +11,7 @@ from tapeback._runlog import (
     RunLog,
     _prune_old_records,
     default_run_log_dir,
+    redact_text,
     run_log,
     write_run_log,
 )
@@ -238,3 +239,50 @@ def test_run_log_without_secrets_behaves_as_before(tmp_path):
 
     record = _read_only_record(tmp_path / "runs")
     assert record["events"] == ["Stage 'merge' took 1.0s"]
+
+
+def test_redact_text_overlapping_secrets_longest_first():
+    """Prefix and suffix overlapping secrets must be fully redacted without leaving fragments."""
+    # Prefix overlap: "sk-live" is a prefix of "sk-live-prod"
+    redactions = ("sk-live", "sk-live-prod")
+    text = "Authorization: Bearer sk-live-prod then sk-live"
+    assert redact_text(text, redactions) == "Authorization: Bearer [redacted] then [redacted]"
+
+    # Suffix overlap: "secret" is a suffix of "super-secret"
+    redactions = ("secret", "super-secret")
+    text = "got super-secret and secret"
+    assert redact_text(text, redactions) == "got [redacted] and [redacted]"
+
+    # Infix / substring overlap + duplicate entries
+    redactions = ("key", "my-key-prod", "key", "")
+    text = "tokens: my-key-prod, key"
+    assert redact_text(text, redactions) == "tokens: [redacted], [redacted]"
+
+
+def test_run_log_redacts_overlapping_secrets_in_events_and_error(tmp_path):
+    """Overlapping configured keys in Settings must not leave reconstructable
+    fragments in events or errors.
+    """
+    settings = Settings(
+        vault_path=tmp_path / "vault",
+        run_log_dir=tmp_path / "runs",
+        lemonade_api_key=SecretStr("sk-live"),
+        hf_token=SecretStr("sk-live-prod"),
+        llm_api_key=SecretStr("sk-live-prod-extended"),
+    )
+
+    with (
+        pytest.raises(RuntimeError),
+        run_log("session", settings, lambda _m: None) as report,
+    ):
+        report("Event with sk-live-prod-extended and sk-live-prod and sk-live")
+        raise RuntimeError("Failed on sk-live-prod-extended with sk-live prefix")
+
+    record = _read_only_record(tmp_path / "runs")
+    raw = json.dumps(record)
+
+    assert "sk-live" not in raw
+    assert "-prod" not in raw
+    assert "-extended" not in raw
+    assert record["events"] == ["Event with [redacted] and [redacted] and [redacted]"]
+    assert record["error"] == "RuntimeError: Failed on [redacted] with [redacted] prefix"

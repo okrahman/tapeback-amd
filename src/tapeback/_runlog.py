@@ -73,11 +73,15 @@ def redact_text(text: str, redactions: tuple[str, ...] = ()) -> str:
     by remote-facing backends and error messages are influenced by remote error
     bodies, so a reflected credential must not survive the write even if an
     upstream sanitizer missed it.
+
+    Secrets are deduplicated and sorted longest-first so that overlapping keys
+    (e.g., prefix or suffix matches) are replaced completely rather than leaving
+    reconstructable fragments.
     """
     out = _CONTROL_CHARS_RE.sub("", text)
-    for secret in redactions:
-        if secret:
-            out = out.replace(secret, _REDACTED_LABEL)
+    unique_secrets = sorted({secret for secret in redactions if secret}, key=len, reverse=True)
+    for secret in unique_secrets:
+        out = out.replace(secret, _REDACTED_LABEL)
     return out
 
 

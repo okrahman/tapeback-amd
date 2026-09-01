@@ -1145,10 +1145,11 @@ class LemonadeBackend:
                 # non-chunkable input is refused here and can fall back to
                 # faster-whisper, which decodes formats the chunker cannot.
                 size = audio_path.stat().st_size
-                if size > _MAX_CHUNK_BYTES:
+                max_payload_bytes = _MAX_CHUNK_BYTES - _REQUEST_OVERHEAD_BYTES
+                if size > max_payload_bytes:
                     raise LemonadeCapabilityError(
                         f"Input is not a chunkable WAV and at {size} bytes exceeds "
-                        f"the single-request cap ({_MAX_CHUNK_BYTES} bytes) — refusing "
+                        f"the single-request cap ({max_payload_bytes} bytes) — refusing "
                         "to buffer it for upload."
                     )
                 on_status(f"  {stage}: single request (file is not a chunkable WAV)")

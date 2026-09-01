@@ -84,6 +84,7 @@ def _install_urlopen(monkeypatch, bodies: list[object]) -> list[object]:
     monkeypatch.setattr("tapeback._lemonade._NO_PROXY_OPENER", _FakeOpener())
     return calls
 
+
 # --- find_data_offset ---
 
 
@@ -438,9 +439,7 @@ def test_live_mic_timeout_latches_and_never_resubmits_to_lemonade(tmp_path, tmp_
     assert texts and all(t == "fw text" for t in texts)  # both channels came from fw
 
 
-def test_live_second_channel_fallback_leaves_no_mixed_interval(
-    tmp_path, tmp_vault, monkeypatch
-):
+def test_live_second_channel_fallback_leaves_no_mixed_interval(tmp_path, tmp_vault, monkeypatch):
     """A fallback on an interval's SECOND channel must not commit a Lemonade first
     channel beside faster-whisper output.
 
@@ -527,9 +526,7 @@ def test_live_channel_error_rolls_back_both_cursors(tmp_path, tmp_vault, monkeyp
     assert lt._segments == []
 
     # The server recovers: the same interval is re-read and nothing was lost.
-    _install_urlopen(
-        monkeypatch, [_lemon_verbose_json("monitor"), _lemon_verbose_json("mic")]
-    )
+    _install_urlopen(monkeypatch, [_lemon_verbose_json("monitor"), _lemon_verbose_json("mic")])
     lt._process_chunk()
 
     assert lt._mic_byte_offset > 0
