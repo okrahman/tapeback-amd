@@ -38,6 +38,8 @@ from __future__ import annotations
 import hashlib
 import ipaddress
 import json
+import math
+import re
 import struct
 import urllib.error
 import urllib.parse
@@ -122,6 +124,17 @@ _MAX_CHUNKS = 1000
 # trusted with audio, not with the client's memory: this bounds what a broken or
 # hostile server can make tapeback buffer before parsing.
 _MAX_RESPONSE_BYTES = 4 * 1024 * 1024
+
+# The multipart part name under which audio is uploaded. Always opaque: the source
+# filename is attacker-influencable in principle (POSIX names may contain quotes
+# and newlines, which would be interpolated into a MIME header verbatim) and
+# discloses local metadata the server has no use for. The content is always
+# declared audio/wav, so the fixed name matches every request we send.
+_UPLOAD_FILENAME = "audio.wav"
+
+# Slack allowed on segment/word timestamps past a chunk's audio length before the
+# response is rejected, to absorb server-side rounding at chunk boundaries.
+_TIMESTAMP_SLACK_SECONDS = 1.0
 
 # Whisper's own language names (what a server echoing Whisper metadata returns)
 # mapped to ISO-639-1 codes. Anything already a two-letter code passes through.
@@ -239,14 +252,37 @@ def _noop_status(_message: str) -> None:
     """The Lemonade model is missing, invalid, unavailable, rejected or unloadable."""
 
 
-# Text fragments (lowercased) in a structured error body that mean "credentials" —
-# checked on every status, because a proxy can answer 404 to an auth problem and a
-# server can put an auth code in a 400.
-_AUTH_MARKERS = ("auth", "unauthorized", "forbidden", "permission", "api key", "api_key", "apikey")
+# Auth phrases matched against the *structured* error fields (type/code), which
+# the server's own code path authored — these may be read broadly. They are
+# matched as whole tokens after tokenization, never as substrings.
+_STRUCTURED_AUTH_PHRASES = (
+    "auth",
+    "unauthorized",
+    "forbidden",
+    "authentication",
+    "not authorized",
+    "permission denied",
+    "insufficient permission",
+    "access denied",
+    "api key",
+    "apikey",
+)
 
-# Any mention of "model" in the structured body means a model problem, not an endpoint
-# problem. This is what disambiguates the two meanings of a bare 404.
-_MODEL_MARKER = "model"
+# Auth phrases matched against the free-text *message*. Deliberately narrow and
+# always token-aware: unanchored substring matching turned "model author not
+# found" (contains "auth") and "permission denied loading model" (contains
+# "permission") into authentication errors, disabling fallback for ordinary
+# model/server failures.
+_MESSAGE_AUTH_PHRASES = (
+    "unauthorized",
+    "authentication",
+    "not authorized",
+    "invalid api key",
+    "missing api key",
+    "api key",
+    "access denied",
+    "forbidden",
+)
 
 # Statuses the classifier reasons about by name.
 _HTTP_UNAUTHORIZED = 401
@@ -255,6 +291,9 @@ _HTTP_NOT_FOUND = 404
 _HTTP_BAD_REQUEST = 400
 _HTTP_TOO_MANY_REQUESTS = 429
 _HTTP_INTERNAL_ERROR = 500
+
+# Default ports are dropped from the normalized base URL.
+_HTTP_DEFAULT_PORTS = {"http": 80, "https": 443}
 
 
 def _error_fields(payload: Any) -> tuple[str, str, str]:
@@ -287,23 +326,68 @@ def _error_fields(payload: Any) -> tuple[str, str, str]:
     return "", "", str(payload.get("message") or "")
 
 
+def _tokens(text: str) -> list[str]:
+    """Lowercased alphanumeric tokens: \"model author not found\" -> [model, author, ...].
+
+    Underscores and other separators split too, so a structured code such as
+    ``invalid_api_key`` tokenizes to [invalid, api, key].
+    """
+    return [token for token in re.split(r"[^a-z0-9]+", text.lower()) if token]
+
+
+def _has_phrase(tokens: list[str], phrase: str) -> bool:
+    """Whether the token list contains ``phrase`` as consecutive whole tokens.
+
+    Token-aware, never substring-based: "auth" cannot match inside "author" and
+    "permission" cannot match inside "permissions granted to load the model".
+    """
+    parts = phrase.split()
+    span = len(parts)
+    return any(tokens[i : i + span] == parts for i in range(len(tokens) - span + 1))
+
+
+def _is_auth_failure(status: int, structured_tokens: list[str], message_tokens: list[str]) -> bool:
+    """Whether the response means "credentials", decided in trust order.
+
+    The status and the structured type/code fields decide first; a model mention
+    in the body outranks incidental auth wording in the free-text message, so
+    "permission denied loading model" stays a model failure that falls back.
+    """
+    if status in (_HTTP_UNAUTHORIZED, _HTTP_FORBIDDEN):
+        return True
+    if any(_has_phrase(structured_tokens, phrase) for phrase in _STRUCTURED_AUTH_PHRASES):
+        return True
+    if "model" in structured_tokens or "model" in message_tokens:
+        return False
+    return any(_has_phrase(message_tokens, phrase) for phrase in _MESSAGE_AUTH_PHRASES)
+
+
 def classify_http_failure(status: int, payload: Any) -> LemonadeError:
     """Map an HTTP error response to the deliberate exception hierarchy.
 
-    Status alone never decides: a 404 is a missing endpoint for one server and a
-    missing model for another, so the structured body is read first and the status
-    only breaks ties.
+    Decision order, from most to least trustworthy:
+
+    1. The status itself for 401/403 — those statuses mean credentials, period.
+    2. The structured ``type``/``code`` fields (machine-authored, read broadly,
+       token-aware) for auth phrases — a proxy can answer 404 to an auth problem
+       and a server can put an auth code in a 400.
+    3. Model semantics: a token-wise "model" mention. This comes before any
+       free-text auth matching, so "permission denied loading model" or
+       "model author not found" on a 500 is a model failure that falls back,
+       not a credential failure that aborts the run.
+    4. A narrow, token-aware auth phrase list against the free-text message.
+    5. Status semantics: 429/5xx are server failures, a bare 404 is a missing
+       endpoint, other 4xx are locally invalid requests.
     """
     error_type, error_code, message = _error_fields(payload)
-    blob = f"{error_type} {error_code} {message}".lower()
+    structured_tokens = _tokens(f"{error_type} {error_code}")
+    message_tokens = _tokens(message)
 
-    if status in (_HTTP_UNAUTHORIZED, _HTTP_FORBIDDEN) or any(
-        marker in blob for marker in _AUTH_MARKERS
-    ):
+    if _is_auth_failure(status, structured_tokens, message_tokens):
         return LemonadeAuthenticationError(
             f"Lemonade rejected the credentials (HTTP {status}): {message or error_code}"
         )
-    if _MODEL_MARKER in blob:
+    if "model" in structured_tokens or "model" in message_tokens:
         return LemonadeModelError(
             f"Lemonade cannot serve the model (HTTP {status}): {error_code or message}"
         )
@@ -333,8 +417,19 @@ def _multipart_body(
     content_type: str,
     data: bytes,
 ) -> tuple[bytes, str]:
-    """Encode a multipart/form-data body. Small, standard, and dependency-free."""
+    """Encode a multipart/form-data body. Small, standard, and dependency-free.
+
+    Field values are interpolated into MIME headers, so a value carrying a quote
+    or CRLF cannot be allowed through — it would inject part headers. The audio
+    part's name is always the fixed opaque `_UPLOAD_FILENAME`.
+    """
     boundary = f"tapeback-{uuid.uuid4().hex}"
+    for _name, value in fields:
+        if any(ch in value for ch in '"\r\n'):
+            raise LemonadeConfigurationError(
+                "A Lemonade request field contains a character that cannot appear "
+                "in a multipart header (quote or CR/LF)."
+            )
     parts: list[bytes] = []
     for name, value in fields:
         parts.extend(
@@ -366,9 +461,7 @@ def _multipart_body(
 _NO_PROXY_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
-def _open_url(
-    request: urllib.request.Request, timeout: float, *, bypass_proxies: bool
-) -> Any:
+def _open_url(request: urllib.request.Request, timeout: float, *, bypass_proxies: bool) -> Any:
     """Open one URL, bypassing the inherited proxy configuration for loopback."""
     if bypass_proxies:
         return _NO_PROXY_OPENER.open(request, timeout=timeout)
@@ -499,9 +592,7 @@ def _plan_chunks(
     frame_bytes = max(1, channels * sampwidth)
     frames_per_duration = int(settings.lemonade_chunk_seconds * framerate)
     overlap = int(settings.lemonade_overlap_seconds * framerate)
-    frames_per_bytes = max(
-        1, (_MAX_CHUNK_BYTES - _REQUEST_OVERHEAD_BYTES) // frame_bytes - overlap
-    )
+    frames_per_bytes = max(1, (_MAX_CHUNK_BYTES - _REQUEST_OVERHEAD_BYTES) // frame_bytes - overlap)
     step = max(1, min(frames_per_duration, frames_per_bytes))
     total = max(1, -(-n_frames // step))  # ceil division
     if total > _MAX_CHUNKS:
@@ -542,12 +633,32 @@ def _normalize_base_url(raw: str) -> str:
     HTTP offers an on-path observer both. Plain ``http://`` is allowed only for
     a strictly recognized loopback host, where the threat model is local and the
     default local-server setup keeps working.
+
+    Structural rule: the URL is rebuilt from its validated components, never
+    passed through. Userinfo (``https://user:pass@host``) is rejected outright —
+    it would otherwise be retained and printed by ``tapeback status`` — and query
+    strings and fragments are rejected because the base URL is kept verbatim while
+    ``/v1/audio/transcriptions`` is appended, which would misroute the request to
+    a path the operator never configured. Scheme and hostname are lowercased, a
+    default port (80/443) is dropped, and a trailing slash is removed.
     """
     candidate = raw.strip()
     parsed = urllib.parse.urlparse(candidate)
     if parsed.scheme not in ("http", "https") or not parsed.hostname:
         raise LemonadeConfigurationError(
             f"TAPEBACK_LEMONADE_URL is not a valid http(s) URL: {raw!r}"
+        )
+    if parsed.username is not None or parsed.password is not None:
+        raise LemonadeConfigurationError(
+            "TAPEBACK_LEMONADE_URL must not embed credentials (user:password@host): "
+            "they would be displayed by status and kept in the configured URL. Pass "
+            "the token with TAPEBACK_LEMONADE_API_KEY instead."
+        )
+    if parsed.query or parsed.fragment:
+        raise LemonadeConfigurationError(
+            "TAPEBACK_LEMONADE_URL must be a bare base URL: query strings and "
+            "fragments are kept while '/v1/audio/transcriptions' is appended, so "
+            "the request could target a path you never configured."
         )
     if parsed.scheme == "http" and not _is_loopback_host(parsed.hostname):
         raise LemonadeConfigurationError(
@@ -556,26 +667,79 @@ def _normalize_base_url(raw: str) -> str:
             "travel unprotected. Use https:// for remote servers (plain http is "
             "allowed only for localhost, 127.0.0.0/8 and ::1)."
         )
-    return candidate.rstrip("/")
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise LemonadeConfigurationError(
+            f"TAPEBACK_LEMONADE_URL has an invalid port: {raw!r}"
+        ) from exc
+    scheme = parsed.scheme.lower()
+    host = parsed.hostname.lower()
+    if port is not None and port == _HTTP_DEFAULT_PORTS.get(scheme):
+        port = None
+    host_part = f"[{host}]" if ":" in host else host
+    netloc = host_part if port is None else f"{host_part}:{port}"
+    return urllib.parse.urlunsplit((scheme, netloc, parsed.path.rstrip("/"), "", ""))
 
 
-def _require_segments(payload: dict[str, Any]) -> list[dict[str, Any]]:
+def _finite_number(value: Any) -> float | None:
+    """The value as a finite float, or None when it is not one.
+
+    Booleans are ``int`` in Python but are never numbers in a JSON schema; NaN
+    and infinities pass naive ``isinstance`` checks and then poison sorting,
+    duration arithmetic, and every timestamp persisted into the resume cache.
+    All three are rejected here, once, for every numeric field of a response.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    number = float(value)
+    if not math.isfinite(number):
+        return None
+    return number
+
+
+def _usable_timestamp(value: Any, name: str) -> float:
+    """A finite, non-negative timestamp, or a sanitized capability error."""
+    number = _finite_number(value)
+    if number is None or number < 0.0:
+        raise LemonadeCapabilityError(
+            f"Lemonade returned a response with an unusable {name} "
+            "(missing, not a number, boolean, non-finite, or negative)"
+        )
+    return number
+
+
+def _require_segments(
+    payload: dict[str, Any], upper_bound: float | None = None
+) -> list[dict[str, Any]]:
     """Return the payload's timestamped segments, or reject the response outright.
 
     Tapeback's pipeline needs segment timestamps for speaker labelling and vault
     timing, so a text-only response is unusable even when the prose is good. This is
     where FLM-style compact responses are rejected in full.
+
+    Every timestamp is strictly validated (finite number, ``0 <= start <= end``),
+    and when ``upper_bound`` is given (a chunk's audio length) an ``end`` beyond it
+    — modulo a small boundary slack — is also rejected: a hostile or broken server
+    must not be able to write timestamps past the recording into the transcript or
+    the resume cache.
     """
     raw = payload.get("segments")
     if isinstance(raw, list) and raw:
         for item in raw:
-            if (
-                not isinstance(item, dict)
-                or not isinstance(item.get("start"), (int, float))
-                or not isinstance(item.get("end"), (int, float))
-            ):
+            if not isinstance(item, dict):
                 raise LemonadeCapabilityError(
                     "Lemonade returned segments without usable timestamps"
+                )
+            start = _usable_timestamp(item.get("start"), "segment start")
+            end = _usable_timestamp(item.get("end"), "segment end")
+            if end < start:
+                raise LemonadeCapabilityError(
+                    "Lemonade returned a segment whose end precedes its start"
+                )
+            if upper_bound is not None and end > upper_bound + _TIMESTAMP_SLACK_SECONDS:
+                raise LemonadeCapabilityError(
+                    "Lemonade returned a segment ending past the audio it was sent"
                 )
         return raw
     text = str(payload.get("text") or "")
@@ -589,22 +753,37 @@ def _require_segments(payload: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def _convert_words(raw_words: Any, offset: float) -> list[Word]:
-    """Convert a response segment's word list, shifted into file-relative time."""
+    """Convert a response segment's word list, shifted into file-relative time.
+
+    Word timestamps and probabilities are validated as strictly as segments: a
+    boolean/NaN/negative timestamp or a probability outside [0, 1] — including
+    one the server sent as a string — is a schema failure and rejects the whole
+    response as a LemonadeCapabilityError, never a ValueError escaping the
+    hierarchy or a fabricated default silently recorded.
+    """
     words: list[Word] = []
     if not isinstance(raw_words, list):
         return words
     for raw in raw_words:
         if not isinstance(raw, dict):
             continue
-        start, end = raw.get("start"), raw.get("end")
-        if not isinstance(start, (int, float)) or not isinstance(end, (int, float)):
-            continue
+        start = _usable_timestamp(raw.get("start"), "word start")
+        end = _usable_timestamp(raw.get("end"), "word end")
+        if end < start:
+            raise LemonadeCapabilityError("Lemonade returned a word whose end precedes its start")
+        raw_probability = raw.get("probability")
+        if raw_probability is None:
+            probability = 0.0
+        else:
+            probability = _finite_number(raw_probability)
+            if probability is None or not 0.0 <= probability <= 1.0:
+                raise LemonadeCapabilityError("Lemonade returned a word probability outside [0, 1]")
         words.append(
             Word(
-                start=offset + float(start),
-                end=offset + float(end),
+                start=offset + start,
+                end=offset + end,
                 word=str(raw.get("word") or ""),
-                probability=float(raw.get("probability") or 0.0),
+                probability=probability,
             )
         )
     return words
@@ -618,13 +797,23 @@ class _MergeState:
     pinned: str | None
     probability: float | None
 
-    def absorb(self, payload: dict[str, Any], offset: float, core_start: float, index: int) -> None:
+    def absorb(
+        self,
+        payload: dict[str, Any],
+        offset: float,
+        core_start: float,
+        index: int,
+        chunk_duration: float | None = None,
+    ) -> None:
         """Convert one chunk response into file-relative, deduped segments.
 
         Also records the language and its probability the first time the server
         supplies segments, so later chunk requests can carry the pinned language.
+
+        ``chunk_duration`` is the length of the audio this response describes; when
+        given, segment timestamps beyond it are rejected (see `_require_segments`).
         """
-        raw_segments = _require_segments(payload)
+        raw_segments = _require_segments(payload, upper_bound=chunk_duration)
         if not raw_segments:
             # Silence, or an empty leading chunk: ignored, never taken as the
             # detected language.
@@ -638,11 +827,11 @@ class _MergeState:
                 # Some Lemonade versions report it under this name instead.
                 raw_probability = payload.get("detected_language_probability")
             # Included only when the server actually supplied a valid probability;
-            # otherwise the field stays absent rather than being invented.
-            if isinstance(raw_probability, (int, float)) and not isinstance(raw_probability, bool):
-                value = float(raw_probability)
-                if 0.0 <= value <= 1.0:
-                    self.probability = value
+            # otherwise the field stays absent rather than being invented. Booleans
+            # and non-finite values (NaN, ±inf) are rejected with everything else.
+            probability = _finite_number(raw_probability)
+            if probability is not None and 0.0 <= probability <= 1.0:
+                self.probability = probability
         for raw in raw_segments:
             start = offset + float(raw["start"])
             end = offset + float(raw["end"])
@@ -697,6 +886,16 @@ class LemonadeBackend:
         """One line: which model, on which server. Hardware stays the server's business."""
         return f"Lemonade: {self._settings.lemonade_model} at {self._base_url}"
 
+    @property
+    def base_url(self) -> str:
+        """The validated, normalized base URL — safe to display and log.
+
+        This is the structural rebuild from `_normalize_base_url`, never the raw
+        configured string, so it cannot carry userinfo, a query string, or a
+        fragment.
+        """
+        return self._base_url
+
     def cache_fingerprint(self) -> str:
         """Identity of everything that changes this backend's transcription output.
 
@@ -718,12 +917,19 @@ class LemonadeBackend:
         return hashlib.sha256("\x00".join(parts).encode()).hexdigest()[:32]
 
     def health(self) -> Any:
-        """Optional status diagnostic — GET /v1/health. Not a transcription preflight."""
-        return self._get_json("/v1/health")
+        """Optional status diagnostic — GET /v1/health. Not a transcription preflight.
+
+        Uses the short diagnostics timeout, not the inference timeout: these tiny
+        GETs exist to diagnose a server that may be exactly the thing that is
+        stalled, so `tapeback status` must never hang for minutes on them.
+        """
+        return self._get_json("/v1/health", self._settings.lemonade_diagnostics_timeout_seconds)
 
     def system_info(self) -> Any:
         """Optional diagnostic — GET /v1/system-info. Not a transcription preflight."""
-        return self._get_json("/v1/system-info")
+        return self._get_json(
+            "/v1/system-info", self._settings.lemonade_diagnostics_timeout_seconds
+        )
 
     def transcribe(
         self,
@@ -766,7 +972,7 @@ class LemonadeBackend:
                     )
                 on_status(f"  {stage}: single request (file is not a chunkable WAV)")
                 payload = self._request_transcription(
-                    audio_path.read_bytes(), audio_path.name, state.pinned
+                    audio_path.read_bytes(), _UPLOAD_FILENAME, state.pinned
                 )
                 state.absorb(payload, 0.0, 0.0, 0)
         except KeyboardInterrupt:
@@ -807,12 +1013,13 @@ class LemonadeBackend:
                 wf.setpos(chunk.audio_start)
                 frames = wf.readframes(chunk.core_end - chunk.audio_start)
                 data = _wrap_wav(frames, channels, sampwidth, framerate)
-                payload = self._request_transcription(data, audio_path.name, state.pinned)
+                payload = self._request_transcription(data, _UPLOAD_FILENAME, state.pinned)
                 state.absorb(
                     payload,
                     chunk.audio_start / framerate,
                     chunk.core_start / framerate,
                     chunk.index,
+                    chunk_duration=(chunk.core_end - chunk.audio_start) / framerate,
                 )
                 progress.update(chunk.core_end / framerate)
         return n_frames / framerate
@@ -865,27 +1072,37 @@ class LemonadeBackend:
             )
         return payload
 
-    def _get_json(self, path: str) -> Any:
-        """GET a diagnostic endpoint. Authenticated only when a key is configured."""
+    def _get_json(self, path: str, timeout: float | None = None) -> Any:
+        """GET a diagnostic endpoint. Authenticated only when a key is configured.
+
+        ``timeout`` defaults to the inference timeout; diagnostics endpoints pass
+        the short dedicated timeout instead.
+        """
         headers = {"Accept": "application/json"}
         if self._api_key:
             headers["Authorization"] = f"Bearer {self._api_key}"
         request = urllib.request.Request(self._base_url + path, headers=headers, method="GET")
-        raw = self._send(request)
+        raw = self._send(request, timeout)
         try:
             return json.loads(raw.decode("utf-8", errors="replace"))
         except ValueError:
             return {"raw": raw.decode("utf-8", errors="replace")}
 
-    def _send(self, request: urllib.request.Request) -> bytes:
+    def _send(self, request: urllib.request.Request, timeout: float | None = None) -> bytes:
         """Perform one HTTP request, mapping every failure onto the error hierarchy.
 
         Response bodies — success and error alike — are read under
         ``_MAX_RESPONSE_BYTES``: a socket timeout is not a size bound, and a
         compromised or broken endpoint must not be able to exhaust client memory
         remotely. Over-limit responses get a sanitized error with no body content.
+
+        ``timeout`` defaults to ``settings.lemonade_timeout_seconds`` — the
+        inference-oriented bound, generous because long-chunk inference
+        legitimately takes minutes. Diagnostics endpoints pass their own short
+        timeout instead.
         """
-        timeout = self._settings.lemonade_timeout_seconds
+        if timeout is None:
+            timeout = self._settings.lemonade_timeout_seconds
         try:
             with _open_url(request, timeout, bypass_proxies=self._bypass_proxies) as response:
                 headers = getattr(response, "headers", None)

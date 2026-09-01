@@ -189,6 +189,10 @@ will never name it — only the endpoint and model you configured.
 
 What the backend does with your audio:
 
+- **Uploads your raw recording audio to that server.** With this backend selected,
+  audio leaves this machine — regardless of the summarization setting — and PII
+  masking applies only to the LLM summary request, never to the uploaded recording.
+  See [PII masking](#pii-masking).
 - Sends each channel as multipart `POST /v1/audio/transcriptions` requests asking for
   `verbose_json`, with an explicit language once one is known. `Authorization: Bearer`
   is sent only if you set `TAPEBACK_LEMONADE_API_KEY`, and the key is never written to
@@ -275,10 +279,10 @@ provider (any provider with an API key set).
 
 ### PII masking
 
-Summarization is the only thing tapeback sends off the machine — recording,
-transcription and diarization are all local. If that request bothers you, either
-leave summarization off (`TAPEBACK_SUMMARIZE=false`, and nothing is ever sent) or
-turn on masking:
+With the default faster-whisper backend, summarization is the only thing tapeback
+sends off the machine — recording, transcription and diarization are all local. If
+that request bothers you, either leave summarization off (`TAPEBACK_SUMMARIZE=false`,
+and nothing is ever sent) or turn on masking:
 
 ```bash
 TAPEBACK_MASK_PII=true
@@ -288,6 +292,14 @@ Emails and phone numbers are then replaced with `[EMAIL_1]` / `[PHONE_1]`
 placeholders before the transcript is sent — including on the retry and on every
 fallback provider — and the real values are restored in the summary saved to your
 vault. The transcript on disk is never masked.
+
+**This does not hold for the Lemonade backend.** With
+`TAPEBACK_TRANSCRIPTION_BACKEND=lemonade`, the raw recording audio is uploaded to
+the Lemonade Server you configured — transcription happens server-side, so audio
+leaves this machine even with summarization off. PII masking cannot help there:
+it rewrites the text of the LLM summary request, and it cannot mask an uploaded
+recording. Choose that backend only for a server you trust; see
+[Lemonade Server backend](#lemonade-server-backend).
 
 **Add the names yourself.** Whisper writes what people say, and what people say
 aloud in meetings is names, not email addresses — so on a typical transcript the
@@ -417,10 +429,11 @@ All settings via environment variables (prefix `TAPEBACK_`) or
 | Variable | Default | Description |
 |---|---|---|
 | `TAPEBACK_TRANSCRIPTION_BACKEND` | `faster-whisper` | `faster-whisper` (built-in local model) or `lemonade` (send WAVs to a [Lemonade Server](#lemonade-server-backend) you run yourself, with automatic fallback to faster-whisper on eligible failures) |
-| `TAPEBACK_LEMONADE_URL` | `http://127.0.0.1:13305` | Lemonade Server base URL. Plaintext `http://` is allowed only for loopback hosts (`localhost`, `127.0.0.0/8`, `::1`); remote endpoints must use `https://` (Lemonade backend only) |
+| `TAPEBACK_LEMONADE_URL` | `http://127.0.0.1:13305` | Lemonade Server base URL. Must be a bare URL — no embedded credentials (`user:pass@host`), query string, or fragment. Plaintext `http://` is allowed only for loopback hosts (`localhost`, `127.0.0.0/8`, `::1`); remote endpoints must use `https://` (Lemonade backend only) |
 | `TAPEBACK_LEMONADE_MODEL` | `Whisper-Large-v3-Turbo` | Model identifier as the server knows it (Lemonade backend only) |
 | `TAPEBACK_LEMONADE_API_KEY` | *(off)* | Optional bearer token; sent only in the `Authorization` header, never logged or cached (Lemonade backend only) |
 | `TAPEBACK_LEMONADE_TIMEOUT_SECONDS` | `600` | Per-request read timeout. Hitting it falls back to faster-whisper rather than resubmitting (Lemonade backend only) |
+| `TAPEBACK_LEMONADE_DIAGNOSTICS_TIMEOUT_SECONDS` | `10` | Per-request timeout for the `tapeback status` health/system-info probes only — deliberately short so a stalled endpoint cannot hang status for minutes. Transcription keeps the generous inference timeout above (Lemonade backend only) |
 | `TAPEBACK_LEMONADE_CHUNK_SECONDS` | `300` | Tapeback's own conservative chunk duration for long WAVs (0 < value ≤ 3600) — bounded memory and reportable progress, not a server limit. Changing it (or the overlap) invalidates Lemonade resume-cache entries (Lemonade backend only) |
 | `TAPEBACK_LEMONADE_OVERLAP_SECONDS` | `2.0` | Contextual overlap prepended to each chunk after the first, deduplicated against the previous chunk's core interval. Must be smaller than the chunk duration (Lemonade backend only) |
 | `TAPEBACK_WHISPER_MODEL` | `large-v3-turbo` | Whisper model (`tiny`, `base`, `small`, `medium`, `large-v3-turbo`) |

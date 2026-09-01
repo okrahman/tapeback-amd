@@ -262,9 +262,7 @@ def status() -> None:
     click.echo(f"\nVault: {settings.vault_path}")
     click.echo(f"Backend: {settings.transcription_backend}")
     if settings.transcription_backend == "lemonade":
-        click.echo(f"Lemonade endpoint: {settings.lemonade_url}")
-        click.echo(f"Lemonade model: {settings.lemonade_model}")
-        _lemonade_diagnostics(settings)
+        _lemonade_status(settings)
     else:
         click.echo(f"Whisper model: {settings.whisper_model}")
         click.echo(f"Device: {settings.device}")
@@ -282,20 +280,42 @@ def status() -> None:
             click.echo(result.stdout)
 
 
-def _lemonade_diagnostics(settings: Settings) -> None:
-    """Best-effort health/system probe for the status command.
+def _lemonade_status(settings: Settings) -> None:
+    """Lemonade section of `status`: endpoint, model, and optional diagnostics.
 
-    Diagnostics are optional: any failure is reported as a line, never raised, and
-    transcription never depends on these endpoints. Runs here — and only here — so a
-    status check may contact the server, but a transcription run may not preflight.
+    The backend is constructed here so the endpoint shown is the validated,
+    normalized URL — never the raw configured string, which could carry userinfo,
+    a query string, or a fragment the structural validation refused or rewrote.
+    A configuration error is reported as a line, never a crash: status must stay
+    usable for diagnosing exactly this.
     """
-    from tapeback._lemonade import (
-        LemonadeBackend,
-        LemonadeError,
-    )
+    from tapeback._lemonade import LemonadeBackend, LemonadeError
 
     try:
         backend = LemonadeBackend(settings)
+    except LemonadeError as exc:
+        click.echo(
+            f"Lemonade endpoint: {settings.lemonade_url} — configuration invalid: {exc}",
+            err=True,
+        )
+        return
+    click.echo(f"Lemonade endpoint: {backend.base_url}")
+    click.echo(f"Lemonade model: {settings.lemonade_model}")
+    _lemonade_diagnostics(backend)
+
+
+def _lemonade_diagnostics(backend) -> None:
+    """Best-effort health/system probe for the status command.
+
+    Diagnostics are optional: any failure is reported as a line, never raised, and
+    transcription never depends on these endpoints. They run on the short
+    diagnostics timeout, so a stalled endpoint cannot hang status for minutes.
+    Runs here — and only here — so a status check may contact the server, but a
+    transcription run may not preflight.
+    """
+    from tapeback._lemonade import LemonadeError
+
+    try:
         click.echo(f"Health: {json.dumps(backend.health(), default=str)}")
         click.echo(f"System info: {json.dumps(backend.system_info(), default=str)}")
     except LemonadeError as exc:

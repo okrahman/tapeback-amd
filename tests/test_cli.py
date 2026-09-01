@@ -170,6 +170,39 @@ def test_status_command(runner, vault_env):
         assert "Recording in progress: 2026-03-20_10-00-00" in result.output
 
 
+def test_status_command_with_lemonade_shows_normalized_endpoint(runner, vault_env):
+    """status shows the normalized URL, never the raw configured string."""
+    with patch("tapeback.cli.get_settings") as mock_settings:
+        mock_settings.return_value = Settings(
+            vault_path=vault_env,
+            transcription_backend="lemonade",
+            lemonade_url="http://LocalHost:13305/",
+        )
+        with (
+            patch("tapeback.recorder.Recorder.get_session_info", return_value=None),
+            patch("tapeback._lemonade.LemonadeBackend.health", return_value={"status": "ok"}),
+            patch("tapeback._lemonade.LemonadeBackend.system_info", return_value={}),
+        ):
+            result = runner.invoke(cli, ["status"])
+    assert result.exit_code == 0
+    assert "Lemonade endpoint: http://localhost:13305" in result.output
+    assert "Health:" in result.output
+
+
+def test_status_command_with_invalid_lemonade_url_reports_and_survives(runner, vault_env):
+    """A bad URL is reported as a line — status must stay usable for diagnosing it."""
+    with patch("tapeback.cli.get_settings") as mock_settings:
+        mock_settings.return_value = Settings(
+            vault_path=vault_env,
+            transcription_backend="lemonade",
+            lemonade_url="http://user:pass@127.0.0.1:13305",
+        )
+        with patch("tapeback.recorder.Recorder.get_session_info", return_value=None):
+            result = runner.invoke(cli, ["status"])
+    assert result.exit_code == 0
+    assert "configuration invalid" in result.stderr
+
+
 # --- _stop_and_process (dual-channel pipeline) ---
 
 

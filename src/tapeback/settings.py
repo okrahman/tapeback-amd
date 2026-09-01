@@ -148,8 +148,11 @@ class Settings(BaseSettings):
     # accelerator). On an eligible Lemonade failure the façade falls back to
     # faster-whisper for that run; see _lemonade.py for the error hierarchy.
     transcription_backend: Literal["faster-whisper", "lemonade"] = "faster-whisper"
-    # Lemonade Server base URL. Must be a syntactically valid http(s) URL; anything
-    # else is refused before a request is ever built (no fallback).
+    # Lemonade Server base URL. Must be a syntactically valid http(s) URL with no
+    # embedded credentials, query string, or fragment; anything else is refused
+    # before a request is ever built (no fallback). The URL is normalized
+    # structurally (lowercased scheme/host, default port dropped) before display
+    # or use, so what status shows is what requests target.
     lemonade_url: str = "http://127.0.0.1:13305"
     # Model identifier as Lemonade Server knows it (e.g. "Whisper-Large-v3-Turbo").
     lemonade_model: str = "Whisper-Large-v3-Turbo"
@@ -161,6 +164,12 @@ class Settings(BaseSettings):
     # take minutes, so this is generous by default; hitting it aborts the run and
     # falls back to faster-whisper rather than resubmitting to Lemonade.
     lemonade_timeout_seconds: float = Field(default=600.0, gt=0.0)
+    # Per-request timeout for the status command's health/system-info diagnostics.
+    # These are tiny GETs against an endpoint that may be the very thing that is
+    # down or stalled: a short bound keeps `tapeback status` a usable diagnostic
+    # instead of a ten-minute hang. Deliberately separate from the inference
+    # timeout above, which must stay generous for long-chunk inference.
+    lemonade_diagnostics_timeout_seconds: float = Field(default=10.0, gt=0.0)
     # Conservative internal chunk duration for long WAVs. Chosen to keep one request's
     # audio bounded in memory and progress reportable — these are tapeback's own
     # transport bounds, not statements about Lemonade Server limits. Finite bounds:
