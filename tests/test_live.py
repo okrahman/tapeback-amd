@@ -29,8 +29,8 @@ from tests.fixtures import create_mono_wav, mock_whisper_transcribe
 class _FakeResponse:
     """A urllib response that yields its body once, then EOF."""
 
-    def __init__(self, body: bytes):
-        self._body = body
+    def __init__(self, body: bytes | bytearray):
+        self._body = bytes(body)
         self._consumed = False
 
     def read(self, n: int = -1):
@@ -488,6 +488,7 @@ def test_live_second_channel_fallback_leaves_no_mixed_interval(
 
     assert len(lemonade_calls) == 2  # monitor -> Lemonade ok, mic -> Lemonade timeout
     assert [s.text for s in lt._segments] == ["fw text", "fw text"]  # never mixed
+    assert lt._transcriber is not None
     assert lt._transcriber._backend is fw  # latched for every later interval
 
 

@@ -14,9 +14,13 @@ import os
 import wave
 
 import pytest
+from pydantic import SecretStr
 
 from tapeback._lemonade import LemonadeBackend, LemonadeError
 from tapeback.settings import Settings
+
+_SMOKE_URL = os.environ.get("TAPEBACK_LEMONADE_URL", "http://127.0.0.1:13305")
+_SMOKE_API_KEY = os.environ.get("TAPEBACK_LEMONADE_API_KEY", "")
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("TAPEBACK_LEMONADE_SMOKE") != "1",
@@ -29,7 +33,8 @@ def settings(tmp_path):
     return Settings(
         transcription_backend="lemonade",
         resume_cache_dir=tmp_path / "resume",
-        lemonade_url=os.environ.get("TAPEBACK_LEMONADE_URL", "http://127.0.0.1:13305"),
+        lemonade_url=_SMOKE_URL,
+        lemonade_api_key=SecretStr(_SMOKE_API_KEY),
     )
 
 

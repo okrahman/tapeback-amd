@@ -117,7 +117,7 @@ def install_urlopen(monkeypatch, bodies):
     return calls
 
 
-def http_error(status: int, payload: dict | str = "") -> urllib.error.HTTPError:
+def http_error(status: int, payload: dict | str | bytes = "") -> urllib.error.HTTPError:
     body = payload if isinstance(payload, bytes) else json.dumps(payload).encode()
     return urllib.error.HTTPError("http://x", status, "err", Message(), io.BytesIO(body))
 
@@ -429,6 +429,48 @@ def test_empty_response_is_silence_not_an_error(tmp_path, monkeypatch):
     segments, info = LemonadeBackend(lemon_settings(tmp_path)).transcribe(wav)
     assert segments == []
     assert info["partial"] is False
+
+
+def test_recursion_error_on_transcription_is_a_capability_error(tmp_path, monkeypatch):
+    """RecursionError during JSON parsing must raise LemonadeCapabilityError."""
+    wav = tmp_path / "a.wav"
+    write_wav(wav, 0.5)
+    install_urlopen(monkeypatch, [b'{"raw": "test"}'])
+
+    def fake_loads(*args, **kwargs):
+        raise RecursionError("maximum recursion depth exceeded")
+
+    monkeypatch.setattr("json.loads", fake_loads)
+
+    with pytest.raises(LemonadeCapabilityError):
+        LemonadeBackend(lemon_settings(tmp_path)).transcribe(wav)
+
+
+def test_recursion_error_on_http_error_falls_back_to_status_classification(tmp_path, monkeypatch):
+    """RecursionError during error JSON parsing must fall back to status classification."""
+    wav = tmp_path / "a.wav"
+    write_wav(wav, 0.5)
+    install_urlopen(monkeypatch, [http_error(500, b"{}")])
+
+    def fake_loads(*args, **kwargs):
+        raise RecursionError("maximum recursion depth exceeded")
+
+    monkeypatch.setattr("json.loads", fake_loads)
+
+    with pytest.raises(LemonadeUnavailableError):
+        LemonadeBackend(lemon_settings(tmp_path)).transcribe(wav)
+
+
+def test_recursion_error_on_diagnostics_returns_raw_dict(tmp_path, monkeypatch):
+    """RecursionError during diagnostics JSON parsing must return raw dictionary."""
+    install_urlopen(monkeypatch, [b'{"health": "ok"}'])
+
+    def fake_loads(*args, **kwargs):
+        raise RecursionError("maximum recursion depth exceeded")
+
+    monkeypatch.setattr("json.loads", fake_loads)
+    backend = LemonadeBackend(lemon_settings(tmp_path))
+    assert backend.health() == {"raw": '{"health": "ok"}'}
 
 
 # --- structured error classification ---
@@ -853,6 +895,7 @@ def test_valid_words_still_convert(tmp_path, monkeypatch):
     segments, _info = LemonadeBackend(lemon_settings(tmp_path)).transcribe(wav)
 
     words = segments[0].words
+    assert words is not None
     assert [w.word for w in words] == ["hel", "lo"]
     assert words[0].probability == 0.9
     # An absent probability stays the historical 0.0, not an invented value.
@@ -1089,7 +1132,7 @@ def test_real_server_redirect_is_never_followed(tmp_path):
         do_POST = _respond
         do_GET = _respond
 
-        def log_message(self, *args: object) -> None:  # silence test output
+        def log_message(self, format: str, *args: object) -> None:  # silence test output
             pass
 
     redirector = HTTPServer(("127.0.0.1", 0), _Redirector)

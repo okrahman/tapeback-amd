@@ -622,7 +622,7 @@ def _raise_for_http_error(
     else:
         try:
             payload = json.loads(raw.decode("utf-8", errors="replace"))
-        except (ValueError, OSError):
+        except (ValueError, OSError, RecursionError):
             payload = None
     raise classify_http_failure(exc.code, payload, secrets=(api_key,) if api_key else ()) from exc
 
@@ -1242,7 +1242,7 @@ class LemonadeBackend:
         raw = self._send(request)
         try:
             payload = json.loads(raw.decode("utf-8", errors="replace"))
-        except ValueError:
+        except (ValueError, RecursionError):
             raise LemonadeCapabilityError(
                 "Lemonade returned a non-JSON transcription response — a text-only "
                 "(e.g. FLM-style) backend cannot serve tapeback"
@@ -1266,7 +1266,7 @@ class LemonadeBackend:
         raw = self._send(request, timeout)
         try:
             return json.loads(raw.decode("utf-8", errors="replace"))
-        except ValueError:
+        except (ValueError, RecursionError):
             return {"raw": raw.decode("utf-8", errors="replace")}
 
     def _send(self, request: urllib.request.Request, timeout: float | None = None) -> bytes:

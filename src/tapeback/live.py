@@ -271,7 +271,7 @@ class LiveTranscriber:
             mic_segments = self._transcribe_chunk(
                 transcriber, mic_pcm, self._mic_byte_offset, overlap_bytes, is_mic=True
             )
-        else:
+        elif monitor_pcm is not None:
             monitor_segments = self._transcribe_chunk(
                 transcriber,
                 monitor_pcm,
