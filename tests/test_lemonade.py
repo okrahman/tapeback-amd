@@ -387,6 +387,84 @@ def test_words_are_shifted_into_file_relative_time(tmp_path, monkeypatch):
     assert two.words[1].end == pytest.approx(1.9)  # 0.5 audio_start + 1.4 chunk time
 
 
+def test_word_timestamps_survive_an_offset_greater_than_the_slack(tmp_path, monkeypatch):
+    """A later chunk's offset exceeds the slack: words must be validated against
+    file-relative segment bounds, not compared across coordinate systems.
+
+    Regression: chunk-relative word times were compared against file-relative
+    segment bounds, so every word-bearing chunk after the first failed
+    validation as a capability error whenever its offset exceeded
+    _TIMESTAMP_SLACK_SECONDS — with the default 300 s chunks, that is every
+    chunk. The small offsets of earlier tests hid the bug inside the slack.
+    """
+    wav = tmp_path / "long.wav"
+    write_wav(wav, 2.5)
+    chunk2 = {  # offset 1.5 s (1.0 s chunks, 0.5 s overlap) > 1.0 s slack
+        "text": "three",
+        "language": "russian",
+        "segments": [
+            {
+                "start": 0.5,
+                "end": 1.0,
+                "text": " three",
+                "words": [{"start": 0.5, "end": 0.7, "word": "three", "probability": 0.9}],
+            }
+        ],
+    }
+    install_urlopen(
+        monkeypatch,
+        [
+            verbose_json([seg(0.0, 0.9)]),
+            verbose_json([seg(0.6, 1.4)]),
+            json.dumps(chunk2).encode(),
+        ],
+    )
+
+    segments, _info = LemonadeBackend(lemon_settings(tmp_path)).transcribe(wav)
+
+    three = next(s for s in segments if s.text == "three")
+    assert three.words is not None
+    assert three.words[0].start == pytest.approx(2.0)  # 1.5 offset + 0.5 chunk time
+    assert three.words[0].end == pytest.approx(2.2)
+
+
+def test_word_past_the_sent_audio_is_rejected_in_later_chunks(tmp_path, monkeypatch):
+    """The sent-audio bound works in file-relative time for later chunks too.
+
+    With the slack tightened so the arithmetic is observable: a word may outrun
+    its chunk's audio by no more than the boundary slack, even in a chunk whose
+    offset is large. Before the coordinate fix the bound was unreachable for
+    every chunk after the first, because a chunk-relative end can never exceed a
+    file-relative limit.
+    """
+    monkeypatch.setattr(lemon, "_TIMESTAMP_SLACK_SECONDS", 0.1)
+    wav = tmp_path / "long.wav"
+    write_wav(wav, 2.5)
+    chunk1 = {  # offset 0.5 s; audio 0.5-2.0 s (1.5 s with overlap), chunk_end = 2.0
+        "text": "two",
+        "language": "russian",
+        "segments": [
+            {
+                "start": 0.9,
+                "end": 1.6,  # exactly chunk duration + slack: segment accepted
+                "text": " two",
+                "words": [{"start": 0.9, "end": 1.65, "word": "tw", "probability": 0.5}],
+            }
+        ],
+    }
+    install_urlopen(
+        monkeypatch,
+        [verbose_json([seg(0.0, 0.9)]), json.dumps(chunk1).encode(), verbose_json([])],
+    )
+
+    with pytest.raises(LemonadeCapabilityError) as excinfo:
+        LemonadeBackend(lemon_settings(tmp_path)).transcribe(wav)
+
+    # The word lies inside its segment (2.15 <= 2.1 + 0.1) but past the audio
+    # that was sent (2.15 > 2.0 + 0.1): only the chunk bound may reject it.
+    assert "past the audio" in str(excinfo.value)
+
+
 def test_interrupt_keeps_completed_chunks_as_partial(tmp_path, monkeypatch):
     """Ctrl+C mid-chunks: keep what finished, mark partial, never raise."""
     wav = tmp_path / "long.wav"
@@ -398,6 +476,9 @@ def test_interrupt_keeps_completed_chunks_as_partial(tmp_path, monkeypatch):
 
     assert [s.text for s in segments] == ["one"]
     assert info["partial"] is True
+    # The interrupt lands inside the chunk loop; the duration must still be the
+    # recording's real length, derived from the WAV header before the loop.
+    assert info["duration"] == pytest.approx(2.5)
 
 
 # --- text-only / capability ---
@@ -988,6 +1069,28 @@ def test_bare_404_is_a_capability_error():
     assert isinstance(classify_http_failure(404, {}), LemonadeCapabilityError)
 
 
+def test_408_request_timeout_is_fallback_eligible():
+    """A proxy/server 408 is a transient availability failure, not a local bug."""
+    err = classify_http_failure(408, {"error": {"message": "upstream request timeout"}})
+    assert isinstance(err, LemonadeInferenceTimeout)
+
+
+def test_408_with_auth_phrasing_is_still_an_auth_error():
+    """Token-aware auth classification outranks 408 status semantics."""
+    err = classify_http_failure(408, {"error": {"message": "unauthorized"}})
+    assert isinstance(err, LemonadeAuthenticationError)
+
+
+def test_408_from_transcription_is_an_inference_timeout(tmp_path, monkeypatch):
+    """A 408 from the transcription endpoint reaches the fallback hierarchy."""
+    wav = tmp_path / "a.wav"
+    write_wav(wav, 0.5)
+    install_urlopen(monkeypatch, [http_error(408, {"error": {"message": "request timeout"}})])
+
+    with pytest.raises(LemonadeInferenceTimeout):
+        LemonadeBackend(lemon_settings(tmp_path)).transcribe(wav)
+
+
 def test_message_auth_phrases_are_token_aware():
     err = classify_http_failure(400, {"error": {"message": "unauthorized request shape"}})
     assert isinstance(err, LemonadeAuthenticationError)
@@ -1083,7 +1186,9 @@ def test_diagnostics_use_the_short_dedicated_timeout(tmp_path, monkeypatch):
     backend.health()
     backend.system_info()
 
-    assert seen == [7.5, 7.5]
+    # The open receives the remaining budget, which at open time is the full
+    # timeout up to clock precision.
+    assert seen == [pytest.approx(7.5), pytest.approx(7.5)]
 
 
 def test_transcription_still_uses_the_inference_timeout(tmp_path, monkeypatch):
@@ -1100,7 +1205,113 @@ def test_transcription_still_uses_the_inference_timeout(tmp_path, monkeypatch):
 
     backend.transcribe(wav)
 
-    assert seen == [600.0]
+    assert seen == [pytest.approx(600.0)]
+
+
+# --- total deadline enforcement ---
+
+
+class _FakeSocket:
+    def __init__(self) -> None:
+        self.timeouts: list[float] = []
+
+    def settimeout(self, value: float) -> None:
+        self.timeouts.append(value)
+
+
+class _FakeRaw:
+    """The BufferedReader.raw layer: _bound_socket_timeout reaches the socket here."""
+
+    def __init__(self, sock: _FakeSocket) -> None:
+        self._sock = sock
+
+
+class _FakeBufferedReader:
+    def __init__(self, sock: _FakeSocket) -> None:
+        self.raw = _FakeRaw(sock)
+
+
+class _SocketResponse:
+    """A response exposing the fp.fp.raw._sock path real urllib responses have."""
+
+    def __init__(self, sock: _FakeSocket) -> None:
+        self.fp = _FakeBufferedReader(sock)
+        self._sent = False
+
+    def read(self, n: int = -1) -> bytes:
+        if not self._sent:
+            self._sent = True
+            return verbose_json([seg(0.0, 0.4)])
+        return b""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+
+class _FakeClock:
+    now = 1000.0
+
+
+def test_socket_timeout_is_reset_to_the_remaining_budget(tmp_path, monkeypatch):
+    """Each blocking operation gets the remaining budget, never the full timeout.
+
+    Headers arrive 590 s into a 600 s budget: the open received the full 600,
+    but the first body read must be bounded by the ~10 s that are left, not by
+    another 600 s socket timeout on top.
+    """
+    monkeypatch.setattr(lemon.time, "monotonic", lambda: _FakeClock.now)
+    sock = _FakeSocket()
+    open_timeouts: list[float] = []
+
+    def fake_open(request, timeout, *, bypass_proxies):
+        open_timeouts.append(timeout)
+        _FakeClock.now += 590.0
+        return _SocketResponse(sock)
+
+    monkeypatch.setattr(lemon, "_open_url", fake_open)
+    wav = tmp_path / "a.wav"
+    write_wav(wav, 0.5)
+
+    LemonadeBackend(lemon_settings(tmp_path, lemonade_timeout_seconds=600.0)).transcribe(wav)
+
+    assert open_timeouts == [pytest.approx(600.0)]
+    assert sock.timeouts
+    assert all(t < 11.0 for t in sock.timeouts)
+
+
+def test_stalled_body_read_trips_the_total_deadline(tmp_path, monkeypatch):
+    """A body read stalling past the deadline raises the inference timeout.
+
+    Headers arrive with 10 s of budget left, the first read stalls for 100 s:
+    the between-reads deadline check must end the request rather than leave it
+    blocked for another full socket timeout.
+    """
+    monkeypatch.setattr(lemon.time, "monotonic", lambda: _FakeClock.now)
+
+    class _StallingResponse:
+        def read(self, n: int = -1) -> bytes:
+            _FakeClock.now += 100.0
+            return b"x" * 10
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    def fake_open(request, timeout, *, bypass_proxies):
+        _FakeClock.now += 590.0
+        return _StallingResponse()
+
+    monkeypatch.setattr(lemon, "_open_url", fake_open)
+    wav = tmp_path / "a.wav"
+    write_wav(wav, 0.5)
+
+    with pytest.raises(LemonadeInferenceTimeout):
+        LemonadeBackend(lemon_settings(tmp_path, lemonade_timeout_seconds=600.0)).transcribe(wav)
 
 
 # --- redirects are never followed ---

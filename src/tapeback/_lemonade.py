@@ -330,6 +330,7 @@ _HTTP_FORBIDDEN = 403
 _HTTP_NOT_FOUND = 404
 _HTTP_BAD_REQUEST = 400
 _HTTP_TOO_MANY_REQUESTS = 429
+_HTTP_REQUEST_TIMEOUT = 408
 _HTTP_INTERNAL_ERROR = 500
 _HTTP_MULTIPLE_CHOICES = 300
 
@@ -428,8 +429,11 @@ def _is_auth_failure(status: int, structured_tokens: list[str], message_tokens: 
     return any(_has_phrase(message_tokens, phrase) for phrase in _MESSAGE_AUTH_PHRASES)
 
 
-def classify_http_failure(
-    status: int, payload: Any, secrets: tuple[str, ...] = ()
+def classify_http_failure(  # noqa: PLR0911 — a deliberate flat decision ladder; one
+    # return per classification rule reads better than a folded return computation.
+    status: int,
+    payload: Any,
+    secrets: tuple[str, ...] = (),
 ) -> LemonadeError:
     """Map an HTTP error response to the deliberate exception hierarchy.
 
@@ -444,8 +448,9 @@ def classify_http_failure(
        "model author not found" on a 500 is a model failure that falls back,
        not a credential failure that aborts the run.
     4. A narrow, token-aware auth phrase list against the free-text message.
-    5. Status semantics: 429/5xx are server failures, a bare 404 is a missing
-       endpoint, other 4xx are locally invalid requests.
+    5. Status semantics: 408 and 429/5xx are remote availability failures (the
+       408 check comes after auth and model matching so phrasing still wins), a
+       bare 404 is a missing endpoint, other 4xx are locally invalid requests.
 
     Classification uses the remote fields raw, but the rendered exception text
     never does: ``message``, ``code`` and ``type`` pass through
@@ -469,6 +474,14 @@ def classify_http_failure(
     if "model" in structured_tokens or "model" in message_tokens:
         return LemonadeModelError(
             f"Lemonade cannot serve the model (HTTP {status}): {safe_code or safe_message}"
+        )
+    if status == _HTTP_REQUEST_TIMEOUT:
+        # A proxy or server gave up waiting for the request — a transient
+        # availability failure on the remote side, in the same class as a read
+        # timeout: fallback-eligible, and never resubmitted to Lemonade.
+        return LemonadeInferenceTimeout(
+            f"Lemonade response did not finish within the configured timeout "
+            f"(HTTP {status}): {safe_message or safe_type or 'no detail'}"
         )
     if status == _HTTP_TOO_MANY_REQUESTS or status >= _HTTP_INTERNAL_ERROR:
         return LemonadeUnavailableError(
@@ -569,6 +582,35 @@ def _open_url(request: urllib.request.Request, timeout: float, *, bypass_proxies
     return _DEFAULT_OPENER.open(request, timeout=timeout)
 
 
+# A just-expired deadline must not hand 0 (or a negative, which some stacks
+# treat as "infinite") to open()/settimeout; the deadline check fires right after.
+_MIN_SOCKET_TIMEOUT_SECONDS = 0.05
+
+
+def _remaining(deadline: float) -> float:
+    """Socket timeout for the next blocking operation: the remaining budget."""
+    return max(_MIN_SOCKET_TIMEOUT_SECONDS, deadline - time.monotonic())
+
+
+def _bound_socket_timeout(fp: Any, deadline: float) -> None:
+    """Set the underlying socket's inactivity timeout to the remaining budget.
+
+    urllib receives the timeout once per open; every later blocking read would
+    otherwise restart a full socket timeout no matter how little budget is left.
+    Best-effort: a response object without a reachable socket (fakes, exotic
+    transports) keeps its previous timeout, and the deadline check between reads
+    still applies.
+    """
+    try:
+        sock = fp.fp.raw._sock  # http.client.HTTPResponse -> BufferedReader -> SocketIO
+    except AttributeError:
+        return
+    try:
+        sock.settimeout(_remaining(deadline))
+    except OSError:
+        return
+
+
 def _read_bounded(fp: Any, limit: int, *, deadline: float | None = None) -> bytes:
     """Read at most ``limit + 1`` bytes from ``fp``, so overflow is detectable.
 
@@ -579,7 +621,9 @@ def _read_bounded(fp: Any, limit: int, *, deadline: float | None = None) -> byte
     ``deadline`` is a monotonic end-to-end bound: when given, expiry raises
     ``LemonadeInferenceTimeout`` even while the peer is still trickling bytes —
     the socket timeout is an inactivity bound, not a promise that the total
-    request finishes on time.
+    request finishes on time. Before every read the socket's inactivity timeout
+    is reset to the remaining budget, so a single stalled read cannot block for
+    a full socket timeout on top of an already-expired deadline.
     """
     pieces: list[bytes] = []
     remaining = limit + 1
@@ -588,6 +632,8 @@ def _read_bounded(fp: Any, limit: int, *, deadline: float | None = None) -> byte
             raise LemonadeInferenceTimeout(
                 "Lemonade response did not finish within the configured timeout"
             )
+        if deadline is not None:
+            _bound_socket_timeout(fp, deadline)
         piece = fp.read(min(65536, remaining))
         if not piece:
             break
@@ -923,9 +969,11 @@ def _convert_words(
     Words are also bounded the way segments are: each word must lie inside its
     containing segment and inside the audio that was actually sent (``chunk_end``,
     file-relative, when known), both modulo the same boundary slack the segment
-    check applies. An in-bounds segment must not smuggle words far past the
-    recording — diarization rebuilds segment boundaries from these words and the
-    resume cache persists them.
+    check applies. Raw word times arrive chunk-relative and are shifted into
+    file-relative time *before* every bound check, so all comparisons — bounds
+    and words alike — run in one coordinate system. An in-bounds segment must not
+    smuggle words far past the recording — diarization rebuilds segment
+    boundaries from these words and the resume cache persists them.
     """
     words: list[Word] = []
     if not isinstance(raw_words, list):
@@ -937,6 +985,12 @@ def _convert_words(
         end = _usable_timestamp(raw.get("end"), "word end")
         if end < start:
             raise LemonadeCapabilityError("Lemonade returned a word whose end precedes its start")
+        # Shift into file-relative time before any bound check. segment_start,
+        # segment_end and chunk_end are file-relative; comparing the still
+        # chunk-relative word times against them would reject every valid word
+        # in any chunk whose offset exceeds the boundary slack.
+        start = offset + start
+        end = offset + end
         if (
             start < segment_start - _TIMESTAMP_SLACK_SECONDS
             or end > segment_end + _TIMESTAMP_SLACK_SECONDS
@@ -955,8 +1009,8 @@ def _convert_words(
                 raise LemonadeCapabilityError("Lemonade returned a word probability outside [0, 1]")
         words.append(
             Word(
-                start=offset + start,
-                end=offset + end,
+                start=start,
+                end=end,
                 word=str(raw.get("word") or ""),
                 probability=probability,
             )
@@ -1130,8 +1184,14 @@ class LemonadeBackend:
         pinned: str | None = normalize_language(explicit) if explicit else None
         state = _MergeState(segments=[], pinned=pinned, probability=None)
         partial = False
-        duration = 0.0
         params = _wav_params(audio_path)
+        # Derive the duration from the validated WAV header before the
+        # interruptible block: a Ctrl+C inside any chunk must still report the
+        # recording's real length, not the 0.0 placeholder. _wav_params has
+        # already rejected forged frame counts against the file size.
+        duration = 0.0
+        if params is not None and params[2] > 0 and params[3] > 0:
+            duration = params[3] / params[2]
 
         try:
             # A degenerate header (0 framerate/frames) is not chunkable either.
@@ -1289,16 +1349,20 @@ class LemonadeBackend:
         The timeout is enforced as a **monotonic end-to-end deadline**: a server
         that tricks a byte just before each socket timeout must still complete
         within the total budget, and a stall at any phase — connect, upload,
-        read — counts against the same clock. The socket timeout is still passed
-        to urllib as a fast inactivity bound, but ``_read_bounded`` also checks
-        the deadline before every read, so a trickling peer cannot extend the
-        request past the configured limit.
+        read — counts against the same clock. Each blocking operation gets the
+        *remaining* budget as its socket timeout rather than the full configured
+        value: the open (connect plus headers), and every body read via
+        ``_read_bounded``, which resets the socket timeout to the remaining
+        budget before each read. A read that begins just before expiry therefore
+        cannot block for another full socket timeout.
         """
         if timeout is None:
             timeout = self._settings.lemonade_timeout_seconds
         deadline = time.monotonic() + timeout
         try:
-            with _open_url(request, timeout, bypass_proxies=self._bypass_proxies) as response:
+            with _open_url(
+                request, _remaining(deadline), bypass_proxies=self._bypass_proxies
+            ) as response:
                 headers = getattr(response, "headers", None)
                 if headers is not None:
                     content_length = headers.get("Content-Length")
