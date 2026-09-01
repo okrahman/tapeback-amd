@@ -3,6 +3,8 @@
 import io
 import json
 import struct
+import threading
+import time
 import urllib.error
 import wave
 from email.message import Message
@@ -533,3 +535,100 @@ def test_live_channel_error_rolls_back_both_cursors(tmp_path, tmp_vault, monkeyp
     assert lt._monitor_byte_offset > 0
     assert len(lt._segments) == 2
     assert {"You", "Other"} == {s.speaker for s in lt._segments}
+
+
+# --- stop() lifecycle ---
+
+
+def test_live_lemonade_request_budget_is_capped(tmp_vault):
+    """A live Lemonade request can never have a worst case past the join budget.
+
+    The 600 s default inference timeout exists for long final files; a live
+    interval is one small pair transaction, so stop()'s join must be able to
+    outlast any request it waits behind.
+    """
+    settings = Settings(
+        vault_path=tmp_vault,
+        transcription_backend="lemonade",
+        lemonade_timeout_seconds=600.0,
+    )
+    lt = LiveTranscriber(
+        settings, "budget-session", tmp_vault / "mic.wav", tmp_vault / "monitor.wav"
+    )
+
+    assert lt._settings.lemonade_timeout_seconds == live_mod._LIVE_REQUEST_BUDGET_SECONDS
+
+
+def test_live_faster_whisper_settings_pass_through_untouched(tmp_vault):
+    """The request-budget cap is a Lemonade-transport concern only."""
+    settings = Settings(vault_path=tmp_vault, lemonade_timeout_seconds=600.0)
+    lt = LiveTranscriber(
+        settings, "passthrough-session", tmp_vault / "mic.wav", tmp_vault / "monitor.wav"
+    )
+
+    assert lt._settings.lemonade_timeout_seconds == 600.0
+
+
+def test_stop_does_not_return_while_the_worker_is_alive(tmp_path, tmp_vault, monkeypatch):
+    """stop() must establish its lifecycle boundary: raise rather than return
+    while the worker can still issue requests or write the live note.
+
+    Regression: stop() joined with a fixed 120 s timeout, never checked
+    is_alive(), and a Lemonade request stalled for 121-600 s survived the join —
+    stop() returned, the final pipeline started, and the worker later woke up to
+    upload another interval and rewrite the live note under it.
+    """
+    settings = Settings(vault_path=tmp_vault, live_interval=1, live_min_chunk=0.01)
+
+    entered = threading.Event()
+    release = threading.Event()
+
+    def stalled_chunk(self):
+        entered.set()
+        release.wait(timeout=10)
+
+    monkeypatch.setattr(LiveTranscriber, "_process_chunk", stalled_chunk)
+    monkeypatch.setattr(live_mod, "_STOP_JOIN_TIMEOUT_SECONDS", 0.2)
+
+    lt = LiveTranscriber(settings, "stall-session", tmp_path / "mic.wav", tmp_path / "monitor.wav")
+    lt.start()
+    assert entered.wait(timeout=5)
+
+    with pytest.raises(RuntimeError, match="final processing aborted"):
+        lt.stop()
+
+    release.set()
+    lt._thread.join(timeout=5)
+    assert not lt._thread.is_alive()
+
+
+def test_no_work_after_stop_returns(tmp_path, tmp_vault, monkeypatch):
+    """After stop() returns, the worker is dead: no further chunk processing,
+    remote request, or live-note write can happen afterwards."""
+    settings = Settings(vault_path=tmp_vault, live_interval=1, live_min_chunk=0.01)
+    mic_path = tmp_path / "mic.wav"
+    monitor_path = tmp_path / "monitor.wav"
+    create_mono_wav(mic_path, duration=0.5, sample_rate=48000)
+    create_mono_wav(monitor_path, duration=0.5, sample_rate=48000)
+
+    chunk_calls: list[int] = []
+    write_calls: list[int] = []
+
+    def counting_chunk(self):
+        chunk_calls.append(1)
+        self._write_live_markdown()
+
+    monkeypatch.setattr(LiveTranscriber, "_process_chunk", counting_chunk)
+    monkeypatch.setattr(LiveTranscriber, "_write_live_markdown", lambda self: write_calls.append(1))
+
+    lt = LiveTranscriber(settings, "poststop-session", mic_path, monitor_path)
+    lt.start()
+    time.sleep(0.3)  # a couple of intervals
+    lt.stop()
+
+    assert not lt._thread.is_alive()
+    chunks_at_stop = len(chunk_calls)
+    writes_at_stop = len(write_calls)
+    time.sleep(0.3)
+    assert len(chunk_calls) == chunks_at_stop
+    assert len(write_calls) == writes_at_stop
