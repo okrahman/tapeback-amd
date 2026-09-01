@@ -202,9 +202,16 @@ What the backend does with your audio:
   on-path observer both. Plain `http://` is accepted only for strictly recognized
   loopback endpoints (`localhost`, `127.0.0.0/8`, `::1`), and those requests bypass
   the process-wide proxy configuration, so an inherited `http_proxy` without a
-  matching `NO_PROXY` cannot capture a "local" upload. Response bodies are read under
-  a hard size cap; a broken or hostile endpoint cannot exhaust tapeback's memory with
-  an oversized body.
+  matching `NO_PROXY` cannot capture a "local" upload. HTTP redirects are never
+  followed, so a 30x cannot move the request (and its `Authorization` header) to a
+  server-chosen origin or downgrade `https://` to `http://` — a redirecting endpoint
+  is reported as an error instead. Response bodies are read under a hard size cap; a
+  broken or hostile endpoint cannot exhaust tapeback's memory with an oversized body.
+  Server-supplied error text is sanitized before it is shown or persisted:
+  length-capped, stripped of terminal-control characters, and redacted of the
+  configured API key, so a server (or proxy) that reflects the received
+  `Authorization` value back in an error body cannot make tapeback repeat the
+  credential into the terminal or the run log.
 - Splits long WAVs into bounded chunks (tapeback's own conservative transport bounds —
   not a statement about the server), with a small contextual overlap between chunks
   and versioned deduplication, so a recording of any length works and progress is

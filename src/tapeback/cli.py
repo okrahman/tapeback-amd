@@ -287,17 +287,16 @@ def _lemonade_status(settings: Settings) -> None:
     normalized URL — never the raw configured string, which could carry userinfo,
     a query string, or a fragment the structural validation refused or rewrote.
     A configuration error is reported as a line, never a crash: status must stay
-    usable for diagnosing exactly this.
+    usable for diagnosing exactly this. The raw configured value is never echoed,
+    not even in the failure branch — an invalid URL may carry embedded credentials,
+    and status output must never display raw userinfo.
     """
     from tapeback._lemonade import LemonadeBackend, LemonadeError
 
     try:
         backend = LemonadeBackend(settings)
     except LemonadeError as exc:
-        click.echo(
-            f"Lemonade endpoint: {settings.lemonade_url} — configuration invalid: {exc}",
-            err=True,
-        )
+        click.echo(f"Lemonade endpoint: <configuration invalid> — {exc}", err=True)
         return
     click.echo(f"Lemonade endpoint: {backend.base_url}")
     click.echo(f"Lemonade model: {settings.lemonade_model}")

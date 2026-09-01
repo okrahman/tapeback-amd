@@ -109,6 +109,7 @@ def _patch_urlopen(monkeypatch, fn):
         def open(self, request, timeout=None):
             return fn(request, timeout=timeout)
 
+    monkeypatch.setattr("tapeback._lemonade._DEFAULT_OPENER", _FakeOpener())
     monkeypatch.setattr("tapeback._lemonade._NO_PROXY_OPENER", _FakeOpener())
 
 

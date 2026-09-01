@@ -188,3 +188,53 @@ def test_write_run_log_returns_none_when_directory_is_unwritable(tmp_path):
 
     record = RunLog(session="s", started_at="2026-08-05T00:00:00+00:00", config={})
     assert write_run_log(record, blocker) is None
+
+
+def test_run_log_redacts_reflected_api_key_from_events_and_error(tmp_path):
+    """A remote error can reflect the received Authorization header; the run
+    record is the final persistence boundary and must not hold the credential."""
+    settings = Settings(
+        vault_path=tmp_path / "vault",
+        run_log_dir=tmp_path / "runs",
+        lemonade_api_key=SecretStr("sk-lemonade-secret"),
+        hf_token=SecretStr("hf-supersecret"),
+        llm_api_key=SecretStr("sk-llm-secret"),
+    )
+
+    printed: list[str] = []
+    with pytest.raises(RuntimeError), run_log("session", settings, printed.append) as report:
+        report("Lemonade server failure (HTTP 502): Bearer sk-lemonade-secret")
+        raise RuntimeError("upstream said: Bearer sk-llm-secret with hf-supersecret")
+
+    record = _read_only_record(tmp_path / "runs")
+    raw = json.dumps(record)
+    assert "sk-lemonade-secret" not in raw
+    assert "sk-llm-secret" not in raw
+    assert "hf-supersecret" not in raw
+    assert record["events"] == ["Lemonade server failure (HTTP 502): Bearer [redacted]"]
+    assert "[redacted]" in record["error"]
+
+
+def test_run_log_strips_terminal_control_characters(tmp_path):
+    """ESC sequences must never survive into a file the user may cat."""
+    settings = Settings(vault_path=tmp_path / "vault", run_log_dir=tmp_path / "runs")
+
+    with pytest.raises(RuntimeError), run_log("session", settings, lambda _m: None) as report:
+        report("\x1b]0;evil\x07 status line")
+        raise RuntimeError("boom\x1b[31m")
+
+    record = _read_only_record(tmp_path / "runs")
+    assert "\x1b" not in json.dumps(record)
+    assert "\x07" not in json.dumps(record)
+    assert record["events"] == ["]0;evil status line"]
+
+
+def test_run_log_without_secrets_behaves_as_before(tmp_path):
+    """Empty redactions are a no-op — plain status lines are stored verbatim."""
+    settings = Settings(vault_path=tmp_path / "vault", run_log_dir=tmp_path / "runs")
+
+    with run_log("session", settings, lambda _m: None) as report:
+        report("Stage 'merge' took 1.0s")
+
+    record = _read_only_record(tmp_path / "runs")
+    assert record["events"] == ["Stage 'merge' took 1.0s"]

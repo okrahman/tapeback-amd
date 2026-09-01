@@ -3,9 +3,12 @@
 import io
 import json
 import struct
+import threading
 import urllib.error
+import urllib.request
 import wave
 from email.message import Message
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +22,7 @@ from tapeback._lemonade import (
     LemonadeBackend,
     LemonadeCapabilityError,
     LemonadeConfigurationError,
+    LemonadeError,
     LemonadeInferenceTimeout,
     LemonadeModelError,
     LemonadeUnavailableError,
@@ -88,9 +92,9 @@ class _FakeResponse:
 def install_urlopen(monkeypatch, bodies):
     """Queue responses (bytes or exception instances) for successive requests.
 
-    Routes BOTH HTTP paths tapeback can take — the default ``urlopen`` and the
-    loopback no-proxy opener — through the same fake, so tests intercept every
-    request regardless of which opener the backend chose.
+    Routes BOTH HTTP paths tapeback can take — the default opener and the loopback
+    no-proxy opener — through the same fake, so tests intercept every request
+    regardless of which opener the backend chose.
     """
     calls: list[object] = []
 
@@ -108,7 +112,7 @@ def install_urlopen(monkeypatch, bodies):
         def open(self, request, timeout=None):
             return fake_urlopen(request, timeout=timeout)
 
-    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    monkeypatch.setattr("tapeback._lemonade._DEFAULT_OPENER", _FakeOpener())
     monkeypatch.setattr("tapeback._lemonade._NO_PROXY_OPENER", _FakeOpener())
     return calls
 
@@ -122,10 +126,31 @@ def http_error(status: int, payload: dict | str = "") -> urllib.error.HTTPError:
 
 
 def test_invalid_url_is_a_configuration_error(tmp_path):
-    with pytest.raises(LemonadeConfigurationError):
+    with pytest.raises(LemonadeConfigurationError) as exc_info:
         LemonadeBackend(lemon_settings(tmp_path, lemonade_url="not-a-url"))
+    # The raw configured value is never echoed: it may carry credentials or
+    # terminal-control characters, and the message reaches status and run logs.
+    assert "not-a-url" not in str(exc_info.value)
     with pytest.raises(LemonadeConfigurationError):
         LemonadeBackend(lemon_settings(tmp_path, lemonade_url="ftp://host:1"))
+
+
+def test_invalid_url_error_never_echoes_credentials_or_control_characters(tmp_path):
+    """Raw input must not survive into the invalid-scheme/invalid-port messages."""
+    # Invalid scheme carrying a terminal-control sequence.
+    with pytest.raises(LemonadeConfigurationError) as exc_info:
+        LemonadeBackend(lemon_settings(tmp_path, lemonade_url="ht\x1b]0;pwned\x07tp://host"))
+    message = str(exc_info.value)
+    assert "\x1b" not in message
+    assert "\x07" not in message
+    # Invalid port: the fixed message carries neither the host nor the port value.
+    with pytest.raises(LemonadeConfigurationError) as exc_info:
+        LemonadeBackend(lemon_settings(tmp_path, lemonade_url="https://host:99999"))
+    assert "99999" not in str(exc_info.value)
+    # The userinfo rejection never contained the raw URL, but pin it down:
+    with pytest.raises(LemonadeConfigurationError) as exc_info:
+        LemonadeBackend(lemon_settings(tmp_path, lemonade_url="http://alice:pw@127.0.0.1:13305"))
+    assert "alice" not in str(exc_info.value) and "pw@" not in str(exc_info.value)
 
 
 def test_malformed_api_key_is_a_configuration_error(tmp_path):
@@ -909,8 +934,14 @@ def test_structured_auth_code_wins_over_model_wording():
 
 def test_url_with_userinfo_is_rejected(tmp_path):
     """Credentials embedded in the URL would be displayed by status."""
-    with pytest.raises(LemonadeConfigurationError):
-        LemonadeBackend(lemon_settings(tmp_path, lemonade_url="http://user:pass@127.0.0.1:13305"))
+    with pytest.raises(LemonadeConfigurationError) as exc_info:
+        LemonadeBackend(
+            lemon_settings(tmp_path, lemonade_url="http://alice:s3cret@127.0.0.1:13305")
+        )
+    # The embedded username/password must not survive into the message (fixed
+    # guidance text may mention the concept, never the actual values).
+    assert "alice" not in str(exc_info.value)
+    assert "s3cret" not in str(exc_info.value)
 
 
 def test_url_with_query_or_fragment_is_rejected(tmp_path):
@@ -999,3 +1030,155 @@ def test_transcription_still_uses_the_inference_timeout(tmp_path, monkeypatch):
     backend.transcribe(wav)
 
     assert seen == [600.0]
+
+
+# --- redirects are never followed ---
+
+
+@pytest.mark.parametrize("code", [301, 302, 303, 307, 308])
+def test_no_redirect_handler_refuses_every_30x(code):
+    """Returning None makes urllib surface the 30x as an HTTPError, un-followed."""
+    handler = lemon._NoRedirectHandler()
+    assert handler.redirect_request(None, None, code, "", {}, "http://attacker.example/") is None
+
+
+@pytest.mark.parametrize("opener_name", ["_DEFAULT_OPENER", "_NO_PROXY_OPENER"])
+def test_openers_install_the_no_redirect_handler(opener_name):
+    """Both HTTP paths must replace urllib's default redirect handler."""
+    opener = getattr(lemon, opener_name)
+    assert any(isinstance(handler, lemon._NoRedirectHandler) for handler in opener.handlers)
+
+
+def test_redirect_response_is_classified_without_echoing_the_target(tmp_path, monkeypatch):
+    """A 30x is a sanitized fallback-eligible error; the Location is never shown."""
+    headers = Message()
+    headers["Location"] = "http://attacker.example/steal"
+    error = urllib.error.HTTPError(
+        "https://example.test/v1/health", 302, "Found", headers, io.BytesIO(b"")
+    )
+    install_urlopen(monkeypatch, [error])
+    backend = LemonadeBackend(lemon_settings(tmp_path, lemonade_url="https://example.test"))
+
+    with pytest.raises(LemonadeUnavailableError) as exc_info:
+        backend.health()
+
+    message = str(exc_info.value)
+    assert "redirect" in message
+    assert "attacker.example" not in message
+
+
+def test_real_server_redirect_is_never_followed(tmp_path):
+    """End-to-end over real sockets: a 302 must not produce a second request.
+
+    This is the regression for the proven POST→GET + Authorization-leak probe:
+    urllib's default handler followed a 302, converted the POST to a GET, and
+    kept the bearer header on the server-chosen target.
+    """
+    victim_requests: list[tuple[str, str | None]] = []
+    redirector_requests: list[tuple[str, str | None]] = []
+
+    victim = HTTPServer(("127.0.0.1", 0), BaseHTTPRequestHandler)
+
+    class _Redirector(BaseHTTPRequestHandler):
+        def _respond(self) -> None:
+            redirector_requests.append((self.command, self.headers.get("Authorization")))
+            self.send_response(302)
+            self.send_header("Location", f"http://127.0.0.1:{victim.server_port}/steal")
+            self.end_headers()
+
+        do_POST = _respond
+        do_GET = _respond
+
+        def log_message(self, *args: object) -> None:  # silence test output
+            pass
+
+    redirector = HTTPServer(("127.0.0.1", 0), _Redirector)
+    for server in (redirector, victim):
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+
+    try:
+        key = "sk-redirect-probe-token"
+        backend = LemonadeBackend(
+            lemon_settings(
+                tmp_path,
+                lemonade_url=f"http://127.0.0.1:{redirector.server_port}",
+                lemonade_api_key=SecretStr(key),
+            )
+        )
+        with pytest.raises(LemonadeUnavailableError) as exc_info:
+            backend.health()
+        assert "redirect" in str(exc_info.value)
+        assert key not in str(exc_info.value)
+    finally:
+        for server in (redirector, victim):
+            server.shutdown()
+            server.server_close()
+
+    # Exactly one request reached the configured endpoint — with method and
+    # credential intact — and the redirect target received nothing at all.
+    assert redirector_requests == [("GET", f"Bearer {key}")]
+    assert victim_requests == []
+
+
+# --- server-controlled error text is sanitized ---
+
+
+def test_classified_error_redacts_a_reflected_api_key():
+    """A server reflecting the received Authorization value must not repeat it."""
+    key = "sk-supersecret-lemonade-token"
+    payload = {
+        "error": {
+            "type": "upstream_error",
+            "code": "bad_gateway",
+            "message": f"request rejected with header: Bearer {key}",
+        }
+    }
+    exc = classify_http_failure(502, payload, secrets=(key,))
+    assert key not in str(exc)
+    assert "[redacted]" in str(exc)
+
+
+def test_send_redacts_a_reflected_api_key(tmp_path, monkeypatch):
+    """The backend wires the configured key into classification end to end."""
+    key = "sk-supersecret-lemonade-token"
+    payload = {"error": {"message": f"received Authorization: Bearer {key}"}}
+    install_urlopen(monkeypatch, [http_error(502, payload)])
+    backend = LemonadeBackend(
+        lemon_settings(
+            tmp_path,
+            lemonade_url="https://example.test",
+            lemonade_api_key=SecretStr(key),
+        )
+    )
+    wav = tmp_path / "a.wav"
+    write_wav(wav, 0.5)
+
+    with pytest.raises(LemonadeError) as exc_info:
+        backend.transcribe(wav)
+
+    assert key not in str(exc_info.value)
+    assert "[redacted]" in str(exc_info.value)
+
+
+def test_classified_error_strips_terminal_control_characters():
+    payload = {"error": {"message": "boom\x1b]0;pwned\x07 and more"}}
+    exc = classify_http_failure(500, payload)
+    assert "\x1b" not in str(exc)
+    assert "\x07" not in str(exc)
+
+
+def test_remote_detail_is_length_capped():
+    payload = {"error": {"message": "A" * 5000}}
+    exc = classify_http_failure(500, payload)
+    assert len(str(exc)) < 300
+
+
+def test_classification_is_unchanged_by_sanitization():
+    """Sanitization shapes the message, never the classification decision."""
+    payload_missing = {"error": {"message": "nope"}}
+    assert isinstance(classify_http_failure(404, payload_missing), LemonadeCapabilityError)
+    assert isinstance(
+        classify_http_failure(500, {"error": {"message": "permission denied loading model"}}),
+        LemonadeModelError,
+    )
+    assert isinstance(classify_http_failure(401, {}), LemonadeAuthenticationError)

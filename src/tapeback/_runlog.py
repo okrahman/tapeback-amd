@@ -12,6 +12,7 @@ from __future__ import annotations
 import datetime
 import json
 import os
+import re
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -56,6 +57,29 @@ RECORDED_SETTINGS = (
 # Keep the directory from growing without bound; oldest records are dropped first.
 MAX_RUN_RECORDS = 200
 
+# Terminal-control characters (C0, C1, and line/paragraph separators) never belong
+# in a persisted diagnostic line: ESC sequences could disguise or corrupt output
+# when the file is catted into a terminal, and they have no legitimate use here.
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029]")
+
+
+_REDACTED_LABEL = "[redacted]"
+
+
+def redact_text(text: str, redactions: tuple[str, ...] = ()) -> str:
+    """Strip terminal-control characters and replace configured secrets.
+
+    Applied to everything captured into the run record: status lines are echoed
+    by remote-facing backends and error messages are influenced by remote error
+    bodies, so a reflected credential must not survive the write even if an
+    upstream sanitizer missed it.
+    """
+    out = _CONTROL_CHARS_RE.sub("", text)
+    for secret in redactions:
+        if secret:
+            out = out.replace(secret, _REDACTED_LABEL)
+    return out
+
 
 def default_run_log_dir() -> Path:
     """XDG data directory for run records."""
@@ -84,15 +108,25 @@ class RunLog:
     outcome: str = OUTCOME_UNKNOWN
     error: str | None = None
     finished_at: str | None = None
+    # Secret strings replaced with "[redacted]" in every captured line and in the
+    # error field. Populated by `run_log` from the settings; empty when constructed
+    # directly (tests). Status text reaches this file from remote-facing backends,
+    # and a reflected credential must not survive the write even if an upstream
+    # sanitizer missed it.
+    redactions: tuple[str, ...] = ()
+
+    def _sanitize(self, message: str) -> str:
+        """Redact configured secrets and strip terminal-control characters."""
+        return redact_text(message, self.redactions)
 
     def record(self, message: str) -> None:
-        """Capture one status line verbatim.
+        """Capture one status line, redacted of configured secrets.
 
         The status lines already are the human-readable record of the run, so they
         are stored as written rather than parsed back into fields — re-parsing our
         own formatted output would break every time a message is reworded.
         """
-        self.events.append(message)
+        self.events.append(self._sanitize(message))
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -161,6 +195,11 @@ def run_log(
     interrupted or failed is exactly the run worth having a record of, so the
     outcome is classified rather than the exception being swallowed — it is
     re-raised unchanged.
+
+    Every captured status line and the error field are redacted of the
+    credentials the settings carry (`lemonade_api_key`, `hf_token`,
+    `llm_api_key`): a remote-facing error can reflect a configured secret, and a
+    post-mortem file the user may share must never hold a reusable credential.
     """
     if not settings.run_log:
         yield on_status
@@ -171,6 +210,15 @@ def run_log(
         session=session,
         started_at=_utc_now_iso(),
         config=_config_snapshot(settings),
+        redactions=tuple(
+            value
+            for value in (
+                settings.lemonade_api_key.get_secret_value(),
+                settings.hf_token.get_secret_value(),
+                settings.llm_api_key.get_secret_value(),
+            )
+            if value
+        ),
     )
 
     def reporter(message: str) -> None:
@@ -186,7 +234,9 @@ def run_log(
         record.outcome = OUTCOME_FAILED
         # Type and message only — a full traceback in a file the user may share
         # can carry local paths, and the message is what identifies the failure.
-        record.error = f"{type(exc).__name__}: {exc}"
+        # The message is remote-influenced text, so it is redacted and stripped
+        # of control characters at this, the final persistence boundary.
+        record.error = redact_text(f"{type(exc).__name__}: {exc}", record.redactions)
         raise
     else:
         record.outcome = OUTCOME_COMPLETED

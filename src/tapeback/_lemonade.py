@@ -24,9 +24,14 @@ Transport decisions that shape the output:
   and the bearer credential must never travel in plaintext. Plain ``http://`` is
   accepted only for strictly recognized loopback endpoints (``localhost``,
   ``127.0.0.0/8``, ``::1``), and loopback requests bypass the process-wide proxy
-  configuration so an inherited ``http_proxy`` cannot capture them. Response
-  bodies are read under a hard size cap, so a broken or hostile endpoint cannot
-  exhaust client memory with an oversized body.
+  configuration so an inherited ``http_proxy`` cannot capture them. Redirects are
+  never followed — a 30x cannot move the request (and its Authorization header)
+  to a server-chosen origin or downgrade https to http. Response bodies are read
+  under a hard size cap, so a broken or hostile endpoint cannot exhaust client
+  memory with an oversized body. Server-supplied error text is sanitized —
+  length-capped, stripped of terminal-control characters, and redacted of the
+  configured API key — before it can reach a status line, the run log, or the
+  terminal.
 
 Errors are a deliberate hierarchy (see `LemonadeFallbackError`): the façade falls
 back to faster-whisper only on fallback-eligible errors, and never on authentication,
@@ -48,7 +53,7 @@ import uuid
 import wave
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, NoReturn
 
 from tapeback._backends import StatusCallback, TranscriptionInfo
 from tapeback._timing import ProgressReporter
@@ -291,9 +296,35 @@ _HTTP_NOT_FOUND = 404
 _HTTP_BAD_REQUEST = 400
 _HTTP_TOO_MANY_REQUESTS = 429
 _HTTP_INTERNAL_ERROR = 500
+_HTTP_MULTIPLE_CHOICES = 300
 
 # Default ports are dropped from the normalized base URL.
 _HTTP_DEFAULT_PORTS = {"http": 80, "https": 443}
+
+
+# Server-controlled text is never trusted verbatim in a user-visible message: a
+# hostile or broken server (or proxy) can reflect the received Authorization
+# header back in an error body, and a reflected bearer token would otherwise be
+# written to the terminal, a status event, or the run-log file. Remote detail is
+# therefore length-capped, stripped of terminal-control characters (which could
+# corrupt or disguise terminal output), and redacted of every configured secret
+# before it is interpolated into any exception message.
+_MAX_REMOTE_DETAIL_CHARS = 200
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029]")
+_REDACTED_LABEL = "[redacted]"
+
+
+def _sanitize_remote_detail(
+    text: str | None, secrets: tuple[str, ...] = (), *, limit: int = _MAX_REMOTE_DETAIL_CHARS
+) -> str:
+    """Make server-supplied text safe to interpolate into a user-visible message."""
+    if not text:
+        return ""
+    out = _CONTROL_CHARS_RE.sub("", text)
+    for secret in secrets:
+        if secret:
+            out = out.replace(secret, _REDACTED_LABEL)
+    return out[:limit]
 
 
 def _error_fields(payload: Any) -> tuple[str, str, str]:
@@ -362,7 +393,9 @@ def _is_auth_failure(status: int, structured_tokens: list[str], message_tokens: 
     return any(_has_phrase(message_tokens, phrase) for phrase in _MESSAGE_AUTH_PHRASES)
 
 
-def classify_http_failure(status: int, payload: Any) -> LemonadeError:
+def classify_http_failure(
+    status: int, payload: Any, secrets: tuple[str, ...] = ()
+) -> LemonadeError:
     """Map an HTTP error response to the deliberate exception hierarchy.
 
     Decision order, from most to least trustworthy:
@@ -378,35 +411,46 @@ def classify_http_failure(status: int, payload: Any) -> LemonadeError:
     4. A narrow, token-aware auth phrase list against the free-text message.
     5. Status semantics: 429/5xx are server failures, a bare 404 is a missing
        endpoint, other 4xx are locally invalid requests.
+
+    Classification uses the remote fields raw, but the rendered exception text
+    never does: ``message``, ``code`` and ``type`` pass through
+    `_sanitize_remote_detail` (length cap, control-character strip, and redaction
+    of every string in ``secrets`` — the caller passes the configured API key) so
+    a server that reflects the received Authorization header cannot make tapeback
+    repeat the credential into a status line, the run log, or the terminal.
     """
     error_type, error_code, message = _error_fields(payload)
     structured_tokens = _tokens(f"{error_type} {error_code}")
     message_tokens = _tokens(message)
 
+    safe_type = _sanitize_remote_detail(error_type, secrets)
+    safe_code = _sanitize_remote_detail(error_code, secrets)
+    safe_message = _sanitize_remote_detail(message, secrets)
+
     if _is_auth_failure(status, structured_tokens, message_tokens):
         return LemonadeAuthenticationError(
-            f"Lemonade rejected the credentials (HTTP {status}): {message or error_code}"
+            f"Lemonade rejected the credentials (HTTP {status}): {safe_message or safe_code}"
         )
     if "model" in structured_tokens or "model" in message_tokens:
         return LemonadeModelError(
-            f"Lemonade cannot serve the model (HTTP {status}): {error_code or message}"
+            f"Lemonade cannot serve the model (HTTP {status}): {safe_code or safe_message}"
         )
     if status == _HTTP_TOO_MANY_REQUESTS or status >= _HTTP_INTERNAL_ERROR:
         return LemonadeUnavailableError(
-            f"Lemonade server failure (HTTP {status}): {message or error_type or 'no detail'}"
+            f"Lemonade server failure (HTTP {status}): {safe_message or safe_type or 'no detail'}"
         )
     if status == _HTTP_NOT_FOUND:
         return LemonadeCapabilityError(
-            f"Lemonade has no transcription endpoint at this URL (HTTP 404): {message}"
+            f"Lemonade has no transcription endpoint at this URL (HTTP 404): {safe_message}"
         )
     if _HTTP_BAD_REQUEST <= status < _HTTP_INTERNAL_ERROR:
         # A client-side problem with the request itself: retrying or falling back
         # cannot fix a locally invalid configuration.
         return LemonadeConfigurationError(
-            f"Lemonade rejected the request as invalid (HTTP {status}): {message or error_type}"
+            f"Lemonade rejected the request as invalid (HTTP {status}): {safe_message or safe_type}"
         )
     return LemonadeUnavailableError(
-        f"Lemonade server failure (HTTP {status}): {message or error_type or 'no detail'}"
+        f"Lemonade server failure (HTTP {status}): {safe_message or safe_type or 'no detail'}"
     )
 
 
@@ -458,14 +502,36 @@ def _multipart_body(
 # Opener for strictly-loopback endpoints. An empty ProxyHandler never consults
 # the process-wide proxy configuration, so an inherited http_proxy without a
 # matching NO_PROXY cannot route a "local" upload through it.
-_NO_PROXY_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+#
+# Both openers below install _NoRedirectHandler in place of urllib's default
+# redirect handler. A redirect would move the request — carrying the bearer
+# credential in its Authorization header — to a URL the server chose, possibly
+# cross-origin or an https→http downgrade, and urllib converts redirected POSTs
+# to GETs while keeping the auth header. The default handler also consumes 30x
+# response bodies before _send() can apply _MAX_RESPONSE_BYTES. tapeback never
+# follows redirects: every 3xx surfaces as an HTTPError and is classified as a
+# sanitized Lemonade error.
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Refuse every redirect: returning None makes urllib raise HTTPError."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_NO_PROXY_OPENER = urllib.request.build_opener(
+    urllib.request.ProxyHandler({}), _NoRedirectHandler()
+)
+_DEFAULT_OPENER = urllib.request.build_opener(_NoRedirectHandler())
 
 
 def _open_url(request: urllib.request.Request, timeout: float, *, bypass_proxies: bool) -> Any:
-    """Open one URL, bypassing the inherited proxy configuration for loopback."""
+    """Open one URL, bypassing the inherited proxy configuration for loopback.
+
+    Redirects are never followed on either path — see `_NoRedirectHandler`.
+    """
     if bypass_proxies:
         return _NO_PROXY_OPENER.open(request, timeout=timeout)
-    return urllib.request.urlopen(request, timeout=timeout)
+    return _DEFAULT_OPENER.open(request, timeout=timeout)
 
 
 def _read_bounded(fp: Any, limit: int) -> bytes:
@@ -484,6 +550,33 @@ def _read_bounded(fp: Any, limit: int) -> bytes:
         pieces.append(piece)
         remaining -= len(piece)
     return b"".join(pieces)
+
+
+def _raise_for_http_error(exc: urllib.error.HTTPError, api_key: str) -> NoReturn:
+    """Map one HTTPError onto the error hierarchy. Never returns.
+
+    Redirects are never followed (see `_NoRedirectHandler`), so a 3xx arrives
+    here as an HTTPError and is classified as a sanitized error — the
+    server-chosen ``Location`` header is never echoed. Error bodies are read
+    under the response cap and classified with ``api_key`` as a redaction
+    secret, so a response that reflects the Authorization header cannot persist
+    the credential through the exception message.
+    """
+    if _HTTP_MULTIPLE_CHOICES <= exc.code < _HTTP_BAD_REQUEST:
+        raise LemonadeUnavailableError(
+            f"Lemonade responded with a redirect (HTTP {exc.code}); tapeback "
+            "never follows redirects — check the configured TAPEBACK_LEMONADE_URL."
+        ) from exc
+    raw = _read_bounded(exc, _MAX_RESPONSE_BYTES)
+    if len(raw) > _MAX_RESPONSE_BYTES:
+        # Classify by status alone rather than buffer a giant error body.
+        payload = None
+    else:
+        try:
+            payload = json.loads(raw.decode("utf-8", errors="replace"))
+        except (ValueError, OSError):
+            payload = None
+    raise classify_http_failure(exc.code, payload, secrets=(api_key,) if api_key else ()) from exc
 
 
 @dataclass(frozen=True)
@@ -641,12 +734,21 @@ def _normalize_base_url(raw: str) -> str:
     ``/v1/audio/transcriptions`` is appended, which would misroute the request to
     a path the operator never configured. Scheme and hostname are lowercased, a
     default port (80/443) is dropped, and a trailing slash is removed.
+
+    Reporting rule: the raw configured value is never echoed in an error message —
+    an invalid URL may carry embedded credentials or terminal-control characters,
+    and the failure text is shown by ``tapeback status`` and captured in run logs.
     """
     candidate = raw.strip()
     parsed = urllib.parse.urlparse(candidate)
     if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        # The raw value is deliberately not echoed: it may carry embedded
+        # credentials or control characters, and this message is printed by
+        # `tapeback status` and captured in run logs.
         raise LemonadeConfigurationError(
-            f"TAPEBACK_LEMONADE_URL is not a valid http(s) URL: {raw!r}"
+            "TAPEBACK_LEMONADE_URL is not a valid http(s) URL — it must start with "
+            "http:// or https:// and name a host. The configured value is not shown "
+            "because it may contain credentials."
         )
     if parsed.username is not None or parsed.password is not None:
         raise LemonadeConfigurationError(
@@ -663,15 +765,17 @@ def _normalize_base_url(raw: str) -> str:
     if parsed.scheme == "http" and not _is_loopback_host(parsed.hostname):
         raise LemonadeConfigurationError(
             f"TAPEBACK_LEMONADE_URL uses plaintext http for the non-loopback host "
-            f"{parsed.hostname!r}: meeting audio and the bearer credential would "
-            "travel unprotected. Use https:// for remote servers (plain http is "
-            "allowed only for localhost, 127.0.0.0/8 and ::1)."
+            f"{_sanitize_remote_detail(parsed.hostname)!r}: meeting audio and the "
+            "bearer credential would travel unprotected. Use https:// for remote "
+            "servers (plain http is allowed only for localhost, 127.0.0.0/8 and ::1)."
         )
     try:
         port = parsed.port
     except ValueError as exc:
         raise LemonadeConfigurationError(
-            f"TAPEBACK_LEMONADE_URL has an invalid port: {raw!r}"
+            "TAPEBACK_LEMONADE_URL has an invalid port — it must be an integer "
+            "between 0 and 65535. The configured value is not shown because it may "
+            "contain credentials."
         ) from exc
     scheme = parsed.scheme.lower()
     host = parsed.hostname.lower()
@@ -1095,6 +1199,9 @@ class LemonadeBackend:
         ``_MAX_RESPONSE_BYTES``: a socket timeout is not a size bound, and a
         compromised or broken endpoint must not be able to exhaust client memory
         remotely. Over-limit responses get a sanitized error with no body content.
+        Error bodies are classified with the configured API key as a redaction
+        secret, so a response that reflects the Authorization header cannot
+        persist the credential through the exception message.
 
         ``timeout`` defaults to ``settings.lemonade_timeout_seconds`` — the
         inference-oriented bound, generous because long-chunk inference
@@ -1126,16 +1233,7 @@ class LemonadeBackend:
                 )
             return raw
         except urllib.error.HTTPError as exc:
-            raw = _read_bounded(exc, _MAX_RESPONSE_BYTES)
-            if len(raw) > _MAX_RESPONSE_BYTES:
-                # Classify by status alone rather than buffer a giant error body.
-                payload = None
-            else:
-                try:
-                    payload = json.loads(raw.decode("utf-8", errors="replace"))
-                except (ValueError, OSError):
-                    payload = None
-            raise classify_http_failure(exc.code, payload) from exc
+            _raise_for_http_error(exc, self._api_key)
         except TimeoutError as exc:
             # socket.timeout is TimeoutError on Python 3.10+: this is the
             # read/inference timeout. Never resubmitted to Lemonade — the server may

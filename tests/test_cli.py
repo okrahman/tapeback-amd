@@ -195,12 +195,17 @@ def test_status_command_with_invalid_lemonade_url_reports_and_survives(runner, v
         mock_settings.return_value = Settings(
             vault_path=vault_env,
             transcription_backend="lemonade",
-            lemonade_url="http://user:pass@127.0.0.1:13305",
+            lemonade_url="http://alice:s3cret@127.0.0.1:13305",
         )
         with patch("tapeback.recorder.Recorder.get_session_info", return_value=None):
             result = runner.invoke(cli, ["status"])
     assert result.exit_code == 0
     assert "configuration invalid" in result.stderr
+    # The rejected URL carried embedded credentials; status must not display the
+    # raw configured value — status output never shows raw userinfo.
+    assert "alice" not in result.stderr
+    assert "s3cret" not in result.stderr
+    assert "127.0.0.1" not in result.stderr
 
 
 # --- _stop_and_process (dual-channel pipeline) ---

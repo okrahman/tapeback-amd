@@ -338,6 +338,7 @@ def test_live_mic_timeout_latches_and_never_resubmits_to_lemonade(tmp_path, tmp_
             return fake_urlopen(request, timeout=timeout)
 
     monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    monkeypatch.setattr("tapeback._lemonade._DEFAULT_OPENER", _FakeOpener())
     monkeypatch.setattr("tapeback._lemonade._NO_PROXY_OPENER", _FakeOpener())
 
     fw = MagicMock()
