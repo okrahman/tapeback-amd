@@ -1863,3 +1863,34 @@ def test_clipping_reconciliation_candidate_clipped_non_final_vs_final():
     # Candidate is clipped (candidate_clipped=True), existing is complete -> existing stays!
     assert len(state.segments) == 1
     assert state.segments[0].text == "Hello world complete"
+
+
+def test_absorb_and_transcribe_preserves_chronological_segment_order():
+    """Overlap absorption that appends an earlier segment maintains chronological sorting."""
+    state = _MergeState(
+        segments=[Segment(start=299.0, end=300.0, text="Bye")],
+        pinned="en",
+        probability=0.9,
+    )
+    # Chunk 1 (offset=298.0s) decodes an utterance in overlap [298.2, 298.8] that Chunk 0 missed,
+    # plus [299.0, 300.5] which replaces [299.0, 300.0].
+    candidate_payload = {
+        "segments": [
+            {"start": 0.2, "end": 0.8, "text": "thanks"},
+            {"start": 1.0, "end": 2.5, "text": "Bye everyone"},
+        ],
+    }
+    state.absorb(
+        candidate_payload,
+        offset=298.0,
+        core_start=300.0,
+        index=1,
+        chunk_duration=5.0,
+        core_end=303.0,
+        final_chunk=True,
+    )
+    assert len(state.segments) == 2
+    assert state.segments[0].start == 298.2
+    assert state.segments[0].text == "thanks"
+    assert state.segments[1].start == 299.0
+    assert state.segments[1].text == "Bye everyone"

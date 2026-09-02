@@ -776,3 +776,71 @@ def test_live_terminal_config_failure_stops_worker_and_surfaces_on_stop(
 
     with pytest.raises(LemonadeConfigurationError):
         lt.stop()
+
+
+def test_read_new_pcm_odd_byte_count_aligns_to_sample_boundaries(tmp_path):
+    """When a growing WAV has an odd byte count, available_pcm and offsets are
+    aligned to 16-bit boundaries.
+    """
+    settings = Settings(vault_path=tmp_path / "vault", live_interval=1, live_min_chunk=0.01)
+    mic_path = tmp_path / "mic.wav"
+    monitor_path = tmp_path / "monitor.wav"
+
+    # Write 44-byte WAV header + odd number of PCM bytes (e.g. 1001 bytes)
+    header = (
+        b"RIFF"
+        + struct.pack("<I", 36 + 1001)
+        + b"WAVEfmt "
+        + struct.pack("<IHHIIHH", 16, 1, 1, 48000, 96000, 2, 16)
+        + b"data"
+        + struct.pack("<I", 1001)
+    )
+    pcm_data = b"\x01\x02" * 500 + b"\x03"  # 1001 bytes
+    mic_path.write_bytes(header + pcm_data)
+
+    lt = LiveTranscriber(settings, "odd-pcm-session", mic_path, monitor_path)
+    pcm_bytes, new_offset = lt._read_new_pcm(
+        mic_path, 0, min_bytes=10, overlap_bytes=0, is_mic=True
+    )
+
+    assert pcm_bytes is not None
+    assert len(pcm_bytes) % 2 == 0
+    assert new_offset % 2 == 0
+    assert new_offset == 1000
+    assert len(pcm_bytes) == 1000
+
+    # Append more bytes (e.g. 500 bytes)
+    with open(mic_path, "ab") as f:
+        f.write(b"\x04\x05" * 250)
+
+    pcm_bytes_2, new_offset_2 = lt._read_new_pcm(
+        mic_path, new_offset, min_bytes=10, overlap_bytes=0, is_mic=True
+    )
+    assert pcm_bytes_2 is not None
+    assert len(pcm_bytes_2) % 2 == 0
+    assert new_offset_2 % 2 == 0
+    assert new_offset_2 == 1500
+    # First two bytes must be the 1000-th sample (\x03 and next \x04)
+    assert pcm_bytes_2[:2] == b"\x03\x04"
+
+
+def test_deduplicate_overlap_scopes_to_same_speaker():
+    """Deduplication only drops candidate segments matching an existing segment
+    of the same speaker.
+    """
+    existing = [
+        Segment(start=58.5, end=59.5, text="I am speaking on mic", speaker="You"),
+        Segment(start=58.0, end=59.0, text="Other speaker earlier", speaker="Other"),
+    ]
+
+    # Monitor segment from "Other" at 58.6s (within tolerance of "You" at 58.5s)
+    new_other = [Segment(start=58.6, end=59.8, text="Remote speaker in overlap", speaker="Other")]
+    kept_other = deduplicate_overlap(existing, new_other, overlap_start=60.0)
+    # Must NOT be dropped by "You" at 58.5s (different speaker)
+    assert len(kept_other) == 1
+    assert kept_other[0].text == "Remote speaker in overlap"
+
+    # Duplicate "You" segment at 58.5s should be dropped
+    new_you = [Segment(start=58.55, end=59.6, text="I am speaking on mic", speaker="You")]
+    kept_you = deduplicate_overlap(existing, new_you, overlap_start=60.0)
+    assert len(kept_you) == 0

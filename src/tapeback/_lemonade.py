@@ -1434,6 +1434,7 @@ class _MergeState:
                 self.total_text_chars += len(candidate.text) - len(existing.text)
                 self.segments[duplicate_index] = candidate
                 self._check_cumulative_bounds()
+        self.segments.sort(key=lambda s: (s.start, s.end))
 
 
 class LemonadeBackend:
@@ -1587,6 +1588,7 @@ class LemonadeBackend:
         }
         if state.probability is not None:
             info["language_probability"] = state.probability
+        state.segments.sort(key=lambda s: (s.start, s.end))
         return state.segments, info
 
     def _transcribe_wav(

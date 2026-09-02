@@ -114,13 +114,11 @@ def deduplicate_overlap(
     """Remove segments from new_segments that duplicate existing ones in the overlap zone.
 
     A new segment is considered a duplicate if its start time is within
-    DEDUP_TOLERANCE_SEC of any existing segment's start time AND it falls
-    within the overlap region (before overlap_start + tolerance).
+    DEDUP_TOLERANCE_SEC of any existing segment of the same speaker's start time
+    AND it falls within the overlap region (before overlap_start + tolerance).
     """
     if not existing or overlap_start <= 0:
         return new_segments
-
-    existing_starts = {s.start for s in existing}
 
     kept: list[Segment] = []
     for seg in new_segments:
@@ -128,7 +126,8 @@ def deduplicate_overlap(
         if seg.start >= overlap_start + DEDUP_TOLERANCE_SEC:
             kept.append(seg)
             continue
-        # Check if this segment duplicates an existing one
+        # Check if this segment duplicates an existing one of the same speaker
+        existing_starts = {s.start for s in existing if s.speaker == seg.speaker}
         is_dup = any(abs(seg.start - es) < DEDUP_TOLERANCE_SEC for es in existing_starts)
         if not is_dup:
             kept.append(seg)
@@ -376,6 +375,10 @@ class LiveTranscriber:
 
         file_size = wav_path.stat().st_size
         available_pcm = file_size - data_offset
+        if available_pcm <= 0:
+            return None, byte_offset
+        # Ensure available_pcm is aligned to sample boundaries (even number of bytes)
+        available_pcm -= available_pcm % BYTES_PER_SAMPLE
         new_bytes = available_pcm - byte_offset
 
         if new_bytes < min_bytes:
@@ -383,6 +386,7 @@ class LiveTranscriber:
 
         # Include overlap from previous chunk
         read_start = max(0, byte_offset - overlap_bytes)
+        read_start -= read_start % BYTES_PER_SAMPLE
         read_length = available_pcm - read_start
 
         with open(wav_path, "rb") as f:
@@ -500,6 +504,10 @@ class LiveTranscriber:
     ) -> bytes | None:
         """Read a specific range of raw PCM bytes from a WAV file."""
         if not wav_path.exists() or length_bytes <= 0:
+            return None
+        start_byte -= start_byte % BYTES_PER_SAMPLE
+        length_bytes -= length_bytes % BYTES_PER_SAMPLE
+        if length_bytes <= 0:
             return None
         if is_mic:
             if self._mic_data_offset is None:
