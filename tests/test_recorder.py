@@ -2,7 +2,9 @@ import json
 import signal
 from unittest.mock import MagicMock, patch
 
-from tapeback.recorder import detect_devices
+import pytest
+
+from tapeback.recorder import detect_devices, validate_session_name
 from tapeback.settings import Settings
 from tests.fixtures import create_session_file
 
@@ -80,6 +82,46 @@ def test_start_creates_session_file(recorder, settings, session_file):
     assert "started_at" in data
     assert "monitor_path" in data
     assert "mic_path" in data
+
+
+@pytest.mark.parametrize(
+    "session_name",
+    [
+        "meeting-2026",
+        "daily_standup_123",
+        "Session1",
+        "a_b-c",
+        "12345",
+    ],
+)
+def test_validate_session_name_valid(session_name):
+    """validate_session_name should accept alphanumeric characters, dashes, and underscores."""
+    validate_session_name(session_name)
+
+
+@pytest.mark.parametrize(
+    "session_name",
+    [
+        "",
+        "../etc",
+        "a/b",
+        "session name",
+        "session.name",
+        "session!",
+        "session\nname",
+        "session@name",
+    ],
+)
+def test_validate_session_name_invalid(session_name):
+    """validate_session_name should raise ValueError for invalid session names."""
+    with pytest.raises(
+        ValueError,
+        match=(
+            r"^Invalid session name: .*\. "
+            r"Only alphanumerics, dashes, and underscores are allowed\.$"
+        ),
+    ):
+        validate_session_name(session_name)
 
 
 def test_stop_sends_sigterm(recorder, session_file):
