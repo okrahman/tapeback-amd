@@ -22,6 +22,13 @@ from tapeback import const
 # would let timecodes and numbers register as repeated "words".
 _WORD_RE = re.compile(r"[^\W\d_]+", re.UNICODE)
 
+# Pre-compiled hallucination marker patterns with optional trailing attribution
+# (e.g. ".Кулакова", "DimaTorzok", "Семкин").
+_HALLUCINATION_PATTERNS = tuple(
+    re.compile(rf"{re.escape(marker)}\s*\.?\s*[^\W\d_]*", re.IGNORECASE | re.UNICODE)
+    for marker in const.HALLUCINATION_MARKERS
+)
+
 # A repeated run this long is a decoding loop, not natural emphasis. Russian and
 # English both allow a doubled word ("да да", "very very"); three in a row is where
 # it stops being speech.
@@ -69,9 +76,7 @@ def strip_hallucinations(text: str) -> str:
     Returns the cleaned text, which may be empty when the segment was nothing else.
     """
     cleaned = text
-    for marker in const.HALLUCINATION_MARKERS:
-        # Optional trailing attribution: ".Кулакова", "DimaTorzok", "Семкин".
-        pattern = re.compile(rf"{re.escape(marker)}\s*\.?\s*[^\W\d_]*", re.IGNORECASE | re.UNICODE)
+    for pattern in _HALLUCINATION_PATTERNS:
         cleaned = pattern.sub(" ", cleaned)
 
     # Only tidy up when something was actually removed. Running the cleanup
