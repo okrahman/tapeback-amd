@@ -22,6 +22,13 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - GPU telemetry and transcription isolation are disabled for the Lemonade backend (there is no local inference to sample or isolate); `TAPEBACK_DEVICE` still governs faster-whisper and diarization.
 
 ### Fixed
+- **Lemonade configuration, diagnostics, and chunk merges are safer.** URL parsing now
+  contains every lazy parser-property failure behind a fixed, cause-free configuration
+  error; successful health and system-info JSON recursively redact the configured
+  bearer token; and adjacent chunk candidates are reconciled by shared-audio
+  intersection plus normalized utterance text, preserving unrelated boundary speech.
+  Auto language detection now requires a valid language token in the first non-empty
+  response before another chunk is sent. The merge-policy cache version is bumped.
 - **Word timestamps in later Lemonade chunks are validated in one coordinate system.** Chunk-relative word times were compared against file-relative segment bounds, so with the default 300 s chunks every word-bearing chunk after the first failed validation as a capability error — discarding the completed remote work and forcing the whole recording through faster-whisper, which users running Lemonade to avoid local model/hardware requirements could not do at all. Small test offsets had hidden the bug inside the 1 s boundary slack; the sent-audio bound is now also genuinely enforceable in later chunks, where it was previously unreachable.
 - **Stopping live transcription no longer aborts healthy local fallback work or leaves recording active.** The fixed join deadline covered Lemonade HTTP requests but not model construction, downloads, isolated-worker startup, or the two faster-whisper transcriptions that can follow a server failure, so a slow supported fallback was declared wedged while `parecord` could remain active. Recording is now finalized first, and shutdown waits for the real live worker while periodically reporting elapsed time; final processing cannot race a surviving preview worker.
 - **The Lemonade "total end-to-end deadline" now actually bounds every blocking socket operation.** The full timeout went to urllib once and the deadline was only checked between body reads, so headers arriving near expiry let the next read block for another full socket timeout — and connect/upload got the full budget regardless of elapsed time. Each blocking operation — the open (connect plus headers) and every body read, success and error bodies alike — now receives the remaining monotonic budget.

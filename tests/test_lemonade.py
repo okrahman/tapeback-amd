@@ -269,13 +269,14 @@ def test_long_wav_is_chunked_with_overlap_and_shifted_timestamps(tmp_path, monke
     segments, info = LemonadeBackend(lemon_settings(tmp_path)).transcribe(wav)
 
     assert len(calls) == 3
-    # Chunk 2 starts its audio at 0.5s (1.0 core minus 0.5 overlap): the echo of
-    # "overlap-echo" is centred at 0.6 < core start 1.0, so dedup drops it.
-    assert [s.text for s in segments] == ["one", "two", "three"]
+    # A different utterance in the shared audio is retained.  Dedup compares
+    # neighboring candidates by overlap *and* normalized transcript text rather
+    # than dropping every segment whose midpoint happens to fall before the core.
+    assert [s.text for s in segments] == ["one", "overlap-echo", "two", "three"]
     # File-relative times: chunk 2's 0.6..1.4 becomes 1.1..1.9, chunk 3's 0.0 becomes 2.0.
-    assert segments[1].start == pytest.approx(1.1)
-    assert segments[1].end == pytest.approx(1.9)
-    assert segments[2].start == pytest.approx(2.0)
+    assert segments[2].start == pytest.approx(1.1)
+    assert segments[2].end == pytest.approx(1.9)
+    assert segments[3].start == pytest.approx(2.0)
     assert info["duration"] == pytest.approx(2.5)
     assert info["partial"] is False
 

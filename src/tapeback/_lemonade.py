@@ -112,7 +112,7 @@ class LemonadeAuthenticationError(LemonadeError):
 
 # Bumped whenever chunk/dedup behaviour changes what output a given WAV produces,
 # so cached channel results from an older policy are never reused.
-DEDUP_POLICY_VERSION = 1
+DEDUP_POLICY_VERSION = 2
 
 # Conservative internal cap on one chunk's WAV payload. A 300 s mono 16 kHz PCM chunk
 # is ~9.6 MB, so this binds only for unusual formats — it is a memory guard, not a
@@ -144,6 +144,7 @@ _UPLOAD_FILENAME = "audio.wav"
 # Slack allowed on segment/word timestamps past a chunk's audio length before the
 # response is rejected, to absorb server-side rounding at chunk boundaries.
 _TIMESTAMP_SLACK_SECONDS = 1.0
+_BOUNDARY_EPSILON_SECONDS = 0.001
 
 # Whisper's own language names (what a server echoing Whisper metadata returns)
 # mapped to ISO-639-1 codes. Anything already a two-letter code passes through.
@@ -361,6 +362,32 @@ def _sanitize_remote_detail(
         if secret:
             out = out.replace(secret, _REDACTED_LABEL)
     return out[:limit]
+
+
+def _redact_diagnostic(value: Any, secrets: tuple[str, ...]) -> Any:
+    """Recursively remove configured credentials from server diagnostic JSON.
+
+    Diagnostics are deliberately returned as JSON-shaped values for CLI rendering;
+    a server can reflect an Authorization header anywhere in that tree, not only in
+    an error message.  Preserve the shape and non-string scalar types so status
+    output remains useful while making every string safe to serialize.
+    """
+    if isinstance(value, str):
+        out = value
+        for secret in secrets:
+            if secret:
+                out = out.replace(secret, _REDACTED_LABEL)
+        return out
+    if isinstance(value, list):
+        return [_redact_diagnostic(item, secrets) for item in value]
+    if isinstance(value, dict):
+        return {
+            _redact_diagnostic(key, secrets) if isinstance(key, str) else key: _redact_diagnostic(
+                item, secrets
+            )
+            for key, item in value.items()
+        }
+    return value
 
 
 def _error_fields(payload: Any) -> tuple[str, str, str]:
@@ -833,9 +860,23 @@ def _normalize_base_url(raw: str) -> str:
     an invalid URL may carry embedded credentials or terminal-control characters,
     and the failure text is shown by ``tapeback status`` and captured in run logs.
     """
-    candidate = raw.strip()
-    parsed = urllib.parse.urlparse(candidate)
-    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+    # urlparse deliberately defers a few validations (notably unmatched IPv6
+    # brackets, NFKC-sensitive netloc delimiters, and ports) to lazy properties.
+    # Keep *all* parsing and property access inside this boundary: configuration
+    # failures must neither echo a potentially secret URL nor expose parser text.
+    try:
+        parsed = urllib.parse.urlparse(raw.strip())
+        scheme = parsed.scheme.lower()
+        hostname = parsed.hostname
+        username = parsed.username
+        password = parsed.password
+        port = parsed.port
+    except ValueError:
+        raise LemonadeConfigurationError(
+            "TAPEBACK_LEMONADE_URL is not a valid http(s) URL. The configured value "
+            "is not shown because it may contain credentials."
+        ) from None
+    if scheme not in ("http", "https") or not hostname:
         # The raw value is deliberately not echoed: it may carry embedded
         # credentials or control characters, and this message is printed by
         # `tapeback status` and captured in run logs.
@@ -844,7 +885,7 @@ def _normalize_base_url(raw: str) -> str:
             "http:// or https:// and name a host. The configured value is not shown "
             "because it may contain credentials."
         )
-    if parsed.username is not None or parsed.password is not None:
+    if username is not None or password is not None:
         raise LemonadeConfigurationError(
             "TAPEBACK_LEMONADE_URL must not embed credentials (user:password@host): "
             "they would be displayed by status and kept in the configured URL. Pass "
@@ -856,23 +897,14 @@ def _normalize_base_url(raw: str) -> str:
             "fragments are kept while '/v1/audio/transcriptions' is appended, so "
             "the request could target a path you never configured."
         )
-    if parsed.scheme == "http" and not _is_loopback_host(parsed.hostname):
+    if scheme == "http" and not _is_loopback_host(hostname):
         raise LemonadeConfigurationError(
             f"TAPEBACK_LEMONADE_URL uses plaintext http for the non-loopback host "
-            f"{_sanitize_remote_detail(parsed.hostname)!r}: meeting audio and the "
+            f"{_sanitize_remote_detail(hostname)!r}: meeting audio and the "
             "bearer credential would travel unprotected. Use https:// for remote "
             "servers (plain http is allowed only for localhost, 127.0.0.0/8 and ::1)."
         )
-    try:
-        port = parsed.port
-    except ValueError as exc:
-        raise LemonadeConfigurationError(
-            "TAPEBACK_LEMONADE_URL has an invalid port — it must be an integer "
-            "between 0 and 65535. The configured value is not shown because it may "
-            "contain credentials."
-        ) from exc
-    scheme = parsed.scheme.lower()
-    host = parsed.hostname.lower()
+    host = hostname.lower()
     if port is not None and port == _HTTP_DEFAULT_PORTS.get(scheme):
         port = None
     host_part = f"[{host}]" if ":" in host else host
@@ -1026,13 +1058,54 @@ class _MergeState:
     pinned: str | None
     probability: float | None
 
-    def absorb(
+    @staticmethod
+    def _same_utterance(left: Segment, right: Segment) -> bool:
+        """Whether overlap candidates say the same thing, allowing token prefixes."""
+        left_tokens = _tokens(left.text)
+        right_tokens = _tokens(right.text)
+        if not left_tokens or not right_tokens:
+            return False
+        short, long = (
+            (left_tokens, right_tokens)
+            if len(left_tokens) <= len(right_tokens)
+            else (right_tokens, left_tokens)
+        )
+        return short == long[: len(short)]
+
+    @staticmethod
+    def _prefer(
+        current: Segment,
+        candidate: Segment,
+        *,
+        current_clipped: bool,
+        candidate_clipped: bool,
+        current_index: int,
+        candidate_index: int,
+    ) -> bool:
+        """True when candidate wins the documented deterministic reconciliation."""
+        current_key = (
+            not current_clipped,
+            current.end,
+            len(current.text),
+            current_index,
+        )
+        candidate_key = (
+            not candidate_clipped,
+            candidate.end,
+            len(candidate.text),
+            candidate_index,
+        )
+        return candidate_key > current_key
+
+    def absorb(  # noqa: PLR0913 - chunk coordinates are explicit for auditability.
         self,
         payload: dict[str, Any],
         offset: float,
         core_start: float,
         index: int,
         chunk_duration: float | None = None,
+        core_end: float | None = None,
+        final_chunk: bool = False,
     ) -> None:
         """Convert one chunk response into file-relative, deduped segments.
 
@@ -1049,8 +1122,10 @@ class _MergeState:
             return
         if self.pinned is None:
             detected = payload.get("language")
-            if detected:
-                self.pinned = _remote_language(detected)
+            # Auto detection needs an answer before another request is made.  A
+            # missing/empty value is a capability failure, rather than silently
+            # submitting the next chunk without a pinned language.
+            self.pinned = _remote_language(detected)
             raw_probability = payload.get("language_probability")
             if raw_probability is None:
                 # Some Lemonade versions report it under this name instead.
@@ -1061,14 +1136,10 @@ class _MergeState:
             probability = _finite_number(raw_probability)
             if probability is not None and 0.0 <= probability <= 1.0:
                 self.probability = probability
+        candidates: list[Segment] = []
         for raw in raw_segments:
             start = offset + float(raw["start"])
             end = offset + float(raw["end"])
-            # Core-interval dedup (policy v1): a later chunk's overlap region was
-            # already heard by the previous chunk, so anything centred inside it is
-            # a duplicate and is dropped. The first chunk keeps everything.
-            if index > 0 and (start + end) / 2 < core_start:
-                continue
             words = _convert_words(
                 raw.get("words"),
                 offset,
@@ -1076,7 +1147,7 @@ class _MergeState:
                 segment_end=end,
                 chunk_end=None if chunk_duration is None else offset + chunk_duration,
             )
-            self.segments.append(
+            candidates.append(
                 Segment(
                     start=start,
                     end=end,
@@ -1084,6 +1155,44 @@ class _MergeState:
                     words=words or None,
                 )
             )
+        # Compare only adjacent-chunk candidates occupying their shared overlap.
+        # Existing unmatched speech remains; this avoids midpoint rounding dropping
+        # unrelated words close to a chunk boundary.
+        for candidate in candidates:
+            duplicate_index: int | None = None
+            for existing_index, existing in enumerate(self.segments):
+                intersects_overlap = index > 0 and max(
+                    existing.start, candidate.start, offset
+                ) < min(existing.end, candidate.end, core_start)
+                if intersects_overlap and self._same_utterance(existing, candidate):
+                    duplicate_index = existing_index
+                    break
+            if duplicate_index is None:
+                self.segments.append(candidate)
+                continue
+            existing = self.segments[duplicate_index]
+            # A segment ending at a non-final request's sent-audio boundary is
+            # likely clipped; prefer its complete neighbor before time/text ties.
+            existing_clipped = (
+                index > 0
+                and core_end is not None
+                and not final_chunk
+                and abs(existing.end - core_end) < _BOUNDARY_EPSILON_SECONDS
+            )
+            candidate_clipped = (
+                not final_chunk
+                and chunk_duration is not None
+                and abs(candidate.end - (offset + chunk_duration)) < _BOUNDARY_EPSILON_SECONDS
+            )
+            if self._prefer(
+                existing,
+                candidate,
+                current_clipped=existing_clipped,
+                candidate_clipped=candidate_clipped,
+                current_index=index - 1,
+                candidate_index=index,
+            ):
+                self.segments[duplicate_index] = candidate
 
 
 class LemonadeBackend:
@@ -1262,6 +1371,8 @@ class LemonadeBackend:
                     chunk.core_start / framerate,
                     chunk.index,
                     chunk_duration=(chunk.core_end - chunk.audio_start) / framerate,
+                    core_end=chunk.core_end / framerate,
+                    final_chunk=chunk.index == chunk.total - 1,
                 )
                 progress.update(chunk.core_end / framerate)
         return n_frames / framerate
@@ -1326,9 +1437,10 @@ class LemonadeBackend:
         request = urllib.request.Request(self._base_url + path, headers=headers, method="GET")
         raw = self._send(request, timeout)
         try:
-            return json.loads(raw.decode("utf-8", errors="replace"))
+            payload = json.loads(raw.decode("utf-8", errors="replace"))
         except (ValueError, RecursionError):
-            return {"raw": raw.decode("utf-8", errors="replace")}
+            payload = {"raw": raw.decode("utf-8", errors="replace")}
+        return _redact_diagnostic(payload, (self._api_key,) if self._api_key else ())
 
     def _send(self, request: urllib.request.Request, timeout: float | None = None) -> bytes:
         """Perform one HTTP request, mapping every failure onto the error hierarchy.

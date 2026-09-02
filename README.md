@@ -440,10 +440,10 @@ All settings via environment variables (prefix `TAPEBACK_`) or
 | `TAPEBACK_LEMONADE_URL` | `http://127.0.0.1:13305` | Lemonade Server base URL. Must be a bare URL — no embedded credentials (`user:pass@host`), query string, or fragment. Plaintext `http://` is allowed only for loopback hosts (`localhost`, `127.0.0.0/8`, `::1`); remote endpoints must use `https://` (Lemonade backend only) |
 | `TAPEBACK_LEMONADE_MODEL` | `Whisper-Large-v3-Turbo` | Model identifier as the server knows it (Lemonade backend only) |
 | `TAPEBACK_LEMONADE_API_KEY` | *(off)* | Optional bearer token; sent only in the `Authorization` header, never logged or cached (Lemonade backend only) |
-| `TAPEBACK_LEMONADE_TIMEOUT_SECONDS` | `600` | Total end-to-end request deadline — connect, upload, and every response read share one budget, each blocking operation getting the remaining time. Hitting it falls back to faster-whisper rather than resubmitting. Live transcription caps requests at 45 s so stopping can never return with a request still in flight (Lemonade backend only) |
+| `TAPEBACK_LEMONADE_TIMEOUT_SECONDS` | `600` | Total end-to-end request deadline — connect, upload, and every response read share one budget, each blocking operation getting the remaining time. The configured value applies in both batch and live mode; hitting it falls back to faster-whisper rather than resubmitting (Lemonade backend only) |
 | `TAPEBACK_LEMONADE_DIAGNOSTICS_TIMEOUT_SECONDS` | `10` | Per-request timeout for the `tapeback status` health/system-info probes only — deliberately short so a stalled endpoint cannot hang status for minutes. Transcription keeps the generous inference timeout above (Lemonade backend only) |
 | `TAPEBACK_LEMONADE_CHUNK_SECONDS` | `300` | Tapeback's own conservative chunk duration for long WAVs (0 < value ≤ 3600) — bounded memory and reportable progress, not a server limit. Changing it (or the overlap) invalidates Lemonade resume-cache entries (Lemonade backend only) |
-| `TAPEBACK_LEMONADE_OVERLAP_SECONDS` | `2.0` | Contextual overlap prepended to each chunk after the first, deduplicated against the previous chunk's core interval. Must be smaller than the chunk duration (Lemonade backend only) |
+| `TAPEBACK_LEMONADE_OVERLAP_SECONDS` | `2.0` | Contextual overlap prepended to each chunk after the first. Adjacent responses are reconciled only when overlapping timestamps and normalized text identify the same utterance; unrelated neighboring speech is retained. Must be smaller than the chunk duration (Lemonade backend only) |
 | `TAPEBACK_WHISPER_MODEL` | `large-v3-turbo` | Whisper model (`tiny`, `base`, `small`, `medium`, `large-v3-turbo`) |
 | `TAPEBACK_LANGUAGE` | `auto` | Language code (`auto` for auto-detection, or `en`, `ru`, `fr`, etc.) |
 | `TAPEBACK_DEVICE` | `cuda` | `cuda` or `cpu` |
@@ -484,9 +484,9 @@ All settings via environment variables (prefix `TAPEBACK_`) or
 
 `stop()` is a hard lifecycle boundary: when it returns, the live worker is verifiably
 dead — no further request can be issued and no live note can be written afterwards.
-With the Lemonade backend, live requests are additionally capped at 45 s (well under
-the general inference timeout; a live interval is one small pair transaction), so a
-stalled request can never outlast the shutdown wait.
+With the Lemonade backend, live requests retain the configured inference deadline.
+Shutdown remains authoritative: it waits for the real worker, reporting progress,
+before returning.
 
 ### Audio
 
