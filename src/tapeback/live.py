@@ -326,10 +326,12 @@ class LiveTranscriber:
         if (
             self._active_backend_fingerprint is not None
             and current_fp != self._active_backend_fingerprint
-            and self._segments
+            and (self._mic_byte_offset > 0 or self._monitor_byte_offset > 0)
         ):
             # Backend switch occurred mid-session: re-transcribe all committed audio
             # from offset 0 with the new backend so the transcript is never mixed.
+            # Committed audio, not emitted segments, is the state boundary: a prior
+            # decoder may have returned silence for audio the fallback can recognize.
             self._segments = self._retranscribe_full(
                 transcriber, mic_new_offset, monitor_new_offset
             )

@@ -14,7 +14,8 @@ import wave
 from email.message import Message
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
+from unittest.mock import MagicMock
 
 import pytest
 from pydantic import SecretStr
@@ -758,6 +759,109 @@ def test_remote_https_keeps_default_proxy_path(tmp_path, monkeypatch):
     assert len(calls) == 1
 
 
+@pytest.mark.parametrize(
+    "proxy_url",
+    ["https://proxy-secret@proxy.test:8443", "proxy-secret@proxy.test:8080"],
+)
+def test_https_and_schemeless_proxies_fail_closed_without_echo(proxy_url, monkeypatch):
+    """Unsupported proxy forms are rejected before connection or payload transmission."""
+    monkeypatch.setattr("urllib.request.proxy_bypass", lambda _host: False)
+    request = urllib.request.Request(
+        "https://origin.test/v1/audio/transcriptions",
+        data=b"private-wave-data",
+        headers={"Authorization": "Bearer origin-token"},
+    )
+
+    with pytest.raises(LemonadeConfigurationError) as exc_info:
+        lemon._SafeProxyHandler({}).proxy_open(request, proxy_url, "https")
+
+    message = str(exc_info.value)
+    assert "proxy-secret" not in message
+    assert request.host == "origin.test"
+    assert vars(request)["_tunnel_host"] is None
+
+
+def test_explicit_http_proxy_is_configured_as_a_connect_tunnel(monkeypatch):
+    monkeypatch.setattr("urllib.request.proxy_bypass", lambda _host: False)
+    request = urllib.request.Request("https://origin.test/v1/health")
+
+    result = lemon._SafeProxyHandler({}).proxy_open(
+        request, "http://proxy-user:proxy-pass@proxy.test:8080", "https"
+    )
+
+    assert result is None
+    assert request.host == "proxy.test:8080"
+    assert vars(request)["_tunnel_host"] == "origin.test"
+    assert request.headers["Proxy-authorization"].startswith("Basic ")
+
+
+def test_https_proxy_connect_keeps_origin_secrets_inside_tunnel(monkeypatch):
+    """The raw proxy sees CONNECT auth only; origin auth/audio follow origin TLS."""
+
+    class _ProxySocket:
+        def __init__(self):
+            self.sent = bytearray()
+            self.closed = False
+
+        def settimeout(self, _timeout):
+            pass
+
+        def sendall(self, data):
+            self.sent.extend(data)
+
+        def makefile(self, *args, **kwargs):
+            return io.BytesIO(b"HTTP/1.0 200 Connection established\r\n\r\n")
+
+        def close(self):
+            self.closed = True
+
+    class _OriginTLSSocket(_ProxySocket):
+        pass
+
+    class _TLSContext:
+        def __init__(self, tls_socket):
+            self.tls_socket = tls_socket
+            self.server_hostname = None
+            self.wrapped_socket = None
+
+        def wrap_socket(self, sock, *, server_hostname):
+            self.wrapped_socket = sock
+            self.server_hostname = server_hostname
+            return self.tls_socket
+
+    proxy_socket = _ProxySocket()
+    origin_socket = _OriginTLSSocket()
+    context = _TLSContext(origin_socket)
+    monkeypatch.setattr(lemon, "_create_deadline_connection", lambda *args: proxy_socket)
+
+    connection = lemon._DeadlineHTTPSConnection(
+        "proxy.test:8080", deadline=time.monotonic() + 5, context=context
+    )
+    connection.set_tunnel(
+        "origin.test",
+        443,
+        headers={"Proxy-Authorization": "Basic proxy-credential"},
+    )
+    connection.connect()
+    connection.request(
+        "POST",
+        "/v1/audio/transcriptions",
+        body=b"private-wave-data",
+        headers={"Authorization": "Bearer origin-token"},
+    )
+
+    proxy_bytes = bytes(proxy_socket.sent)
+    origin_bytes = bytes(origin_socket.sent)
+    assert b"CONNECT origin.test:443" in proxy_bytes
+    assert b"Proxy-Authorization: Basic proxy-credential" in proxy_bytes
+    assert b"origin-token" not in proxy_bytes
+    assert b"private-wave-data" not in proxy_bytes
+    assert context.server_hostname == "origin.test"
+    assert context.wrapped_socket is proxy_socket
+    assert b"Authorization: Bearer origin-token" in origin_bytes
+    assert b"private-wave-data" in origin_bytes
+
+
 # --- response size cap ---
 
 
@@ -1227,6 +1331,65 @@ def test_transcription_still_uses_the_inference_timeout(tmp_path, monkeypatch):
 
 
 # --- total deadline enforcement ---
+
+
+def test_dns_resolution_is_bounded_by_total_deadline(monkeypatch):
+    release = threading.Event()
+    monkeypatch.setattr(lemon, "_DNS_RESOLVER_SLOTS", threading.BoundedSemaphore(2))
+    monkeypatch.setattr(lemon.socket, "getaddrinfo", lambda *args: release.wait(timeout=2))
+
+    started = time.monotonic()
+    try:
+        with pytest.raises(TimeoutError, match="deadline during DNS"):
+            lemon._resolve_with_deadline("stalled.test", 443, time.monotonic() + 0.08)
+    finally:
+        release.set()
+
+    assert time.monotonic() - started < 0.3
+
+
+def test_stalled_dns_workers_are_resource_bounded(monkeypatch):
+    release = threading.Event()
+    calls = 0
+    calls_lock = threading.Lock()
+    monkeypatch.setattr(lemon, "_DNS_RESOLVER_SLOTS", threading.BoundedSemaphore(2))
+
+    def stalled_getaddrinfo(*args):
+        nonlocal calls
+        with calls_lock:
+            calls += 1
+        release.wait(timeout=2)
+        return []
+
+    monkeypatch.setattr(lemon.socket, "getaddrinfo", stalled_getaddrinfo)
+    try:
+        for _ in range(3):
+            with pytest.raises(TimeoutError):
+                lemon._resolve_with_deadline("stalled.test", 443, time.monotonic() + 0.05)
+    finally:
+        release.set()
+
+    assert calls == 2
+
+
+def test_connection_retries_resolved_addresses_with_remaining_budget(monkeypatch):
+    addresses = [
+        (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("192.0.2.1", 443)),
+        (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("192.0.2.2", 443)),
+    ]
+    monkeypatch.setattr(lemon, "_resolve_with_deadline", lambda *args: addresses)
+
+    sockets = [MagicMock(), MagicMock()]
+    sockets[0].connect.side_effect = OSError("first address failed")
+    monkeypatch.setattr(lemon.socket, "socket", lambda *args: sockets.pop(0))
+
+    connected = lemon._create_deadline_connection(
+        ("origin.test", 443), time.monotonic() + 5, ("127.0.0.1", 0)
+    )
+
+    connected_mock = cast(Any, connected)
+    assert connected_mock.connect.call_args.args == (("192.0.2.2", 443),)
+    assert connected_mock.bind.call_args.args == (("127.0.0.1", 0),)
 
 
 class _FakeSocket:

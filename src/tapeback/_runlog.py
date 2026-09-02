@@ -13,6 +13,7 @@ import datetime
 import json
 import os
 import re
+import urllib.parse
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -53,7 +54,6 @@ RECORDED_SETTINGS = (
     "diarize",
     "pause_threshold",
     "transcription_backend",
-    "lemonade_url",
     "lemonade_model",
     "lemonade_chunk_seconds",
     "lemonade_overlap_seconds",
@@ -71,6 +71,8 @@ _CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029]")
 
 
 _REDACTED_LABEL = "[redacted]"
+_INVALID_URL_LABEL = "[invalid/redacted]"
+_DEFAULT_URL_PORTS = {"http": 80, "https": 443}
 
 
 def redact_text(text: str, redactions: tuple[str, ...] = ()) -> str:
@@ -103,9 +105,51 @@ def _utc_now_iso() -> str:
     return datetime.datetime.now(datetime.UTC).isoformat()
 
 
+def _safe_url_origin(raw: str) -> str:
+    """Return only a credential-free http(s) origin for the run record.
+
+    The backend performs authoritative URL validation. This persistence-boundary
+    sanitizer is intentionally conservative and never returns userinfo, path,
+    query, or fragment data: any of those components can carry a reusable secret.
+    """
+    if (
+        not raw
+        or not raw.isascii()
+        or raw != raw.strip()
+        or any(ch.isspace() or not ch.isprintable() for ch in raw)
+    ):
+        return _INVALID_URL_LABEL
+    try:
+        parsed = urllib.parse.urlsplit(raw)
+        scheme = parsed.scheme.lower()
+        hostname = parsed.hostname
+        username = parsed.username
+        password = parsed.password
+        port = parsed.port
+    except ValueError:
+        return _INVALID_URL_LABEL
+    if (
+        scheme not in _DEFAULT_URL_PORTS
+        or not hostname
+        or not hostname.isascii()
+        or username is not None
+        or password is not None
+        or parsed.query
+        or parsed.fragment
+    ):
+        return _INVALID_URL_LABEL
+    host = hostname.lower()
+    if port == _DEFAULT_URL_PORTS[scheme]:
+        port = None
+    host_part = f"[{host}]" if ":" in host else host
+    return f"{scheme}://{host_part}" + (f":{port}" if port is not None else "")
+
+
 def _config_snapshot(settings: Settings) -> dict[str, object]:
     """Copy the transcription-relevant settings, and only those."""
-    return {name: getattr(settings, name) for name in RECORDED_SETTINGS}
+    config = {name: getattr(settings, name) for name in RECORDED_SETTINGS}
+    config["lemonade_url"] = _safe_url_origin(settings.lemonade_url)
+    return config
 
 
 @dataclass

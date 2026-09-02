@@ -79,6 +79,39 @@ def test_run_log_records_lemonade_config(tmp_path):
     assert "sk-lemon-secret" not in json.dumps(record)
 
 
+@pytest.mark.parametrize(
+    ("configured_url", "expected_recorded", "forbidden"),
+    [
+        ("HTTPS://Example.COM:443/api", "https://example.com", "/api"),
+        ("http://[::1]:80/private-token", "http://[::1]", "private-token"),
+        ("https://alice:password@example.test", "[invalid/redacted]", "password"),
+        ("https://example.test?token=query-secret", "[invalid/redacted]", "query-secret"),
+        ("https://example.test#fragment-secret", "[invalid/redacted]", "fragment-secret"),
+        ("https://example.test:99999", "[invalid/redacted]", "99999"),
+        (" https://example.test", "[invalid/redacted]", "example.test"),
+        ("https://example.test/\x1bsecret", "[invalid/redacted]", "secret"),
+    ],
+)
+def test_run_log_records_only_a_safe_lemonade_origin(
+    tmp_path, configured_url, expected_recorded, forbidden
+):
+    """The raw URL never crosses the durable run-log boundary, even on fw runs."""
+    settings = Settings(
+        vault_path=tmp_path / "vault",
+        run_log_dir=tmp_path / "runs",
+        transcription_backend="faster-whisper",
+        lemonade_url=configured_url,
+    )
+
+    with run_log("safe-origin", settings, lambda _m: None):
+        pass
+
+    raw = next((tmp_path / "runs").glob("*.json")).read_text()
+    record = json.loads(raw)
+    assert record["config"]["lemonade_url"] == expected_recorded
+    assert forbidden not in raw
+
+
 def test_run_log_never_records_credentials(tmp_path):
     """P0: a post-mortem file that leaks credentials is worse than no file at all."""
     settings = Settings(

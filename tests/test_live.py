@@ -444,6 +444,67 @@ def test_live_mic_timeout_latches_and_never_resubmits_to_lemonade(tmp_path, tmp_
     assert texts and all(t == "fw text" for t in texts)  # both channels came from fw
 
 
+def test_live_switch_retranscribes_committed_audio_after_empty_result(
+    tmp_path, tmp_vault, monkeypatch
+):
+    """An empty old-backend result is still committed audio, not unprocessed silence."""
+    settings = Settings(
+        vault_path=tmp_vault,
+        transcription_backend="lemonade",
+        resume_cache_dir=tmp_path / "resume",
+        live_min_chunk=0.1,
+        live_interval=60,
+        live_overlap=0.0,
+    )
+    mic_path = tmp_path / "mic.wav"
+    monitor_path = tmp_path / "monitor.wav"
+    create_mono_wav(mic_path, duration=0.5, sample_rate=48000)
+    create_mono_wav(monitor_path, duration=0.5, sample_rate=48000)
+
+    empty = json.dumps(
+        {"text": "", "segments": [], "language": "english", "language_probability": 0.9}
+    ).encode()
+    _install_urlopen(monkeypatch, [empty, empty])
+
+    fw_frame_counts: list[int] = []
+    fw = MagicMock()
+    fw.cache_fingerprint.return_value = "fw-fingerprint"
+
+    def fw_transcribe(path, **kwargs):
+        with wave.open(str(path), "rb") as wav:
+            fw_frame_counts.append(wav.getnframes())
+        return [Segment(start=0.0, end=0.4, text="recovered speech")], {
+            "language": "en",
+            "duration": 0.5,
+            "partial": False,
+        }
+
+    fw.transcribe.side_effect = fw_transcribe
+    monkeypatch.setattr(Transcriber, "_new_fw_backend", lambda self: fw)
+    monkeypatch.setattr(live_mod, "load_transcriber", lambda s: Transcriber(s))
+
+    lt = LiveTranscriber(settings, "empty-switch", mic_path, monitor_path)
+    lt._process_chunk()
+    assert lt._segments == []
+    assert lt._mic_byte_offset > 0 and lt._monitor_byte_offset > 0
+
+    with open(mic_path, "ab") as file:
+        file.write(b"\x00\x00" * 24000)
+    with open(monitor_path, "ab") as file:
+        file.write(b"\x00\x00" * 24000)
+    _install_urlopen(monkeypatch, [TimeoutError("server unavailable")])
+
+    lt._process_chunk()
+
+    # The first two fw calls retry the new 0.5 s interval. The final two are the
+    # full 1.0 s session, proving that the earlier empty result was reconsidered.
+    assert fw_frame_counts == [8000, 8000, 16000, 16000]
+    assert [segment.text for segment in lt._segments] == [
+        "recovered speech",
+        "recovered speech",
+    ]
+
+
 def test_live_second_channel_fallback_leaves_no_mixed_interval(tmp_path, tmp_vault, monkeypatch):
     """A fallback on an interval's SECOND channel must not commit a Lemonade first
     channel beside faster-whisper output.
@@ -492,6 +553,7 @@ def test_live_second_channel_fallback_leaves_no_mixed_interval(tmp_path, tmp_vau
 
     assert len(lemonade_calls) == 2  # monitor -> Lemonade ok, mic -> Lemonade timeout
     assert [s.text for s in lt._segments] == ["fw text", "fw text"]  # never mixed
+    assert fw.transcribe.call_count == 2  # first-cycle fallback needs no full replay
     assert lt._transcriber is not None
     assert lt._transcriber._backend is fw  # latched for every later interval
 

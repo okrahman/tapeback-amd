@@ -27,7 +27,9 @@ Transport decisions that shape the output:
   and the bearer credential must never travel in plaintext. Plain ``http://`` is
   accepted only for strictly recognized loopback endpoints (``localhost``,
   ``127.0.0.0/8``, ``::1``), and loopback requests bypass the process-wide proxy
-  configuration so an inherited ``http_proxy`` cannot capture them. Redirects are
+  configuration so an inherited ``http_proxy`` cannot capture them. Remote HTTPS
+  supports explicit plaintext CONNECT proxies; TLS-to-proxy and ambiguous proxy
+  schemes fail closed before a body is sent. Redirects are
   never followed — a 30x cannot move the request (and its Authorization header)
   to a server-chosen origin or downgrade https to http. Response bodies are read
   under a hard size cap, so a broken or hostile endpoint cannot exhaust client
@@ -43,14 +45,17 @@ configuration, or interrupt.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import http.client
 import ipaddress
 import json
 import math
+import queue
 import re
 import socket
 import struct
+import threading
 import time
 import unicodedata
 import urllib.error
@@ -136,6 +141,14 @@ _MAX_CHUNKS = 1000
 # trusted with audio, not with the client's memory: this bounds what a broken or
 # hostile server can make tapeback buffer before parsing.
 _MAX_RESPONSE_BYTES = 4 * 1024 * 1024
+
+# A just-expired deadline must not hand 0 (or a negative, which some stacks
+# treat as "infinite") to connect()/settimeout; expiry is checked before every
+# blocking operation. DNS runs in daemon workers because getaddrinfo() has no
+# portable cancellation API. The semaphore bounds workers that can remain stuck
+# inside the platform resolver after their callers have timed out.
+_MIN_SOCKET_TIMEOUT_SECONDS = 0.05
+_DNS_RESOLVER_SLOTS = threading.BoundedSemaphore(2)
 
 # Schema limits on per-response payload size to guard against pathological memory / CPU usage.
 _MAX_RESPONSE_SEGMENTS = 5000
@@ -621,6 +634,135 @@ class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
         return None
 
 
+class _SafeProxyHandler(urllib.request.ProxyHandler):
+    """Allow HTTPS destinations only through explicit plaintext CONNECT proxies.
+
+    urllib does not retain the proxy URL scheme after ``Request.set_proxy()``.
+    Without this check an ``https://`` proxy reaches our HTTPS connection looking
+    exactly like an ordinary HTTP CONNECT proxy. A direct TLS connection to that
+    proxy can then receive the origin Authorization header and multipart body.
+    Nested TLS is deliberately out of scope for the stdlib-only transport, so
+    unsupported or ambiguous proxy schemes fail before a socket is opened.
+    """
+
+    def proxy_open(self, req: urllib.request.Request, proxy: str, type: str) -> Any:
+        if req.host and urllib.request.proxy_bypass(req.host):
+            return None
+        if type == "https":
+            try:
+                proxy_scheme = urllib.parse.urlsplit(proxy).scheme.lower()
+            except ValueError:
+                proxy_scheme = ""
+            if proxy_scheme != "http":
+                raise LemonadeConfigurationError(
+                    "Lemonade HTTPS endpoints require an explicit http:// CONNECT proxy. "
+                    "TLS-to-proxy, scheme-less, and other proxy URLs are refused before "
+                    "credentials or audio are sent."
+                )
+        return super().proxy_open(req, proxy, type)
+
+
+def _deadline_timeout(deadline: float, phase: str) -> float:
+    """Remaining request budget for one blocking operation."""
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError(f"Lemonade request exceeded end-to-end deadline before {phase}")
+    return max(_MIN_SOCKET_TIMEOUT_SECONDS, remaining)
+
+
+def _resolve_with_deadline(host: str, port: int, deadline: float) -> list[tuple[Any, ...]]:
+    """Resolve an address without allowing platform DNS to outlive the request.
+
+    getaddrinfo() cannot be cancelled portably. A timed-out daemon may finish in
+    the background, but the two-slot semaphore prevents repeated failures from
+    creating an unbounded number of resolver threads.
+    """
+    resolver_slots = _DNS_RESOLVER_SLOTS
+    if not resolver_slots.acquire(timeout=_deadline_timeout(deadline, "DNS resolver capacity")):
+        raise TimeoutError("Lemonade request exceeded end-to-end deadline waiting for DNS")
+
+    results: queue.Queue[tuple[list[tuple[Any, ...]] | None, BaseException | None]] = queue.Queue(
+        maxsize=1
+    )
+
+    def resolve() -> None:
+        try:
+            addresses = socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM)
+            results.put((addresses, None))
+        except BaseException as exc:  # propagated on the request thread
+            results.put((None, exc))
+        finally:
+            resolver_slots.release()
+
+    worker = threading.Thread(target=resolve, name="lemonade-dns-resolver", daemon=True)
+    try:
+        worker.start()
+    except BaseException:
+        resolver_slots.release()
+        raise
+    try:
+        addresses, error = results.get(timeout=_deadline_timeout(deadline, "DNS resolution"))
+    except queue.Empty:
+        raise TimeoutError("Lemonade request exceeded end-to-end deadline during DNS") from None
+    if error is not None:
+        raise error
+    if time.monotonic() >= deadline:
+        raise TimeoutError("Lemonade request exceeded end-to-end deadline during DNS")
+    return addresses or []
+
+
+def _create_deadline_connection(
+    address: tuple[str, int],
+    deadline: float,
+    source_address: tuple[str, int] | None,
+) -> socket.socket:
+    """Resolve and connect like socket.create_connection(), under one deadline."""
+    host, port = address
+    addresses = _resolve_with_deadline(host, port, deadline)
+    last_error: OSError | None = None
+    for family, socktype, proto, _canonname, socket_address in addresses:
+        sock: socket.socket | None = None
+        try:
+            sock = socket.socket(family, socktype, proto)
+            sock.settimeout(_deadline_timeout(deadline, "TCP connection"))
+            if source_address:
+                sock.bind(source_address)
+            sock.connect(socket_address)
+            with contextlib.suppress(OSError):
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            return sock
+        except OSError as exc:
+            last_error = exc
+            if sock is not None:
+                sock.close()
+    if last_error is not None:
+        raise last_error
+    raise OSError("getaddrinfo returned no usable addresses")
+
+
+class _DeadlineFile:
+    """File wrapper that refreshes the socket budget before buffered reads."""
+
+    def __init__(self, file: Any, owner: _DeadlineSocket) -> None:
+        self._file = file
+        self._owner = owner
+
+    def read(self, *args: Any, **kwargs: Any) -> Any:
+        self._owner._update_timeout()
+        return self._file.read(*args, **kwargs)
+
+    def readline(self, *args: Any, **kwargs: Any) -> Any:
+        self._owner._update_timeout()
+        return self._file.readline(*args, **kwargs)
+
+    def readinto(self, *args: Any, **kwargs: Any) -> Any:
+        self._owner._update_timeout()
+        return self._file.readinto(*args, **kwargs)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._file, name)
+
+
 class _DeadlineSocket:
     """Socket wrapper that recalculates and updates the socket timeout before every operation."""
 
@@ -652,7 +794,7 @@ class _DeadlineSocket:
 
     def makefile(self, *args: Any, **kwargs: Any) -> Any:
         self._update_timeout()
-        return self._sock.makefile(*args, **kwargs)
+        return _DeadlineFile(self._sock.makefile(*args, **kwargs), self)
 
     def settimeout(self, timeout: float) -> None:
         remaining = self._deadline - time.monotonic()
@@ -662,6 +804,10 @@ class _DeadlineSocket:
 
     def close(self) -> None:
         return self._sock.close()
+
+    def unwrap(self) -> Any:
+        """Return the real socket for SSLContext.wrap_socket()."""
+        return self._sock
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._sock, name)
@@ -675,19 +821,11 @@ class _DeadlineHTTPConnection(http.client.HTTPConnection):
         self._deadline = deadline
 
     def connect(self) -> None:
-        if self._deadline is not None:
-            remaining = self._deadline - time.monotonic()
-            if remaining <= 0:
-                raise TimeoutError(
-                    "Lemonade request exceeded end-to-end deadline before connection"
-                )
-            timeout = max(_MIN_SOCKET_TIMEOUT_SECONDS, remaining)
-        else:
-            timeout = self.timeout
+        if self._deadline is None:
+            return super().connect()
         source_address = getattr(self, "source_address", None)
-        self.sock = socket.create_connection((self.host, self.port), timeout, source_address)
-        if self._deadline is not None:
-            self.sock = _DeadlineSocket(self.sock, self._deadline)
+        sock = _create_deadline_connection((self.host, self.port), self._deadline, source_address)
+        self.sock = _DeadlineSocket(sock, self._deadline)
 
 
 class _DeadlineHTTPSConnection(http.client.HTTPSConnection):
@@ -698,32 +836,32 @@ class _DeadlineHTTPSConnection(http.client.HTTPSConnection):
         self._deadline = deadline
 
     def connect(self) -> None:
-        if self._deadline is not None:
-            remaining = self._deadline - time.monotonic()
-            if remaining <= 0:
-                raise TimeoutError(
-                    "Lemonade request exceeded end-to-end deadline before connection"
-                )
-            timeout = max(_MIN_SOCKET_TIMEOUT_SECONDS, remaining)
-        else:
-            timeout = self.timeout
+        if self._deadline is None:
+            return super().connect()
         source_address = getattr(self, "source_address", None)
-        sock = socket.create_connection((self.host, self.port), timeout, source_address)
-        if self._deadline is not None:
-            remaining = self._deadline - time.monotonic()
-            if remaining <= 0:
-                sock.close()
-                raise TimeoutError(
-                    "Lemonade request exceeded end-to-end deadline before TLS handshake"
-                )
-            sock.settimeout(max(_MIN_SOCKET_TIMEOUT_SECONDS, remaining))
-        context = getattr(self, "_context", None)
-        if context is not None:
-            self.sock = context.wrap_socket(sock, server_hostname=self.host)
-        else:
-            self.sock = sock
-        if self._deadline is not None:
-            self.sock = _DeadlineSocket(self.sock, self._deadline)
+        raw_sock = _create_deadline_connection(
+            (self.host, self.port), self._deadline, source_address
+        )
+        try:
+            self.sock = _DeadlineSocket(raw_sock, self._deadline)
+            tunnel_host = getattr(self, "_tunnel_host", None)
+            if tunnel_host:
+                self._tunnel()  # ty: ignore[unresolved-attribute]
+                server_hostname = tunnel_host
+            else:
+                server_hostname = self.host
+            raw_sock = self.sock.unwrap()
+            raw_sock.settimeout(_deadline_timeout(self._deadline, "TLS handshake"))
+            self.sock = None
+            context = self._context  # ty: ignore[unresolved-attribute]
+            tls_sock = context.wrap_socket(raw_sock, server_hostname=server_hostname)
+            self.sock = _DeadlineSocket(tls_sock, self._deadline)
+        except BaseException:
+            if self.sock is not None:
+                self.sock.close()
+            else:
+                raw_sock.close()
+            raise
 
 
 class _DeadlineHTTPHandler(urllib.request.HTTPHandler):
@@ -757,6 +895,7 @@ _NO_PROXY_OPENER = urllib.request.build_opener(
     _DeadlineHTTPSHandler(),
 )
 _DEFAULT_OPENER = urllib.request.build_opener(
+    _SafeProxyHandler(),
     _NoRedirectHandler(),
     _DeadlineHTTPHandler(),
     _DeadlineHTTPSHandler(),
@@ -776,11 +915,6 @@ def _open_url(
     if bypass_proxies:
         return _NO_PROXY_OPENER.open(request, timeout=timeout)
     return _DEFAULT_OPENER.open(request, timeout=timeout)
-
-
-# A just-expired deadline must not hand 0 (or a negative, which some stacks
-# treat as "infinite") to open()/settimeout; the deadline check fires right after.
-_MIN_SOCKET_TIMEOUT_SECONDS = 0.05
 
 
 def _remaining(deadline: float) -> float:

@@ -202,7 +202,11 @@ What the backend does with your audio:
   on-path observer both. Plain `http://` is accepted only for strictly recognized
   loopback endpoints (`localhost`, `127.0.0.0/8`, `::1`), and those requests bypass
   the process-wide proxy configuration, so an inherited `http_proxy` without a
-  matching `NO_PROXY` cannot capture a "local" upload. HTTP redirects are never
+  matching `NO_PROXY` cannot capture a "local" upload. Remote HTTPS destinations
+  support explicit `http://` CONNECT proxies: the proxy receives only CONNECT and
+  optional proxy authentication, while origin credentials and audio stay inside the
+  origin TLS tunnel. `https://` proxy URLs (TLS to the proxy), scheme-less proxy URLs,
+  and other proxy schemes are refused before credentials or audio are sent. HTTP redirects are never
   followed, so a 30x cannot move the request (and its `Authorization` header) to a
   server-chosen origin or downgrade `https://` to `http://` — a redirecting endpoint
   is reported as an error instead. Response bodies are read under a hard size cap; a
@@ -440,7 +444,7 @@ All settings via environment variables (prefix `TAPEBACK_`) or
 | `TAPEBACK_LEMONADE_URL` | `http://127.0.0.1:13305` | Lemonade Server base URL. Must be a bare URL — no embedded credentials (`user:pass@host`), query string, or fragment. Plaintext `http://` is allowed only for loopback hosts (`localhost`, `127.0.0.0/8`, `::1`); remote endpoints must use `https://` (Lemonade backend only) |
 | `TAPEBACK_LEMONADE_MODEL` | `Whisper-Large-v3-Turbo` | Model identifier as the server knows it (Lemonade backend only) |
 | `TAPEBACK_LEMONADE_API_KEY` | *(off)* | Optional bearer token; sent only in the `Authorization` header, never logged or cached (Lemonade backend only) |
-| `TAPEBACK_LEMONADE_TIMEOUT_SECONDS` | `600` | Total end-to-end request deadline — connect, upload, and every response read share one budget, each blocking operation getting the remaining time. The configured value applies in both batch and live mode; hitting it falls back to faster-whisper rather than resubmitting (Lemonade backend only) |
+| `TAPEBACK_LEMONADE_TIMEOUT_SECONDS` | `600` | Total end-to-end request deadline — DNS resolution, connect, proxy CONNECT, TLS, upload, and every response read share one budget, each blocking operation getting the remaining time. The configured value applies in both batch and live mode; hitting it falls back to faster-whisper rather than resubmitting (Lemonade backend only) |
 | `TAPEBACK_LEMONADE_DIAGNOSTICS_TIMEOUT_SECONDS` | `10` | Per-request timeout for the `tapeback status` health/system-info probes only — deliberately short so a stalled endpoint cannot hang status for minutes. Transcription keeps the generous inference timeout above (Lemonade backend only) |
 | `TAPEBACK_LEMONADE_CHUNK_SECONDS` | `300` | Tapeback's own conservative chunk duration for long WAVs (0 < value ≤ 3600) — bounded memory and reportable progress, not a server limit. Changing it (or the overlap) invalidates Lemonade resume-cache entries (Lemonade backend only) |
 | `TAPEBACK_LEMONADE_OVERLAP_SECONDS` | `2.0` | Contextual overlap prepended to each chunk after the first. Adjacent responses are reconciled only when overlapping timestamps and normalized text identify the same utterance; unrelated neighboring speech is retained. Must be smaller than the chunk duration (Lemonade backend only) |
@@ -574,7 +578,9 @@ It holds the settings the run actually used, every status line it printed, and h
 ended (`completed` / `aborted` / `failed`, with the error for the last one). Useful when
 a transcript looks wrong and you need to know which configuration produced it, or when a
 run died and the terminal is long gone. Credentials are never recorded — the stored
-settings are an explicit allow-list. Disable with `TAPEBACK_RUN_LOG=false`.
+settings are an explicit allow-list, and `lemonade_url` contains only its normalized
+origin (`scheme://host[:port]`) or `[invalid/redacted]`, never userinfo, paths, queries,
+or fragments. Disable with `TAPEBACK_RUN_LOG=false`.
 
 ### Transcription is suddenly very slow, and the GPU is not even hot
 
@@ -690,7 +696,8 @@ message means, by cause:
 Falling back is per-run and results are cached under the backend that produced them,
 so a Lemonade result is never reused as a faster-whisper one or the reverse.
 Authentication rejections (401/403) and locally invalid configuration (malformed
-`TAPEBACK_LEMONADE_URL` or `TAPEBACK_LEMONADE_API_KEY`) do **not** fall back — they
+`TAPEBACK_LEMONADE_URL` or `TAPEBACK_LEMONADE_API_KEY`, or an unsupported
+`HTTPS_PROXY` that is not an explicit `http://` CONNECT proxy) do **not** fall back — they
 fail the run loudly, because retrying with another backend cannot fix a credential or
 a typo.
 
