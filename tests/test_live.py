@@ -1007,3 +1007,113 @@ def test_stop_and_process_survives_live_transcriber_fatal_error(tmp_path, monkey
         do_summarize=False,
     )
     assert md_path.exists()
+
+
+def test_deduplicate_overlap_does_not_overwrite_distinct_speech():
+    """Distinct speech starting near chunk boundary must never overwrite preceding speech."""
+    existing = [
+        Segment(start=59.5, end=59.9, text="Thank you.", speaker="You"),
+    ]
+    # In chunk 1, boundary is 60.0. Segment starts at 59.95s (within 0.5s tolerance)
+    # but says completely different words.
+    new_segments = [
+        Segment(start=59.95, end=62.5, text="Next topic is budget.", speaker="You"),
+    ]
+    result = deduplicate_overlap(existing, new_segments, overlap_start=60.0)
+    # Neither segment should be dropped or overwritten
+    assert len(existing) == 1
+    assert existing[0].text == "Thank you."
+    assert len(result) == 1
+    assert result[0].text == "Next topic is budget."
+
+
+def test_deduplicate_overlap_keeps_segments_at_or_past_boundary_immediately():
+    """Segments starting >= overlap_start are kept immediately even within tolerance."""
+    existing = [
+        Segment(start=59.8, end=60.0, text="Hello", speaker="You"),
+    ]
+    new_segments = [
+        Segment(start=60.1, end=61.0, text="World", speaker="You"),
+    ]
+    result = deduplicate_overlap(existing, new_segments, overlap_start=60.0)
+    assert len(existing) == 1
+    assert existing[0].text == "Hello"
+    assert len(result) == 1
+    assert result[0].text == "World"
+
+
+def test_write_markdown_failure_does_not_corrupt_segments_or_offsets(tmp_path, monkeypatch):
+    """Failed markdown write leaves segments and offsets uncommitted."""
+    settings = Settings(vault_path=tmp_path, live=True)
+    mic_path = tmp_path / "mic.wav"
+    monitor_path = tmp_path / "monitor.wav"
+    header = (
+        b"RIFF\x24\x00\x00\x00WAVEfmt \x10\x00\x00\x00\x01\x00\x01\x00"
+        b"\x80>\x00\x00\x00}\x00\x00\x02\x00\x10\x00data\x00\x00\x00\x00"
+    )
+    pcm_data = b"\x01\x00" * 48000 * 6  # 6 seconds
+    mic_path.write_bytes(header + pcm_data)
+    monitor_path.write_bytes(header + pcm_data)
+
+    lt = LiveTranscriber(settings, "atomic-test", mic_path, monitor_path)
+    mock_transcriber = MagicMock()
+    mock_transcriber._backend.cache_fingerprint.return_value = "fp1"
+    mock_transcriber.transcribe_stereo.return_value = (
+        [Segment(start=0.0, end=1.0, text="Hello", speaker="You")],
+        [],
+        {"duration": 1.0, "language": "en"},
+    )
+    monkeypatch.setattr(lt, "_ensure_transcriber", lambda: mock_transcriber)
+
+    # First attempt: simulate write error
+    err_mock = MagicMock(side_effect=OSError("Disk full"))
+    monkeypatch.setattr("tapeback.live.save_live_markdown", err_mock)
+    with pytest.raises(OSError):
+        lt._process_chunk()
+
+    # In-memory segments and offsets must remain uncommitted (empty / 0)
+    assert lt._segments == []
+    assert lt._mic_byte_offset == 0
+    assert lt._monitor_byte_offset == 0
+
+    # Second attempt: write succeeds
+    monkeypatch.setattr("tapeback.live.save_live_markdown", MagicMock())
+    lt._process_chunk()
+
+    assert len(lt._segments) == 1
+    assert lt._segments[0].text == "Hello"
+    assert lt._mic_byte_offset > 0
+
+
+def test_live_stop_processes_tail_audio_under_min_chunk(tmp_path, monkeypatch):
+    """Stop cleans up tail audio even if less than live_min_chunk (e.g. 2s < 5s)."""
+    settings = Settings(vault_path=tmp_path, live=True, live_min_chunk=5.0)
+    mic_path = tmp_path / "mic.wav"
+    monitor_path = tmp_path / "monitor.wav"
+    header = (
+        b"RIFF\x24\x00\x00\x00WAVEfmt \x10\x00\x00\x00\x01\x00\x01\x00"
+        b"\x80>\x00\x00\x00}\x00\x00\x02\x00\x10\x00data\x00\x00\x00\x00"
+    )
+    pcm_2s = b"\x01\x00" * 48000 * 2  # 2 seconds (< 5s min chunk)
+    mic_path.write_bytes(header + pcm_2s)
+    monitor_path.write_bytes(header + pcm_2s)
+
+    lt = LiveTranscriber(settings, "tail-test", mic_path, monitor_path)
+    mock_transcriber = MagicMock()
+    mock_transcriber._backend.cache_fingerprint.return_value = "fp1"
+    mock_transcriber.transcribe_stereo.return_value = (
+        [Segment(start=0.0, end=1.5, text="Tail segment", speaker="You")],
+        [],
+        {"duration": 1.5, "language": "en"},
+    )
+    monkeypatch.setattr(lt, "_ensure_transcriber", lambda: mock_transcriber)
+    monkeypatch.setattr("tapeback.live.save_live_markdown", MagicMock())
+
+    # Normal process_chunk should ignore 2s because min_bytes is 5s
+    lt._process_chunk(is_final=False)
+    assert len(lt._segments) == 0
+
+    # Stop / final chunk should process it
+    lt._process_chunk(is_final=True)
+    assert len(lt._segments) == 1
+    assert lt._segments[0].text == "Tail segment"

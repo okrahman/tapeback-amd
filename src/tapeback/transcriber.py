@@ -462,13 +462,23 @@ class Transcriber:
             for s in mic_segments_raw
         ]
 
-        # Pick info from channel with more speech
+        # Pick info from channel with more speech. When neither channel has speech
+        # (or mic was skipped), prefer monitor_info so language and duration metadata
+        # are preserved rather than replaced with empty mic_info.
         mic_speech = sum(s.end - s.start for s in mic_segments)
         monitor_speech = sum(s.end - s.start for s in monitor_segments)
-        info = mic_info if mic_speech >= monitor_speech else monitor_info
+        info = dict(
+            mic_info if (mic_result is not None and mic_speech > monitor_speech) else monitor_info
+        )
+        if "duration" not in info:
+            dur = max(
+                float(monitor_info.get("duration", 0.0)),
+                float(mic_info.get("duration", 0.0)),
+            )
+            if dur > 0.0:
+                info["duration"] = dur
         # Partiality belongs to the run, not to whichever channel happened to be
         # picked for its language — a transcript missing one channel is partial.
-        info = dict(info)
         info["partial"] = bool(
             monitor_info.get("partial") or mic_info.get("partial") or mic_skipped
         )
@@ -525,6 +535,6 @@ class Transcriber:
         Storing a partial result would make the next run reuse the truncated version
         and call it done — the opposite of what resuming is for.
         """
-        if key is None or info.get("partial") or not segments:
+        if key is None or info.get("partial"):
             return
         _resume.store(key, _resume.resume_dir(self._settings), segments, info)

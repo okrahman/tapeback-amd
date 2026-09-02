@@ -16,7 +16,11 @@ import numpy as np
 from tapeback import const
 from tapeback._gpu import free_gpu_memory
 from tapeback._lazy import load_transcriber
-from tapeback._lemonade import LemonadeAuthenticationError, LemonadeConfigurationError
+from tapeback._lemonade import (
+    LemonadeAuthenticationError,
+    LemonadeConfigurationError,
+    _utterance_tokens,
+)
 from tapeback.formatter import format_live_markdown
 from tapeback.models import Segment, Word
 from tapeback.settings import Settings
@@ -106,6 +110,20 @@ def adjust_timestamps(segments: list[Segment], offset_seconds: float) -> list[Se
     return result
 
 
+def _same_utterance(left: Segment, right: Segment) -> bool:
+    """Whether overlap candidates say the same thing, allowing token prefixes or suffixes."""
+    left_tokens = _utterance_tokens(left.text)
+    right_tokens = _utterance_tokens(right.text)
+    if not left_tokens or not right_tokens:
+        return False
+    short, long = (
+        (left_tokens, right_tokens)
+        if len(left_tokens) <= len(right_tokens)
+        else (right_tokens, left_tokens)
+    )
+    return long[: len(short)] == short or long[-len(short) :] == short
+
+
 def deduplicate_overlap(
     existing: list[Segment],
     new_segments: list[Segment],
@@ -114,8 +132,9 @@ def deduplicate_overlap(
     """Remove segments from new_segments that duplicate existing ones in the overlap zone.
 
     A new segment is considered a duplicate if its start time is within
-    DEDUP_TOLERANCE_SEC of any existing segment of the same speaker's start time
-    AND it falls within the overlap region (before overlap_start + tolerance).
+    DEDUP_TOLERANCE_SEC of any existing segment of the same speaker's start time,
+    it falls within the overlap region (before overlap_start), AND both segments
+    match as the same utterance.
 
     If a duplicate candidate in the overlap zone extends past the overlap boundary
     or has longer text than the matched existing segment, it updates/replaces the
@@ -127,8 +146,8 @@ def deduplicate_overlap(
     kept: list[Segment] = []
     replaced = False
     for seg in new_segments:
-        # Segments clearly past the overlap zone — always keep
-        if seg.start >= overlap_start + DEDUP_TOLERANCE_SEC:
+        # Segments starting at or past the overlap zone — always keep
+        if seg.start >= overlap_start:
             kept.append(seg)
             continue
 
@@ -138,7 +157,7 @@ def deduplicate_overlap(
         for i, es in enumerate(existing):
             if es.speaker == seg.speaker:
                 diff = abs(seg.start - es.start)
-                if diff < best_diff:
+                if diff < best_diff and _same_utterance(es, seg):
                     best_diff = diff
                     best_match_idx = i
 
@@ -275,7 +294,7 @@ class LiveTranscriber:
         # Process final chunk on stop only if no terminal fatal error occurred
         if self._fatal_error is None:
             try:
-                self._process_chunk()
+                self._process_chunk(is_final=True)
             except (LemonadeAuthenticationError, LemonadeConfigurationError) as exc:
                 self._fatal_error = exc
                 import traceback  # noqa: PLC0415 — only on error
@@ -293,7 +312,7 @@ class LiveTranscriber:
                     file=sys.stderr,
                 )
 
-    def _process_chunk(self) -> None:
+    def _process_chunk(self, *, is_final: bool = False) -> None:
         """Read new audio from both channels, transcribe, update markdown.
 
         Both channels of one interval are transcribed as ONE backend transaction
@@ -304,8 +323,10 @@ class LiveTranscriber:
         so the next cycle re-reads the same audio and recovers the interval instead of
         silently dropping it.
         """
-        min_bytes = int(
-            self._settings.live_min_chunk * self._settings.sample_rate * BYTES_PER_SAMPLE
+        min_bytes = (
+            0
+            if is_final
+            else int(self._settings.live_min_chunk * self._settings.sample_rate * BYTES_PER_SAMPLE)
         )
         overlap_bytes = int(
             self._settings.live_overlap * self._settings.sample_rate * BYTES_PER_SAMPLE
@@ -332,14 +353,24 @@ class LiveTranscriber:
         transcriber = self._ensure_transcriber()
         mic_segments: list[Segment] = []
         monitor_segments: list[Segment] = []
+        staging_segments = list(self._segments)
 
         if mic_pcm is not None and monitor_pcm is not None:
             mic_segments, monitor_segments = self._transcribe_pair(
-                transcriber, mic_pcm, monitor_pcm, overlap_bytes
+                transcriber,
+                mic_pcm,
+                monitor_pcm,
+                overlap_bytes,
+                existing_segments=staging_segments,
             )
         elif mic_pcm is not None:
             mic_segments = self._transcribe_chunk(
-                transcriber, mic_pcm, self._mic_byte_offset, overlap_bytes, is_mic=True
+                transcriber,
+                mic_pcm,
+                self._mic_byte_offset,
+                overlap_bytes,
+                is_mic=True,
+                existing_segments=staging_segments,
             )
         elif monitor_pcm is not None:
             monitor_segments = self._transcribe_chunk(
@@ -348,6 +379,7 @@ class LiveTranscriber:
                 self._monitor_byte_offset,
                 overlap_bytes,
                 is_mic=False,
+                existing_segments=staging_segments,
             )
 
         current_fp = transcriber._backend.cache_fingerprint()
@@ -360,13 +392,20 @@ class LiveTranscriber:
             # from offset 0 with the new backend so the transcript is never mixed.
             # Committed audio, not emitted segments, is the state boundary: a prior
             # decoder may have returned silence for audio the fallback can recognize.
-            self._segments = self._retranscribe_full(
+            updated_segments = self._retranscribe_full(
                 transcriber, mic_new_offset, monitor_new_offset
             )
-        elif mic_segments or monitor_segments:
-            self._segments.extend(mic_segments)
-            self._segments.extend(monitor_segments)
-            self._segments.sort(key=lambda s: s.start)
+        elif mic_segments or monitor_segments or staging_segments != self._segments:
+            updated_segments = staging_segments + mic_segments + monitor_segments
+            updated_segments.sort(key=lambda s: s.start)
+        else:
+            updated_segments = self._segments
+
+        # Write markdown before committing in-memory segments and cursors, so a
+        # write failure (e.g. disk full, permission error) leaves cursors in place
+        # without duplicating segments upon retry.
+        self._write_live_markdown(updated_segments)
+        self._segments = updated_segments
         self._active_backend_fingerprint = current_fp
 
         # Commit both cursors only once the whole interval succeeded — never between
@@ -374,7 +413,6 @@ class LiveTranscriber:
         # forever.
         self._mic_byte_offset = mic_new_offset
         self._monitor_byte_offset = monitor_new_offset
-        self._write_live_markdown()
 
     def _read_new_pcm(
         self,
@@ -411,7 +449,7 @@ class LiveTranscriber:
         available_pcm -= available_pcm % BYTES_PER_SAMPLE
         new_bytes = available_pcm - byte_offset
 
-        if new_bytes < min_bytes:
+        if new_bytes < max(BYTES_PER_SAMPLE, min_bytes):
             return None, byte_offset
 
         # Include overlap from previous chunk
@@ -438,6 +476,7 @@ class LiveTranscriber:
         overlap_bytes: int,
         *,
         is_mic: bool,
+        existing_segments: list[Segment] | None = None,
     ) -> list[Segment]:
         """Resample, write temp WAV, transcribe, adjust timestamps, deduplicate."""
         samples_16k = resample_48k_to_16k(pcm_bytes)
@@ -464,7 +503,13 @@ class LiveTranscriber:
         finally:
             chunk_path.unlink(missing_ok=True)
 
-        return self._finalize_segments(segments, byte_offset, overlap_bytes, is_mic=is_mic)
+        return self._finalize_segments(
+            segments,
+            byte_offset,
+            overlap_bytes,
+            is_mic=is_mic,
+            existing_segments=existing_segments,
+        )
 
     def _transcribe_pair(
         self,
@@ -472,6 +517,8 @@ class LiveTranscriber:
         mic_pcm: bytes,
         monitor_pcm: bytes,
         overlap_bytes: int,
+        *,
+        existing_segments: list[Segment] | None = None,
     ) -> tuple[list[Segment], list[Segment]]:
         """Transcribe one mic/monitor pair as ONE backend transaction.
 
@@ -503,10 +550,18 @@ class LiveTranscriber:
             monitor_path.unlink(missing_ok=True)
 
         mic_segments = self._finalize_segments(
-            mic_segments, self._mic_byte_offset, overlap_bytes, is_mic=True
+            mic_segments,
+            self._mic_byte_offset,
+            overlap_bytes,
+            is_mic=True,
+            existing_segments=existing_segments,
         )
         monitor_segments = self._finalize_segments(
-            monitor_segments, self._monitor_byte_offset, overlap_bytes, is_mic=False
+            monitor_segments,
+            self._monitor_byte_offset,
+            overlap_bytes,
+            is_mic=False,
+            existing_segments=existing_segments,
         )
         return mic_segments, monitor_segments
 
@@ -640,6 +695,7 @@ class LiveTranscriber:
         overlap_bytes: int,
         *,
         is_mic: bool,
+        existing_segments: list[Segment] | None = None,
     ) -> list[Segment]:
         """Shift to absolute wall-clock time, assign the speaker, dedup the overlap.
 
@@ -668,7 +724,8 @@ class LiveTranscriber:
 
         # Deduplicate overlap with existing segments
         overlap_boundary = byte_offset / (self._settings.sample_rate * BYTES_PER_SAMPLE)
-        return deduplicate_overlap(self._segments, segments, overlap_boundary)
+        target_existing = self._segments if existing_segments is None else existing_segments
+        return deduplicate_overlap(target_existing, segments, overlap_boundary)
 
     @staticmethod
     def _write_chunk_wav(samples_16k: np.ndarray, path: Path) -> None:
@@ -679,10 +736,11 @@ class LiveTranscriber:
             wf.setframerate(const.SAMPLE_RATE_16K)
             wf.writeframes(samples_16k.tobytes())
 
-    def _write_live_markdown(self) -> None:
+    def _write_live_markdown(self, segments: list[Segment] | None = None) -> None:
         """Write (or overwrite) the live markdown file in the vault."""
+        target_segments = self._segments if segments is None else segments
         markdown = format_live_markdown(
-            self._segments,
+            target_segments,
             self._session_name,
             self._settings.language,
         )

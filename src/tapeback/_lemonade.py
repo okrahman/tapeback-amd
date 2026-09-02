@@ -923,6 +923,26 @@ def _remaining(deadline: float) -> float:
     return max(_MIN_SOCKET_TIMEOUT_SECONDS, deadline - time.monotonic())
 
 
+def _extract_socket(obj: Any) -> Any:
+    """Traverse response wrapper layers to find the underlying socket."""
+    curr = obj
+    visited = set()
+    while curr is not None and id(curr) not in visited:
+        visited.add(id(curr))
+        has_sock_fn = hasattr(curr, "getsockname") or hasattr(curr, "fileno")
+        if hasattr(curr, "settimeout") and has_sock_fn:
+            return curr
+        if hasattr(curr, "_sock"):
+            return curr._sock
+        if hasattr(curr, "raw"):
+            curr = curr.raw
+        elif hasattr(curr, "fp"):
+            curr = curr.fp
+        else:
+            break
+    return None
+
+
 def _bound_socket_timeout(fp: Any, deadline: float) -> None:
     """Set the underlying socket's inactivity timeout to the remaining budget.
 
@@ -932,13 +952,12 @@ def _bound_socket_timeout(fp: Any, deadline: float) -> None:
     transports) keeps its previous timeout, and the deadline check between reads
     still applies.
     """
-    try:
-        sock = fp.fp.raw._sock  # http.client.HTTPResponse -> BufferedReader -> SocketIO
-    except AttributeError:
+    sock = _extract_socket(fp)
+    if sock is None:
         return
     try:
         sock.settimeout(_remaining(deadline))
-    except OSError:
+    except (OSError, AttributeError):
         return
 
 
@@ -1241,7 +1260,10 @@ def _finite_number(value: Any) -> float | None:
     """
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    number = float(value)
+    try:
+        number = float(value)
+    except OverflowError:
+        return None
     if not math.isfinite(number):
         return None
     return number
@@ -1457,8 +1479,17 @@ class _MergeState:
         )
         return candidate_key > current_key
 
+    @staticmethod
+    def _is_token_subsequence(sub: list[str], full: list[str]) -> bool:
+        """Whether sub is a non-empty contiguous token sub-sequence of full."""
+        if not sub or not full or len(sub) > len(full):
+            return False
+        sub_len = len(sub)
+        return any(full[i : i + sub_len] == sub for i in range(len(full) - sub_len + 1))
+
     def _purge_subsumed(self, duplicate_index: int, candidate: Segment, offset: float) -> None:
         """Purge any adjacent fragments from chunk N-1 that are subsumed by candidate's span."""
+        cand_tokens = _utterance_tokens(candidate.text)
         pruned: list[Segment] = []
         for i, s in enumerate(self.segments):
             if i == duplicate_index:
@@ -1467,11 +1498,7 @@ class _MergeState:
                 s.start >= candidate.start - _TIMESTAMP_SLACK_SECONDS
                 and s.end <= candidate.end + _TIMESTAMP_SLACK_SECONDS
                 and s.start >= offset - _TIMESTAMP_SLACK_SECONDS
-                and (
-                    candidate.text.startswith(s.text)
-                    or candidate.text.endswith(s.text)
-                    or s.text in candidate.text
-                )
+                and self._is_token_subsequence(_utterance_tokens(s.text), cand_tokens)
             ):
                 s_words = len(s.words) if s.words else 0
                 self.total_words -= s_words
@@ -1931,9 +1958,19 @@ class LemonadeBackend:
             ) from exc
         except urllib.error.URLError as exc:
             reason = getattr(exc, "reason", exc)
+            detail = (
+                _sanitize_remote_detail(
+                    str(reason), secrets=(self._api_key,) if self._api_key else ()
+                )
+                or type(reason).__name__
+            )
             if isinstance(reason, TimeoutError):
                 # Connect-phase timeout: the server never became reachable.
-                raise LemonadeUnavailableError(f"Lemonade connection timed out: {reason}") from exc
-            raise LemonadeUnavailableError(f"Lemonade server unreachable: {reason}") from exc
+                raise LemonadeUnavailableError(f"Lemonade connection timed out: {detail}") from exc
+            raise LemonadeUnavailableError(f"Lemonade server unreachable: {detail}") from exc
         except OSError as exc:
-            raise LemonadeUnavailableError(f"Lemonade connection failed: {exc}") from exc
+            detail = (
+                _sanitize_remote_detail(str(exc), secrets=(self._api_key,) if self._api_key else ())
+                or type(exc).__name__
+            )
+            raise LemonadeUnavailableError(f"Lemonade connection failed: {detail}") from exc

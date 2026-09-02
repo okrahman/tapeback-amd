@@ -22,6 +22,21 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - GPU telemetry and transcription isolation are disabled for the Lemonade backend (there is no local inference to sample or isolate); `TAPEBACK_DEVICE` still governs faster-whisper and diarization.
 
 ### Fixed
+- **Live deduplication and chunk boundaries.** Overlap deduplication now matches utterances
+  token-by-token rather than overwriting trailing speech in-place based purely on timestamp
+  proximity, keeping distinct utterances intact across chunk boundaries. Live stops transcribe
+  all trailing audio under `live_min_chunk` rather than dropping chunks under 5 seconds.
+  Live transcript writes are staged before mutating in-memory segments and cursors, preventing
+  duplicate accumulation on retry if disk writing encounters an error.
+- **Transport security and socket deadlines.** Exception details in `URLError` and `OSError`
+  are sanitized for credentials and control characters before wrapping in
+  `LemonadeUnavailableError`. `_bound_socket_timeout` traverses underlying response and buffer
+  wrappers to set socket timeouts directly against the deadline budget. Subsumed word purging
+  in chunk overlap verifies whole-token subsequences instead of naive substrings.
+- **Stereo and resume metadata preservation.** When both channels or a skipped mic contain
+  silence, monitor channel duration and language metadata are preserved. Complete silent channels
+  (`segments=[]`, `partial=False`) are safely cached in the resume store to avoid redundant
+  re-transcription on reruns.
 - **Lemonade configuration, diagnostics, and chunk merges are safer.** URL parsing now
   contains every lazy parser-property failure behind a fixed, cause-free configuration
   error; successful health and system-info JSON recursively redact the configured

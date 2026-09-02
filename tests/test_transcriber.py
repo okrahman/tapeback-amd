@@ -407,3 +407,30 @@ def test_plain_inference_when_batch_size_zero(settings):
 
     instance.transcribe.assert_called_once()
     mock_batched_cls.assert_not_called()
+
+
+def test_assemble_stereo_preserves_monitor_metadata_on_silence(settings):
+    """When both channels contain silence, monitor_info metadata is preserved."""
+    transcriber = Transcriber(settings)
+    monitor_result = ([], {"duration": 10.0, "language": "fr", "language_probability": 0.95})
+    mic_result = ([], {"duration": 10.0, "language": "en", "language_probability": 0.5})
+
+    mic_segs, mon_segs, info = transcriber._assemble_stereo(
+        mic_result=mic_result,
+        monitor_result=monitor_result,
+        mic_skipped=False,
+    )
+    assert mic_segs == []
+    assert mon_segs == []
+    assert info["language"] == "fr"
+    assert info["duration"] == 10.0
+
+    # Also test when mic is skipped
+    _, _, info_skipped = transcriber._assemble_stereo(
+        mic_result=None,
+        monitor_result=monitor_result,
+        mic_skipped=True,
+    )
+    assert info_skipped["language"] == "fr"
+    assert info_skipped["duration"] == 10.0
+    assert info_skipped["partial"] is True

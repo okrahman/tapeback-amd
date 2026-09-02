@@ -287,3 +287,21 @@ def test_load_handles_recursion_error(tmp_path, monkeypatch):
 
     monkeypatch.setattr("tapeback._resume.json.loads", _raise_recursion)
     assert _resume.load(key, tmp_path) is None
+
+
+def test_complete_silent_channel_is_cached(cached_settings, audio):
+    """A completely silent channel with empty segments is stored and reloaded from cache."""
+    key = _resume.resume_key(audio, "test_fp", "test_stage")
+    assert key is not None
+    r_dir = _resume.resume_dir(cached_settings)
+
+    transcriber = Transcriber(cached_settings)
+    info = {"duration": 5.0, "language": "en", "partial": False}
+    transcriber._store_resume(key, [], info)
+
+    loaded = _resume.load(key, r_dir)
+    assert loaded is not None
+    loaded_segs, loaded_info = loaded
+    assert loaded_segs == []
+    assert loaded_info["duration"] == 5.0
+    assert loaded_info["language"] == "en"

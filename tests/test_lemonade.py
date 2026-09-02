@@ -2141,3 +2141,85 @@ def test_transcribe_non_wav_derives_duration_from_segments(tmp_path, monkeypatch
     segments, info = backend.transcribe(fake_audio)
     assert len(segments) == 2
     assert info["duration"] == 12.3
+
+
+def test_send_sanitizes_urlerror_and_oserror_secrets_and_control_chars(tmp_path, monkeypatch):
+    """URLError and OSError in _send must sanitize secrets and terminal escape characters."""
+    backend = LemonadeBackend(lemon_settings(tmp_path, lemonade_api_key="secret-key-12345"))
+
+    def mock_open_urlerror(*args, **kwargs):
+        raise urllib.error.URLError("Failed to connect: secret-key-12345\x1b[31mcolors\x07")
+
+    monkeypatch.setattr(lemon, "_open_url", mock_open_urlerror)
+    with pytest.raises(LemonadeUnavailableError) as exc_info:
+        backend._send(urllib.request.Request("http://localhost:8000/v1/audio/transcriptions"), 10.0)
+
+    msg = str(exc_info.value)
+    assert "secret-key-12345" not in msg
+    assert "[redacted]" in msg
+    assert "\x1b" not in msg
+    assert "\x07" not in msg
+
+    def mock_open_oserror(*args, **kwargs):
+        raise OSError("Connection refused: secret-key-12345\x1b[2J")
+
+    monkeypatch.setattr(lemon, "_open_url", mock_open_oserror)
+    with pytest.raises(LemonadeUnavailableError) as exc_info:
+        backend._send(urllib.request.Request("http://localhost:8000/v1/audio/transcriptions"), 10.0)
+
+    msg = str(exc_info.value)
+    assert "secret-key-12345" not in msg
+    assert "[redacted]" in msg
+    assert "\x1b" not in msg
+
+
+def test_purge_subsumed_preserves_distinct_short_words():
+    """_purge_subsumed does not delete distinct short words that are substrings."""
+    state = lemon._MergeState(
+        segments=[
+            Segment(start=9.8, end=10.2, text="in", speaker="Other"),
+            Segment(start=10.3, end=10.8, text="walking", speaker="Other"),
+        ],
+        pinned=None,
+        probability=1.0,
+    )
+    # "in" must NOT be purged by "walking", even though "in" is a substring of "walking"!
+    cand = Segment(start=9.8, end=10.8, text="walking", speaker="Other")
+    state._purge_subsumed(duplicate_index=1, candidate=cand, offset=9.0)
+
+    assert len(state.segments) == 2
+    assert state.segments[0].text == "in"
+    assert state.segments[1].text == "walking"
+
+
+def test_bound_socket_timeout_traverses_response_layers():
+    """_bound_socket_timeout traverses response wrapper layers to set timeout."""
+    mock_sock = MagicMock()
+    mock_sock.fileno = MagicMock()
+    mock_sock.settimeout = MagicMock()
+
+    class SocketIO:
+        _sock = mock_sock
+
+    class BufferedReader:
+        raw = SocketIO()
+
+    class HTTPResponse:
+        fp = BufferedReader()
+
+    class AddInfoUrl:
+        fp = HTTPResponse()
+
+    resp = AddInfoUrl()
+    deadline = time.monotonic() + 5.0
+    lemon._bound_socket_timeout(resp, deadline)
+    mock_sock.settimeout.assert_called_once()
+    timeout_arg = mock_sock.settimeout.call_args[0][0]
+    assert 4.0 <= timeout_arg <= 5.0
+
+
+def test_finite_number_overflow():
+    """_finite_number returns None on overflow instead of raising OverflowError."""
+    assert lemon._finite_number(10**400) is None
+    assert lemon._finite_number(-(10**400)) is None
+    assert lemon._finite_number(42) == 42.0
