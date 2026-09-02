@@ -81,43 +81,45 @@ def stop_and_process(
 
     session_name = monitor_path.parent.name
 
-    with run_log(session_name, settings, on_status) as report:
-        report("Merging audio channels...")
-        output_dir = monitor_path.parent
-        with stage_timer("merge", report):
-            stereo_path = merge_channels(monitor_path, mic_path, output_dir)
+    try:
+        with run_log(session_name, settings, on_status) as report:
+            report("Merging audio channels...")
+            output_dir = monitor_path.parent
+            with stage_timer("merge", report):
+                stereo_path = merge_channels(monitor_path, mic_path, output_dir)
 
-        audio_dest = save_audio_to_vault(stereo_path, settings, session_name)
-        report(f"Audio saved: {audio_dest}")
+            audio_dest = save_audio_to_vault(stereo_path, settings, session_name)
+            report(f"Audio saved: {audio_dest}")
 
-        segments, info, raw_segments = process_stereo_file(
-            stereo_path, output_dir, settings, diarize=diarize, on_status=report
-        )
+            segments, info, raw_segments = process_stereo_file(
+                stereo_path, output_dir, settings, diarize=diarize, on_status=report
+            )
 
-        audio_rel_path = f"{settings.attachments_dir}/{session_name}.wav"
+            audio_rel_path = f"{settings.attachments_dir}/{session_name}.wav"
 
-        markdown = format_markdown(
-            segments=segments,
-            meta=TranscriptMeta(
-                session_name=session_name,
-                audio_rel_path=audio_rel_path,
-                duration_seconds=float(info.get("duration", 0.0)),
-                language=str(info.get("language", settings.language)),
-                partial=bool(info.get("partial")),
-            ),
-            raw_segments=raw_segments,
-        )
+            markdown = format_markdown(
+                segments=segments,
+                meta=TranscriptMeta(
+                    session_name=session_name,
+                    audio_rel_path=audio_rel_path,
+                    duration_seconds=float(info.get("duration", 0.0)),
+                    language=str(info.get("language", settings.language)),
+                    partial=bool(info.get("partial")),
+                ),
+                raw_segments=raw_segments,
+            )
 
-        md_path = save_markdown_to_vault(markdown, settings, session_name)
-        report(f"Saved: {md_path}")
+            md_path = save_markdown_to_vault(markdown, settings, session_name)
+            report(f"Saved: {md_path}")
 
-        if live_transcriber is not None:
-            remove_live_markdown(settings, session_name)
+            if live_transcriber is not None:
+                remove_live_markdown(settings, session_name)
 
-        if do_summarize:
-            _maybe_summarize(md_path, settings, report)
+            if do_summarize:
+                _maybe_summarize(md_path, settings, report)
+    finally:
+        shutil.rmtree(monitor_path.parent, ignore_errors=True)
 
-    shutil.rmtree(monitor_path.parent, ignore_errors=True)
     return md_path
 
 
@@ -137,41 +139,43 @@ def process_file(
 
     tmp_dir = Path(tempfile.mkdtemp(prefix="tapeback_"))
 
-    with run_log(name, settings, on_status) as report:
-        audio_dest = save_audio_to_vault(audio_path, settings, name)
-        report(f"Audio saved: {audio_dest}")
+    try:
+        with run_log(name, settings, on_status) as report:
+            audio_dest = save_audio_to_vault(audio_path, settings, name)
+            report(f"Audio saved: {audio_dest}")
 
-        if is_stereo(audio_path):
-            report("Stereo file detected, using dual-channel pipeline...")
-            segments, info, raw_segments = process_stereo_file(
-                audio_path, tmp_dir, settings, diarize=diarize, on_status=report
+            if is_stereo(audio_path):
+                report("Stereo file detected, using dual-channel pipeline...")
+                segments, info, raw_segments = process_stereo_file(
+                    audio_path, tmp_dir, settings, diarize=diarize, on_status=report
+                )
+            else:
+                segments, info, raw_segments = process_mono_file(
+                    audio_path, tmp_dir, settings, diarize=diarize, on_status=report
+                )
+
+            audio_rel_path = f"{settings.attachments_dir}/{name}.wav"
+
+            markdown = format_markdown(
+                segments=segments,
+                meta=TranscriptMeta(
+                    session_name=name,
+                    audio_rel_path=audio_rel_path,
+                    duration_seconds=float(info.get("duration", 0.0)),
+                    language=str(info.get("language", settings.language)),
+                    partial=bool(info.get("partial")),
+                ),
+                raw_segments=raw_segments,
             )
-        else:
-            segments, info, raw_segments = process_mono_file(
-                audio_path, tmp_dir, settings, diarize=diarize, on_status=report
-            )
 
-        audio_rel_path = f"{settings.attachments_dir}/{name}.wav"
+            md_path = save_markdown_to_vault(markdown, settings, name)
+            report(f"Saved: {md_path}")
 
-        markdown = format_markdown(
-            segments=segments,
-            meta=TranscriptMeta(
-                session_name=name,
-                audio_rel_path=audio_rel_path,
-                duration_seconds=float(info.get("duration", 0.0)),
-                language=str(info.get("language", settings.language)),
-                partial=bool(info.get("partial")),
-            ),
-            raw_segments=raw_segments,
-        )
+            if do_summarize:
+                _maybe_summarize(md_path, settings, report)
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
-        md_path = save_markdown_to_vault(markdown, settings, name)
-        report(f"Saved: {md_path}")
-
-        if do_summarize:
-            _maybe_summarize(md_path, settings, report)
-
-    shutil.rmtree(tmp_dir, ignore_errors=True)
     return md_path
 
 
