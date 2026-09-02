@@ -704,7 +704,8 @@ def test_fallback_latch_is_installed_before_local_backend_construction(tmp_path,
 
     monkeypatch.setattr(Transcriber, "_new_fw_backend", failing_new_fw)
 
-    # First attempt: Lemonade times out, fallback initiates and attempts fw construction, which fails
+    # First attempt: Lemonade times out, fallback initiates and attempts fw construction,
+    # which fails
     with pytest.raises(RuntimeError, match="Model download failed"):
         transcriber.transcribe(wav)
 

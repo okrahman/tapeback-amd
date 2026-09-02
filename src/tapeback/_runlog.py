@@ -52,6 +52,13 @@ RECORDED_SETTINGS = (
     "gate_mic_silence",
     "diarize",
     "pause_threshold",
+    "transcription_backend",
+    "lemonade_url",
+    "lemonade_model",
+    "lemonade_chunk_seconds",
+    "lemonade_overlap_seconds",
+    "lemonade_timeout_seconds",
+    "lemonade_diagnostics_timeout_seconds",
 )
 
 # Keep the directory from growing without bound; oldest records are dropped first.

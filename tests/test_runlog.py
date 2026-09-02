@@ -46,7 +46,37 @@ def test_run_log_records_config_events_and_outcome(tmp_path):
     ]
     assert record["config"]["whisper_model"] == "large-v3-turbo"
     assert record["config"]["chunk_length"] == 30
+    assert record["config"]["transcription_backend"] == "faster-whisper"
+    assert record["config"]["lemonade_url"] == "http://127.0.0.1:13305"
+    assert record["config"]["lemonade_model"] == "Whisper-Large-v3-Turbo"
+    assert record["config"]["lemonade_chunk_seconds"] == 300.0
+    assert record["config"]["lemonade_overlap_seconds"] == 2.0
     assert record["finished_at"] is not None
+
+
+def test_run_log_records_lemonade_config(tmp_path):
+    settings = Settings(
+        vault_path=tmp_path / "vault",
+        run_log_dir=tmp_path / "runs",
+        transcription_backend="lemonade",
+        lemonade_url="http://localhost:8000",
+        lemonade_model="custom-whisper",
+        lemonade_chunk_seconds=120.0,
+        lemonade_overlap_seconds=3.0,
+        lemonade_api_key=SecretStr("sk-lemon-secret"),
+    )
+
+    with run_log("lemon-session", settings, lambda _m: None) as report:
+        report("Lemonade transcription started")
+
+    record = _read_only_record(tmp_path / "runs")
+    assert record["config"]["transcription_backend"] == "lemonade"
+    assert record["config"]["lemonade_url"] == "http://localhost:8000"
+    assert record["config"]["lemonade_model"] == "custom-whisper"
+    assert record["config"]["lemonade_chunk_seconds"] == 120.0
+    assert record["config"]["lemonade_overlap_seconds"] == 3.0
+    assert "lemonade_api_key" not in record["config"]
+    assert "sk-lemon-secret" not in json.dumps(record)
 
 
 def test_run_log_never_records_credentials(tmp_path):

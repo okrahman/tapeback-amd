@@ -254,7 +254,8 @@ class LiveTranscriber:
                 import traceback  # noqa: PLC0415 — only on error
 
                 print(
-                    f"Error: Terminal live transcription final chunk error:\n{traceback.format_exc()}",
+                    "Error: Terminal live transcription final chunk error:\n"
+                    f"{traceback.format_exc()}",
                     file=sys.stderr,
                 )
             except Exception:
@@ -540,11 +541,23 @@ class LiveTranscriber:
             monitor_path.unlink(missing_ok=True)
 
         mic_segs = [
-            Segment(start=s.start, end=s.end, text=s.text, words=s.words, speaker=const.SPEAKER_YOU)
+            Segment(
+                start=s.start,
+                end=s.end,
+                text=s.text,
+                words=s.words,
+                speaker=const.SPEAKER_YOU,
+            )
             for s in mic_segs
         ]
         monitor_segs = [
-            Segment(start=s.start, end=s.end, text=s.text, words=s.words, speaker=const.SPEAKER_OTHER)
+            Segment(
+                start=s.start,
+                end=s.end,
+                text=s.text,
+                words=s.words,
+                speaker=const.SPEAKER_OTHER,
+            )
             for s in monitor_segs
         ]
         return mic_segs, monitor_segs

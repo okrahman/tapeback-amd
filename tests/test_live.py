@@ -761,7 +761,9 @@ def test_live_terminal_config_failure_stops_worker_and_surfaces_on_stop(
     create_mono_wav(mic_path, duration=0.5, sample_rate=48000)
     create_mono_wav(monitor_path, duration=0.5, sample_rate=48000)
 
-    config_error = urllib.error.HTTPError("http://x", 400, "bad request", Message(), io.BytesIO(b"{}"))
+    config_error = urllib.error.HTTPError(
+        "http://x", 400, "bad request", Message(), io.BytesIO(b"{}")
+    )
     lemonade_calls = _install_urlopen(monkeypatch, [config_error])
     monkeypatch.setattr(live_mod, "load_transcriber", lambda s: Transcriber(s))
 
@@ -774,4 +776,3 @@ def test_live_terminal_config_failure_stops_worker_and_surfaces_on_stop(
 
     with pytest.raises(LemonadeConfigurationError):
         lt.stop()
-

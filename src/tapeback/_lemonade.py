@@ -137,6 +137,17 @@ _MAX_CHUNKS = 1000
 # hostile server can make tapeback buffer before parsing.
 _MAX_RESPONSE_BYTES = 4 * 1024 * 1024
 
+# Schema limits on per-response payload size to guard against pathological memory / CPU usage.
+_MAX_RESPONSE_SEGMENTS = 5000
+_MAX_SEGMENT_WORDS = 1000
+_MAX_SEGMENT_TEXT_CHARS = 10_000
+_MAX_WORD_TEXT_CHARS = 250
+
+# Cumulative bounds on total output across all chunk responses for a single transcription.
+_MAX_CUMULATIVE_SEGMENTS = 50_000
+_MAX_CUMULATIVE_WORDS = 500_000
+_MAX_CUMULATIVE_TEXT_CHARS = 5_000_000
+
 # The multipart part name under which audio is uploaded. Always opaque: the source
 # filename is attacker-influencable in principle (POSIX names may contain quotes
 # and newlines, which would be interpolated into a MIME header verbatim) and
@@ -673,9 +684,8 @@ class _DeadlineHTTPConnection(http.client.HTTPConnection):
             timeout = max(_MIN_SOCKET_TIMEOUT_SECONDS, remaining)
         else:
             timeout = self.timeout
-        self.sock = socket.create_connection(
-            (self.host, self.port), timeout, self.source_address
-        )
+        source_address = getattr(self, "source_address", None)
+        self.sock = socket.create_connection((self.host, self.port), timeout, source_address)
         if self._deadline is not None:
             self.sock = _DeadlineSocket(self.sock, self._deadline)
 
@@ -697,9 +707,8 @@ class _DeadlineHTTPSConnection(http.client.HTTPSConnection):
             timeout = max(_MIN_SOCKET_TIMEOUT_SECONDS, remaining)
         else:
             timeout = self.timeout
-        sock = socket.create_connection(
-            (self.host, self.port), timeout, self.source_address
-        )
+        source_address = getattr(self, "source_address", None)
+        sock = socket.create_connection((self.host, self.port), timeout, source_address)
         if self._deadline is not None:
             remaining = self._deadline - time.monotonic()
             if remaining <= 0:
@@ -708,7 +717,11 @@ class _DeadlineHTTPSConnection(http.client.HTTPSConnection):
                     "Lemonade request exceeded end-to-end deadline before TLS handshake"
                 )
             sock.settimeout(max(_MIN_SOCKET_TIMEOUT_SECONDS, remaining))
-        self.sock = self._context.wrap_socket(sock, server_hostname=self.host)
+        context = getattr(self, "_context", None)
+        if context is not None:
+            self.sock = context.wrap_socket(sock, server_hostname=self.host)
+        else:
+            self.sock = sock
         if self._deadline is not None:
             self.sock = _DeadlineSocket(self.sock, self._deadline)
 
@@ -728,10 +741,11 @@ class _DeadlineHTTPSHandler(urllib.request.HTTPSHandler):
     def https_open(self, req: urllib.request.Request) -> Any:
         deadline = getattr(req, "_tapeback_deadline", None)
         if deadline is not None:
+            context = getattr(self, "_context", None)
             return self.do_open(
                 lambda host, **kw: _DeadlineHTTPSConnection(host, deadline=deadline, **kw),
                 req,
-                context=self._context,
+                context=context,
             )
         return super().https_open(req)
 
@@ -1019,8 +1033,14 @@ def _normalize_base_url(raw: str) -> str:
     # brackets, NFKC-sensitive netloc delimiters, and ports) to lazy properties.
     # Keep *all* parsing and property access inside this boundary: configuration
     # failures must neither echo a potentially secret URL nor expose parser text.
+    cleaned_raw = raw.strip()
+    if not cleaned_raw.isascii() or any(ch.isspace() or not ch.isprintable() for ch in cleaned_raw):
+        raise LemonadeConfigurationError(
+            "TAPEBACK_LEMONADE_URL contains invalid characters (whitespace, control "
+            "characters, or non-ASCII)."
+        )
     try:
-        parsed = urllib.parse.urlparse(raw.strip())
+        parsed = urllib.parse.urlparse(cleaned_raw)
         scheme = parsed.scheme.lower()
         hostname = parsed.hostname
         username = parsed.username
@@ -1039,6 +1059,10 @@ def _normalize_base_url(raw: str) -> str:
             "TAPEBACK_LEMONADE_URL is not a valid http(s) URL — it must start with "
             "http:// or https:// and name a host. The configured value is not shown "
             "because it may contain credentials."
+        )
+    if not hostname.isascii():
+        raise LemonadeConfigurationError(
+            "TAPEBACK_LEMONADE_URL hostname must contain only ASCII characters."
         )
     if username is not None or password is not None:
         raise LemonadeConfigurationError(
@@ -1064,7 +1088,12 @@ def _normalize_base_url(raw: str) -> str:
         port = None
     host_part = f"[{host}]" if ":" in host else host
     netloc = host_part if port is None else f"{host_part}:{port}"
-    return urllib.parse.urlunsplit((scheme, netloc, parsed.path.rstrip("/"), "", ""))
+    path = parsed.path.rstrip("/")
+    if not path.isascii() or any(ch.isspace() or not ch.isprintable() for ch in path):
+        raise LemonadeConfigurationError(
+            "TAPEBACK_LEMONADE_URL contains invalid characters in its path."
+        )
+    return urllib.parse.urlunsplit((scheme, netloc, path, "", ""))
 
 
 def _finite_number(value: Any) -> float | None:
@@ -1111,6 +1140,11 @@ def _require_segments(
     """
     raw = payload.get("segments")
     if isinstance(raw, list) and raw:
+        if len(raw) > _MAX_RESPONSE_SEGMENTS:
+            raise LemonadeCapabilityError(
+                f"Lemonade returned too many segments in one response "
+                f"({len(raw)} > {_MAX_RESPONSE_SEGMENTS})"
+            )
         for item in raw:
             if not isinstance(item, dict):
                 raise LemonadeCapabilityError(
@@ -1125,6 +1159,12 @@ def _require_segments(
             if upper_bound is not None and end > upper_bound + _TIMESTAMP_SLACK_SECONDS:
                 raise LemonadeCapabilityError(
                     "Lemonade returned a segment ending past the audio it was sent"
+                )
+            text = str(item.get("text") or "")
+            if len(text) > _MAX_SEGMENT_TEXT_CHARS:
+                raise LemonadeCapabilityError(
+                    f"Lemonade returned a segment exceeding the text size limit "
+                    f"({len(text)} > {_MAX_SEGMENT_TEXT_CHARS})"
                 )
         return raw
     text = str(payload.get("text") or "")
@@ -1165,6 +1205,11 @@ def _convert_words(
     words: list[Word] = []
     if not isinstance(raw_words, list):
         return words
+    if len(raw_words) > _MAX_SEGMENT_WORDS:
+        raise LemonadeCapabilityError(
+            f"Lemonade returned too many words in one segment "
+            f"({len(raw_words)} > {_MAX_SEGMENT_WORDS})"
+        )
     for raw in raw_words:
         if not isinstance(raw, dict):
             continue
@@ -1194,11 +1239,17 @@ def _convert_words(
             probability = _finite_number(raw_probability)
             if probability is None or not 0.0 <= probability <= 1.0:
                 raise LemonadeCapabilityError("Lemonade returned a word probability outside [0, 1]")
+        word_text = str(raw.get("word") or "")
+        if len(word_text) > _MAX_WORD_TEXT_CHARS:
+            raise LemonadeCapabilityError(
+                f"Lemonade returned a word exceeding the text size limit "
+                f"({len(word_text)} > {_MAX_WORD_TEXT_CHARS})"
+            )
         words.append(
             Word(
                 start=start,
                 end=end,
-                word=str(raw.get("word") or ""),
+                word=word_text,
                 probability=probability,
             )
         )
@@ -1212,6 +1263,25 @@ class _MergeState:
     segments: list[Segment]
     pinned: str | None
     probability: float | None
+    total_words: int = 0
+    total_text_chars: int = 0
+
+    def _check_cumulative_bounds(self) -> None:
+        if len(self.segments) > _MAX_CUMULATIVE_SEGMENTS:
+            raise LemonadeCapabilityError(
+                f"Lemonade transcription exceeded cumulative segment limit "
+                f"({len(self.segments)} > {_MAX_CUMULATIVE_SEGMENTS})"
+            )
+        if self.total_words > _MAX_CUMULATIVE_WORDS:
+            raise LemonadeCapabilityError(
+                f"Lemonade transcription exceeded cumulative word limit "
+                f"({self.total_words} > {_MAX_CUMULATIVE_WORDS})"
+            )
+        if self.total_text_chars > _MAX_CUMULATIVE_TEXT_CHARS:
+            raise LemonadeCapabilityError(
+                f"Lemonade transcription exceeded cumulative decoded text limit "
+                f"({self.total_text_chars} > {_MAX_CUMULATIVE_TEXT_CHARS})"
+            )
 
     @staticmethod
     def _same_utterance(left: Segment, right: Segment) -> bool:
@@ -1313,26 +1383,37 @@ class _MergeState:
         # Compare only adjacent-chunk candidates occupying their shared overlap.
         # Existing unmatched speech remains; this avoids midpoint rounding dropping
         # unrelated words close to a chunk boundary.
+        #
+        # Linear search restricted to the immediately adjacent overlap window:
+        # scan backwards from the end of self.segments, and stop scanning once
+        # segments end before the overlap window begins.
         for candidate in candidates:
             duplicate_index: int | None = None
-            for existing_index, existing in enumerate(self.segments):
-                intersects_overlap = index > 0 and max(
-                    existing.start, candidate.start, offset
-                ) < min(existing.end, candidate.end, core_start)
-                if intersects_overlap and self._same_utterance(existing, candidate):
-                    duplicate_index = existing_index
-                    break
+            if index > 0:
+                for existing_index in range(len(self.segments) - 1, -1, -1):
+                    existing = self.segments[existing_index]
+                    if existing.end < offset - _TIMESTAMP_SLACK_SECONDS:
+                        break
+                    intersects_overlap = max(existing.start, candidate.start, offset) < min(
+                        existing.end, candidate.end, core_start
+                    )
+                    if intersects_overlap and self._same_utterance(existing, candidate):
+                        duplicate_index = existing_index
+                        break
             if duplicate_index is None:
+                candidate_words = len(candidate.words) if candidate.words else 0
+                self.total_words += candidate_words
+                self.total_text_chars += len(candidate.text)
                 self.segments.append(candidate)
+                self._check_cumulative_bounds()
                 continue
             existing = self.segments[duplicate_index]
             # A segment ending at a non-final request's sent-audio boundary is
             # likely clipped; prefer its complete neighbor before time/text ties.
+            # Chunk N-1 (existing) had its audio end at chunk N's core_start and was
+            # non-final (since chunk N exists, index > 0).
             existing_clipped = (
-                index > 0
-                and core_end is not None
-                and not final_chunk
-                and abs(existing.end - core_end) < _BOUNDARY_EPSILON_SECONDS
+                index > 0 and abs(existing.end - core_start) < _BOUNDARY_EPSILON_SECONDS
             )
             candidate_clipped = (
                 not final_chunk
@@ -1347,7 +1428,12 @@ class _MergeState:
                 current_index=index - 1,
                 candidate_index=index,
             ):
+                existing_words = len(existing.words) if existing.words else 0
+                candidate_words = len(candidate.words) if candidate.words else 0
+                self.total_words += candidate_words - existing_words
+                self.total_text_chars += len(candidate.text) - len(existing.text)
                 self.segments[duplicate_index] = candidate
+                self._check_cumulative_bounds()
 
 
 class LemonadeBackend:
@@ -1371,9 +1457,13 @@ class LemonadeBackend:
         # the "local" upload through that proxy.
         self._bypass_proxies = _is_loopback_host(urllib.parse.urlparse(self._base_url).hostname)
         key = settings.lemonade_api_key.get_secret_value()
-        if key and (key != key.strip() or any(ch.isspace() or not ch.isprintable() for ch in key)):
+        if key and (
+            not key.isascii()
+            or key != key.strip()
+            or any(ch.isspace() or not ch.isprintable() for ch in key)
+        ):
             raise LemonadeConfigurationError(
-                "TAPEBACK_LEMONADE_API_KEY is malformed: it must be a single bearer "
+                "TAPEBACK_LEMONADE_API_KEY is malformed: it must be a single ASCII bearer "
                 "token with no whitespace or control characters."
             )
         # Held only for the Authorization header. Never logged, cached, or serialized:
@@ -1563,7 +1653,7 @@ class LemonadeBackend:
         headers = {"Accept": "application/json", "Content-Type": content_type}
         if self._api_key:
             headers["Authorization"] = f"Bearer {self._api_key}"
-        request = urllib.request.Request(
+        request = urllib.request.Request(  # noqa: S310 - validated base URL http(s) without userinfo or query
             self._transcription_url, data=body, headers=headers, method="POST"
         )
         raw = self._send(request)
@@ -1589,7 +1679,9 @@ class LemonadeBackend:
         headers = {"Accept": "application/json"}
         if self._api_key:
             headers["Authorization"] = f"Bearer {self._api_key}"
-        request = urllib.request.Request(self._base_url + path, headers=headers, method="GET")
+        request = urllib.request.Request(  # noqa: S310 - validated base URL http(s) without userinfo or query
+            self._base_url + path, headers=headers, method="GET"
+        )
         raw = self._send(request, timeout)
         try:
             payload = json.loads(raw.decode("utf-8", errors="replace"))
@@ -1626,7 +1718,7 @@ class LemonadeBackend:
         if timeout is None:
             timeout = self._settings.lemonade_timeout_seconds
         deadline = time.monotonic() + timeout
-        request._tapeback_deadline = deadline  # type: ignore[attr-defined]
+        setattr(request, "_tapeback_deadline", deadline)  # noqa: B010 - dynamically set deadline on Request
         try:
             with _open_url(
                 request,
@@ -1655,6 +1747,13 @@ class LemonadeBackend:
             return raw
         except urllib.error.HTTPError as exc:
             _raise_for_http_error(exc, self._api_key, deadline=deadline)
+        except (http.client.InvalidURL, UnicodeEncodeError) as exc:
+            raise LemonadeConfigurationError(
+                f"Lemonade request could not be built or encoded: {exc}"
+            ) from exc
+        except http.client.HTTPException as exc:
+            detail = _sanitize_remote_detail(str(exc)) or type(exc).__name__
+            raise LemonadeUnavailableError(f"Lemonade HTTP protocol failure: {detail}") from exc
         except TimeoutError as exc:
             # socket.timeout is TimeoutError on Python 3.10+: this is the
             # read/inference timeout. Never resubmitted to Lemonade — the server may

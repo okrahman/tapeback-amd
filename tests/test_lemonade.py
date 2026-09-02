@@ -1,7 +1,10 @@
 """Lemonade backend: HTTP transport, chunking, language handling, error mapping."""
 
+import contextlib
+import http.client
 import io
 import json
+import socket
 import struct
 import threading
 import time
@@ -18,6 +21,13 @@ from pydantic import SecretStr
 
 import tapeback._lemonade as lemon
 from tapeback._lemonade import (
+    _MAX_CUMULATIVE_SEGMENTS,
+    _MAX_CUMULATIVE_TEXT_CHARS,
+    _MAX_CUMULATIVE_WORDS,
+    _MAX_RESPONSE_SEGMENTS,
+    _MAX_SEGMENT_TEXT_CHARS,
+    _MAX_SEGMENT_WORDS,
+    _MAX_WORD_TEXT_CHARS,
     DEDUP_POLICY_VERSION,
     LemonadeAuthenticationError,
     LemonadeBackend,
@@ -27,9 +37,15 @@ from tapeback._lemonade import (
     LemonadeInferenceTimeout,
     LemonadeModelError,
     LemonadeUnavailableError,
+    _convert_words,
+    _MergeState,
+    _normalize_base_url,
+    _require_segments,
+    _utterance_tokens,
     classify_http_failure,
     normalize_language,
 )
+from tapeback.models import Segment
 from tapeback.settings import Settings
 
 # --- helpers ---
@@ -1481,8 +1497,6 @@ def test_classification_is_unchanged_by_sanitization():
 
 
 def test_utterance_tokens_unicode_and_cjk():
-    from tapeback._lemonade import _utterance_tokens
-
     # Cyrillic
     assert _utterance_tokens("Привет, мир!") == ["привет", "мир"]
     # Chinese (CJK characters split individually)
@@ -1513,7 +1527,7 @@ def test_unicode_overlap_deduplication_cyrillic_and_cjk(tmp_path, monkeypatch):
     ]
     calls = install_urlopen(monkeypatch, responses)
 
-    segments, info = LemonadeBackend(lemon_settings(tmp_path)).transcribe(wav)
+    segments, _info = LemonadeBackend(lemon_settings(tmp_path)).transcribe(wav)
 
     assert len(calls) == 3
     # "Привет, мир!" from chunk 1's overlap must be deduplicated, not duplicated!
@@ -1537,7 +1551,7 @@ def test_cjk_overlap_deduplication(tmp_path, monkeypatch):
     ]
     calls = install_urlopen(monkeypatch, responses)
 
-    segments, info = LemonadeBackend(lemon_settings(tmp_path)).transcribe(wav)
+    segments, _info = LemonadeBackend(lemon_settings(tmp_path)).transcribe(wav)
 
     assert len(calls) == 3
     assert [s.text for s in segments] == ["第一部分", "今天天气很好", "第二部分", "第三部分"]
@@ -1545,10 +1559,7 @@ def test_cjk_overlap_deduplication(tmp_path, monkeypatch):
 
 def test_real_socket_end_to_end_deadline_multi_phase_delay(tmp_path):
     """A real socket delaying across multiple pre-response phases must trip the total deadline."""
-    import socket
-    import threading
-
-    # Create a loopback TCP server that delays both before reading request and before sending headers
+    # Loopback TCP server delaying before reading request and before sending headers
     server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_sock.bind(("127.0.0.1", 0))
     server_sock.listen(1)
@@ -1559,19 +1570,13 @@ def test_real_socket_end_to_end_deadline_multi_phase_delay(tmp_path):
             conn, _ = server_sock.accept()
             # Delay phase 1: 0.15s before reading request
             time.sleep(0.15)
-            try:
+            with contextlib.suppress(Exception):
                 conn.recv(4096)
-            except Exception:
-                pass
             # Delay phase 2: 0.20s before sending response headers
             time.sleep(0.20)
-            try:
+            with contextlib.suppress(Exception):
                 conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}")
                 conn.close()
-            except Exception:
-                pass
-        except Exception:
-            pass
         finally:
             server_sock.close()
 
@@ -1596,3 +1601,265 @@ def test_real_socket_end_to_end_deadline_multi_phase_delay(tmp_path):
     # The configured deadline was 0.20s. The client must abort near 0.20s, well before 0.35s.
     assert elapsed < 0.32
 
+
+# --- Finding 1: Cumulative caps and Linear Dedup Tests ---
+
+
+def test_require_segments_rejects_excessive_segment_count():
+    """A response containing more than _MAX_RESPONSE_SEGMENTS segments is rejected."""
+    excessive = [seg(i * 0.1, i * 0.1 + 0.05, "word") for i in range(_MAX_RESPONSE_SEGMENTS + 1)]
+    with pytest.raises(LemonadeCapabilityError, match="too many segments"):
+        _require_segments({"segments": excessive})
+
+
+def test_require_segments_rejects_excessive_segment_text():
+    """A segment whose text exceeds _MAX_SEGMENT_TEXT_CHARS is rejected."""
+    long_text = "a" * (_MAX_SEGMENT_TEXT_CHARS + 1)
+    payload = {"segments": [{"start": 0.0, "end": 1.0, "text": long_text}]}
+    with pytest.raises(LemonadeCapabilityError, match="exceeding the text size limit"):
+        _require_segments(payload)
+
+
+def test_convert_words_rejects_excessive_word_count():
+    """A segment containing more than _MAX_SEGMENT_WORDS words is rejected."""
+    excessive_words = [
+        {"start": 0.0, "end": 0.1, "word": "hi", "probability": 0.9}
+        for _ in range(_MAX_SEGMENT_WORDS + 1)
+    ]
+    with pytest.raises(LemonadeCapabilityError, match="too many words"):
+        _convert_words(excessive_words, 0.0, segment_start=0.0, segment_end=1.0)
+
+
+def test_convert_words_rejects_excessive_word_text():
+    """A word whose text exceeds _MAX_WORD_TEXT_CHARS is rejected."""
+    long_word = "w" * (_MAX_WORD_TEXT_CHARS + 1)
+    raw_words = [{"start": 0.0, "end": 0.1, "word": long_word, "probability": 0.9}]
+    with pytest.raises(LemonadeCapabilityError, match="exceeding the text size limit"):
+        _convert_words(raw_words, 0.0, segment_start=0.0, segment_end=1.0)
+
+
+def test_merge_state_cumulative_caps():
+    """_MergeState rejects cumulative segments, words, and text exceeding total bounds."""
+    state = _MergeState(segments=[], pinned=None, probability=None)
+
+    # Cumulative segments
+    state.segments = [
+        Segment(start=0.0, end=1.0, text="hi") for _ in range(_MAX_CUMULATIVE_SEGMENTS)
+    ]
+    with pytest.raises(LemonadeCapabilityError, match="cumulative segment limit"):
+        state.absorb(
+            {"segments": [{"start": 0.0, "end": 1.0, "text": "extra"}], "language": "en"},
+            offset=0.0,
+            core_start=0.0,
+            index=0,
+        )
+
+    # Cumulative words
+    state2 = _MergeState(
+        segments=[], pinned=None, probability=None, total_words=_MAX_CUMULATIVE_WORDS
+    )
+    with pytest.raises(LemonadeCapabilityError, match="cumulative word limit"):
+        state2.absorb(
+            {
+                "segments": [
+                    {
+                        "start": 0.0,
+                        "end": 1.0,
+                        "text": "hi",
+                        "words": [{"start": 0.0, "end": 1.0, "word": "hi"}],
+                    }
+                ],
+                "language": "en",
+            },
+            offset=0.0,
+            core_start=0.0,
+            index=0,
+        )
+
+    # Cumulative text chars
+    state3 = _MergeState(
+        segments=[], pinned=None, probability=None, total_text_chars=_MAX_CUMULATIVE_TEXT_CHARS
+    )
+    with pytest.raises(LemonadeCapabilityError, match="cumulative decoded text limit"):
+        state3.absorb(
+            {"segments": [{"start": 0.0, "end": 1.0, "text": "extra text"}], "language": "en"},
+            offset=0.0,
+            core_start=0.0,
+            index=0,
+        )
+
+
+def test_linear_dedup_scans_only_adjacent_overlap_window():
+    """Deduplication only checks segments ending in the adjacent overlap window."""
+    state = _MergeState(segments=[], pinned="en", probability=0.9)
+    # Chunk 0: 0.0 to 10.0s
+    state.segments = [
+        Segment(start=0.0, end=2.0, text="old segment early"),
+        Segment(start=2.0, end=4.0, text="old segment mid"),
+        Segment(start=8.5, end=9.8, text="boundary utterance"),
+    ]
+    # Chunk 1: offset=8.0, core_start=10.0 (overlap is 8.0-10.0s).
+    # Candidate in overlap matches "boundary utterance".
+    state.absorb(
+        {
+            "segments": [
+                {"start": 0.5, "end": 1.9, "text": "boundary utterance"},
+                {"start": 2.5, "end": 4.0, "text": "new segment"},
+            ]
+        },
+        offset=8.0,
+        core_start=10.0,
+        index=1,
+        chunk_duration=5.0,
+        core_end=13.0,
+        final_chunk=False,
+    )
+    # The duplicate in the overlap should be reconciled
+    assert len(state.segments) == 4
+    assert state.segments[2].text == "boundary utterance"
+    assert state.segments[3].text == "new segment"
+
+
+# --- Finding 2: Configuration & Error Hierarchy Tests ---
+
+
+def test_backend_rejects_non_ascii_bearer_token(tmp_path):
+    """A bearer token containing non-ASCII printable characters is rejected at config time."""
+    settings = Settings(
+        vault_path=tmp_path / "vault",
+        transcription_backend="lemonade",
+        lemonade_api_key=SecretStr("sk-token-🔑"),
+    )
+    with pytest.raises(LemonadeConfigurationError, match="ASCII bearer token"):
+        LemonadeBackend(settings)
+
+    settings_accent = Settings(
+        vault_path=tmp_path / "vault",
+        transcription_backend="lemonade",
+        lemonade_api_key=SecretStr("sk-token-é"),
+    )
+    with pytest.raises(LemonadeConfigurationError, match="ASCII bearer token"):
+        LemonadeBackend(settings_accent)
+
+
+def test_normalize_base_url_rejects_unsafe_path_characters():
+    """Base URLs with spaces, control characters, or non-ASCII characters in path are rejected."""
+    with pytest.raises(LemonadeConfigurationError, match="invalid characters"):
+        _normalize_base_url("http://127.0.0.1:13305/v1 /test")
+
+    with pytest.raises(LemonadeConfigurationError, match="invalid characters"):
+        _normalize_base_url("http://127.0.0.1:13305/v1\x00test")
+
+    with pytest.raises(LemonadeConfigurationError, match="invalid characters"):
+        _normalize_base_url("http://127.0.0.1:13305/v1/ümlaut")
+
+
+def test_send_translates_invalid_url_and_encoding_failures(tmp_path, monkeypatch):
+    """http.client.InvalidURL / UnicodeEncodeError mapped to LemonadeConfigurationError."""
+    backend = LemonadeBackend(lemon_settings(tmp_path))
+
+    def raise_invalid_url(*args, **kwargs):
+        raise http.client.InvalidURL("URL can't contain control characters")
+
+    monkeypatch.setattr(lemon, "_open_url", raise_invalid_url)
+    with pytest.raises(LemonadeConfigurationError, match="could not be built or encoded"):
+        backend.health()
+
+    def raise_encode_error(*args, **kwargs):
+        raise UnicodeEncodeError("latin-1", "bad", 0, 1, "reason")
+
+    monkeypatch.setattr(lemon, "_open_url", raise_encode_error)
+    with pytest.raises(LemonadeConfigurationError, match="could not be built or encoded"):
+        backend.health()
+
+
+def test_send_translates_http_exceptions_to_unavailable(tmp_path, monkeypatch):
+    """http.client.HTTPException (e.g. BadStatusLine) is mapped to LemonadeUnavailableError."""
+    backend = LemonadeBackend(lemon_settings(tmp_path))
+
+    def raise_bad_status(*args, **kwargs):
+        raise http.client.BadStatusLine("???")
+
+    monkeypatch.setattr(lemon, "_open_url", raise_bad_status)
+    with pytest.raises(LemonadeUnavailableError, match="Lemonade HTTP protocol failure"):
+        backend.health()
+
+
+# --- Finding 3: Boundary Clipping Reconciliation Tests ---
+
+
+def test_clipping_reconciliation_previous_chunk_middle_and_final():
+    """Previous chunk segment clipped at core_start is preferred over by complete neighbor."""
+    # Scenario 1: Middle chunk (final_chunk=False)
+    # Chunk 0 was 0..10s. Segment was clipped right at 10.0s (core_start for chunk 1).
+    # Chunk 1 (offset=8.0s, core_start=10.0s, core_end=15.0s, final_chunk=False)
+    # Candidate in chunk 1 covers 8.5..10.8s (complete utterance).
+    state = _MergeState(
+        segments=[Segment(start=8.5, end=10.0, text="Hello world")],
+        pinned="en",
+        probability=0.9,
+    )
+    candidate_payload = {
+        "segments": [{"start": 0.5, "end": 2.8, "text": "Hello world today"}],
+    }
+    state.absorb(
+        candidate_payload,
+        offset=8.0,
+        core_start=10.0,
+        index=1,
+        chunk_duration=7.0,
+        core_end=15.0,
+        final_chunk=False,
+    )
+    # Existing segment was clipped at core_start (10.0), candidate was complete -> candidate wins
+    assert len(state.segments) == 1
+    assert state.segments[0].text == "Hello world today"
+    assert state.segments[0].end == 10.8
+
+    # Scenario 2: Final chunk (final_chunk=True)
+    # Even when chunk 1 is final_chunk=True, existing chunk 0 was non-final and was clipped at 10s.
+    state_final = _MergeState(
+        segments=[Segment(start=8.5, end=10.0, text="Hello world")],
+        pinned="en",
+        probability=0.9,
+    )
+    state_final.absorb(
+        candidate_payload,
+        offset=8.0,
+        core_start=10.0,
+        index=1,
+        chunk_duration=7.0,
+        core_end=15.0,
+        final_chunk=True,
+    )
+    # Candidate must still win because existing was clipped
+    assert len(state_final.segments) == 1
+    assert state_final.segments[0].text == "Hello world today"
+    assert state_final.segments[0].end == 10.8
+
+
+def test_clipping_reconciliation_candidate_clipped_non_final_vs_final():
+    """Candidate clipped at chunk audio end is rejected if existing is complete."""
+    # Existing in chunk 0 covers 8.5..11.0s (complete)
+    # Candidate in chunk 1 (duration 3.0s, offset 8.0s -> chunk audio ends at 11.0s)
+    # Candidate ends right at 11.0s (clipped at chunk end, non-final)
+    state = _MergeState(
+        segments=[Segment(start=8.5, end=11.0, text="Hello world complete")],
+        pinned="en",
+        probability=0.9,
+    )
+    candidate_payload = {
+        "segments": [{"start": 0.5, "end": 3.0, "text": "Hello world"}],
+    }
+    state.absorb(
+        candidate_payload,
+        offset=8.0,
+        core_start=10.0,
+        index=1,
+        chunk_duration=3.0,
+        core_end=11.0,
+        final_chunk=False,
+    )
+    # Candidate is clipped (candidate_clipped=True), existing is complete -> existing stays!
+    assert len(state.segments) == 1
+    assert state.segments[0].text == "Hello world complete"
