@@ -1,3 +1,5 @@
+import contextlib
+import os
 import shutil
 import subprocess
 import sys
@@ -134,6 +136,11 @@ def split_channels_16k(stereo_wav: Path, output_dir: Path) -> tuple[Path, Path]:
         check=True,
     )
 
+    with contextlib.suppress(OSError):
+        src_stat = stereo_wav.stat()
+        os.utime(mic_16k_path, (src_stat.st_atime, src_stat.st_mtime))
+        os.utime(monitor_16k_path, (src_stat.st_atime, src_stat.st_mtime))
+
     return mic_16k_path, monitor_16k_path
 
 
@@ -174,6 +181,10 @@ def convert_to_mono16k(input_file: Path, output_dir: Path) -> Path:
         check=True,
     )
 
+    with contextlib.suppress(OSError):
+        src_stat = input_file.stat()
+        os.utime(output_path, (src_stat.st_atime, src_stat.st_mtime))
+
     return output_path
 
 
@@ -189,6 +200,13 @@ def gate_wav_inactive(
     channel.gate_inactive_regions), and writes it back — so Whisper never sees the
     mic channel's pauses and can't hallucinate loops on them.
     """
+    try:
+        orig_stat = wav_path.stat()
+        orig_atime = orig_stat.st_atime
+        orig_mtime = orig_stat.st_mtime
+    except OSError:
+        orig_mtime = None
+
     with wave.open(str(wav_path), "rb") as wf:
         sample_rate = wf.getframerate()
         frames = wf.readframes(wf.getnframes())
@@ -201,3 +219,7 @@ def gate_wav_inactive(
         wf.setsampwidth(2)
         wf.setframerate(sample_rate)
         wf.writeframes(gated.astype(np.int16).tobytes())
+
+    if orig_mtime is not None:
+        with contextlib.suppress(OSError):
+            os.utime(wav_path, (orig_atime, orig_mtime))

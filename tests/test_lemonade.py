@@ -2057,3 +2057,67 @@ def test_absorb_and_transcribe_preserves_chronological_segment_order():
     assert state.segments[0].text == "thanks"
     assert state.segments[1].start == 299.0
     assert state.segments[1].text == "Bye everyone"
+
+
+def test_absorb_purges_subsumed_multi_segment_fragments():
+    """Replacing a split boundary segment purges trailing split fragments."""
+    # Chunk 0 output: utterance was split across boundary into "thank" and "you"
+    state = _MergeState(
+        segments=[
+            Segment(start=9.5, end=9.7, text="thank"),
+            Segment(start=9.7, end=10.0, text="you"),
+        ],
+        pinned="en",
+        probability=0.9,
+    )
+    # Chunk 1 (offset=9.0s): full context decodes "thank you very much" [9.5s -> 10.5s]
+    candidate_payload = {
+        "segments": [
+            {"start": 0.5, "end": 1.5, "text": "thank you very much"},
+        ],
+    }
+    state.absorb(
+        candidate_payload,
+        offset=9.0,
+        core_start=10.0,
+        index=1,
+        chunk_duration=5.0,
+        core_end=14.0,
+        final_chunk=True,
+    )
+    assert len(state.segments) == 1
+    assert state.segments[0].start == 9.5
+    assert state.segments[0].end == 10.5
+    assert state.segments[0].text == "thank you very much"
+
+
+def test_deadline_socket_settimeout_none_handled():
+    """sock.settimeout(None) does not raise TypeError and bounds against deadline."""
+    mock_raw_sock = MagicMock()
+    now = time.monotonic()
+    sock = lemon._DeadlineSocket(mock_raw_sock, deadline=now + 10.0)
+    sock.settimeout(None)
+    mock_raw_sock.settimeout.assert_called_once()
+    timeout_arg = mock_raw_sock.settimeout.call_args[0][0]
+    assert 9.0 <= timeout_arg <= 10.0
+
+
+def test_transcribe_non_wav_derives_duration_from_segments(tmp_path, monkeypatch):
+    """Non-WAV audio with 0.0 header duration derives duration from transcribed segments."""
+    fake_audio = tmp_path / "raw_audio.bin"
+    fake_audio.write_bytes(b"not a wav file header at all")
+    install_urlopen(
+        monkeypatch,
+        [
+            verbose_json(
+                [
+                    {"start": 0.0, "end": 4.5, "text": "Testing audio."},
+                    {"start": 5.0, "end": 12.3, "text": "End of audio."},
+                ]
+            )
+        ],
+    )
+    backend = LemonadeBackend(lemon_settings(tmp_path))
+    segments, info = backend.transcribe(fake_audio)
+    assert len(segments) == 2
+    assert info["duration"] == 12.3

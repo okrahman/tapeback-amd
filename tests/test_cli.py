@@ -214,8 +214,12 @@ def test_status_command_with_invalid_lemonade_url_reports_and_survives(runner, v
 def test_stop_and_process_stops_recorder_before_live_teardown(tmp_vault, tmp_path):
     """Recording is finalized even when live-preview teardown fails."""
     settings = Settings(vault_path=tmp_vault)
-    monitor_wav = tmp_path / "session" / "monitor.wav"
-    mic_wav = tmp_path / "session" / "mic.wav"
+    session_dir = tmp_path / "session"
+    session_dir.mkdir(parents=True, exist_ok=True)
+    monitor_wav = session_dir / "monitor.wav"
+    mic_wav = session_dir / "mic.wav"
+    monitor_wav.write_bytes(b"mon")
+    mic_wav.write_bytes(b"mic")
     order: list[str] = []
     on_status = MagicMock()
 
@@ -232,16 +236,28 @@ def test_stop_and_process_stops_recorder_before_live_teardown(tmp_vault, tmp_pat
 
     live_transcriber.stop.side_effect = fail_live_stop
 
-    with pytest.raises(RuntimeError, match="preview teardown failed"):
-        stop_and_process(
+    with (
+        patch("tapeback.pipeline.merge_channels", return_value=session_dir / "stereo.wav"),
+        patch("tapeback.pipeline.save_audio_to_vault", return_value=tmp_vault / "audio.wav"),
+        patch(
+            "tapeback.pipeline.process_stereo_file",
+            return_value=([], {"duration": 1.0}, []),
+        ),
+    ):
+        md_path = stop_and_process(
             recorder,
             settings,
             live_transcriber=live_transcriber,
             on_status=on_status,
+            do_summarize=False,
         )
 
+    assert md_path.exists()
     assert order == ["recorder-stopped", "live-stop-failed"]
     live_transcriber.stop.assert_called_once_with(on_status)
+    assert any(
+        "Warning: Live transcription stopped with error" in str(c) for c in on_status.mock_calls
+    )
 
 
 def test_stop_and_process_enters_pipeline_only_after_live_exit(tmp_vault, tmp_path):

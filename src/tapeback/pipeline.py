@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import shutil
 import tempfile
 from collections.abc import Callable
@@ -88,7 +89,10 @@ def stop_and_process(
 
     if live_transcriber is not None:
         on_status("Stopping live transcription...")
-        live_transcriber.stop(on_status)
+        try:
+            live_transcriber.stop(on_status)
+        except Exception as exc:
+            on_status(f"Warning: Live transcription stopped with error: {exc}")
 
     session_name = monitor_path.parent.name
 
@@ -146,7 +150,16 @@ def process_file(
         name = audio_path.stem
     validate_session_name(name)
 
-    tmp_dir = Path(tempfile.mkdtemp(prefix="tapeback_"))
+    # Deterministic staging directory per input audio identity, so resume cache keys
+    # remain stable across separate process runs.
+    try:
+        stat = audio_path.stat()
+        ident = f"{audio_path.resolve()}:{stat.st_size}:{stat.st_mtime_ns}"
+    except OSError:
+        ident = str(audio_path.resolve())
+    staging_hash = hashlib.sha256(ident.encode()).hexdigest()[:16]
+    tmp_dir = Path(tempfile.gettempdir()) / "tapeback" / f"proc_{staging_hash}"
+    tmp_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
 
     with run_log(name, settings, on_status) as report:
         audio_dest = save_audio_to_vault(audio_path, settings, name)

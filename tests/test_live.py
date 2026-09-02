@@ -14,6 +14,7 @@ import numpy as np
 import pytest
 
 import tapeback.live as live_mod
+import tapeback.pipeline as pipeline_mod
 from tapeback._lemonade import (
     LemonadeAuthenticationError,
     LemonadeConfigurationError,
@@ -906,3 +907,61 @@ def test_deduplicate_overlap_scopes_to_same_speaker():
     new_you = [Segment(start=58.55, end=59.6, text="I am speaking on mic", speaker="You")]
     kept_you = deduplicate_overlap(existing, new_you, overlap_start=60.0)
     assert len(kept_you) == 0
+
+
+def test_live_transcriber_reuses_detected_language_for_single_mic_chunk(tmp_path, monkeypatch):
+    """Single mic chunk transcribes with language_override when language was previously detected."""
+    settings = Settings(vault_path=tmp_path, live=True, transcription_backend="lemonade")
+    mic_path = tmp_path / "mic.wav"
+    monitor_path = tmp_path / "monitor.wav"
+
+    lt = LiveTranscriber(settings, "lang-coord", mic_path, monitor_path)
+    lt._last_detected_language = "fr"
+
+    mock_transcriber = MagicMock()
+    mock_transcriber.transcribe.return_value = ([], {"language": "fr"})
+    monkeypatch.setattr(lt, "_ensure_transcriber", lambda: mock_transcriber)
+
+    # Fake PCM data for single mic chunk
+    fake_pcm = b"\x00\x00" * 16000
+    lt._transcribe_chunk(mock_transcriber, fake_pcm, 0, 0, is_mic=True)
+
+    mock_transcriber.transcribe.assert_called_once()
+    assert mock_transcriber.transcribe.call_args[1]["language_override"] == "fr"
+
+
+def test_stop_and_process_survives_live_transcriber_fatal_error(tmp_path, monkeypatch):
+    """pipeline.stop_and_process does not crash when live_transcriber.stop() raises fatal error."""
+    settings = Settings(vault_path=tmp_path, live=True)
+    mock_recorder = MagicMock()
+    session_dir = tmp_path / "sess_123"
+    session_dir.mkdir(parents=True)
+    mon = session_dir / "monitor.wav"
+    mic = session_dir / "mic.wav"
+    wav_header = (
+        b"RIFF\x24\x00\x00\x00WAVEfmt \x10\x00\x00\x00\x01\x00\x01\x00"
+        b"\x80>\x00\x00\x00}\x00\x00\x02\x00\x10\x00data\x00\x00\x00\x00"
+    )
+    mon.write_bytes(wav_header)
+    mic.write_bytes(wav_header)
+    mock_recorder.stop.return_value = (mon, mic)
+
+    mock_lt = MagicMock()
+    mock_lt.stop.side_effect = LemonadeAuthenticationError("Invalid API key")
+
+    monkeypatch.setattr(pipeline_mod, "merge_channels", lambda m, mi, out: out / "stereo.wav")
+    monkeypatch.setattr(pipeline_mod, "save_audio_to_vault", lambda p, s, n: tmp_path / f"{n}.wav")
+    monkeypatch.setattr(
+        pipeline_mod,
+        "process_stereo_file",
+        lambda p, out, s, diarize, on_status: ([], {"duration": 1.0}, []),
+    )
+
+    # Must complete and return markdown path without crashing
+    md_path = pipeline_mod.stop_and_process(
+        recorder=mock_recorder,
+        settings=settings,
+        live_transcriber=mock_lt,
+        do_summarize=False,
+    )
+    assert md_path.exists()

@@ -796,11 +796,12 @@ class _DeadlineSocket:
         self._update_timeout()
         return _DeadlineFile(self._sock.makefile(*args, **kwargs), self)
 
-    def settimeout(self, timeout: float) -> None:
+    def settimeout(self, timeout: float | None) -> None:
         remaining = self._deadline - time.monotonic()
         if remaining <= 0:
             raise TimeoutError("Lemonade request exceeded end-to-end deadline")
-        self._sock.settimeout(min(timeout, max(_MIN_SOCKET_TIMEOUT_SECONDS, remaining)))
+        bound = max(_MIN_SOCKET_TIMEOUT_SECONDS, remaining)
+        self._sock.settimeout(bound if timeout is None else min(timeout, bound))
 
     def close(self) -> None:
         return self._sock.close()
@@ -1456,6 +1457,29 @@ class _MergeState:
         )
         return candidate_key > current_key
 
+    def _purge_subsumed(self, duplicate_index: int, candidate: Segment, offset: float) -> None:
+        """Purge any adjacent fragments from chunk N-1 that are subsumed by candidate's span."""
+        pruned: list[Segment] = []
+        for i, s in enumerate(self.segments):
+            if i == duplicate_index:
+                pruned.append(s)
+            elif (
+                s.start >= candidate.start - _TIMESTAMP_SLACK_SECONDS
+                and s.end <= candidate.end + _TIMESTAMP_SLACK_SECONDS
+                and s.start >= offset - _TIMESTAMP_SLACK_SECONDS
+                and (
+                    candidate.text.startswith(s.text)
+                    or candidate.text.endswith(s.text)
+                    or s.text in candidate.text
+                )
+            ):
+                s_words = len(s.words) if s.words else 0
+                self.total_words -= s_words
+                self.total_text_chars -= len(s.text)
+            else:
+                pruned.append(s)
+        self.segments = pruned
+
     def absorb(  # noqa: PLR0913 - chunk coordinates are explicit for auditability.
         self,
         payload: dict[str, Any],
@@ -1567,6 +1591,7 @@ class _MergeState:
                 self.total_words += candidate_words - existing_words
                 self.total_text_chars += len(candidate.text) - len(existing.text)
                 self.segments[duplicate_index] = candidate
+                self._purge_subsumed(duplicate_index, candidate, offset)
                 self._check_cumulative_bounds()
         self.segments.sort(key=lambda s: (s.start, s.end))
 
@@ -1714,6 +1739,9 @@ class LemonadeBackend:
                 f"Interrupted during '{stage}' — keeping the {len(state.segments)} "
                 "segments transcribed so far."
             )
+
+        if duration == 0.0 and state.segments:
+            duration = max(s.end for s in state.segments)
 
         info: TranscriptionInfo = {
             "language": state.pinned or "",

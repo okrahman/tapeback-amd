@@ -161,6 +161,7 @@ class LiveTranscriber:
         self._segments: list[Segment] = []
         self._active_backend_fingerprint: str | None = None
         self._fatal_error: Exception | None = None
+        self._last_detected_language: str | None = None
 
         self._stop_event = threading.Event()
         self._thread = threading.Thread(
@@ -421,11 +422,18 @@ class LiveTranscriber:
         chunk_path = self._mic_path.parent / f"chunk_{suffix}.wav"
         self._write_chunk_wav(samples_16k, chunk_path)
 
+        language_override = self._last_detected_language if is_mic else None
         try:
             # The temp WAV is ephemeral — it never outlives this call — so resume IO
             # is disabled: storing an entry for a file that is deleted before it can
             # ever be reused is pure waste (and risks key collisions across sessions).
-            segments, _info = transcriber.transcribe(chunk_path, use_resume=False)
+            segments, _info = transcriber.transcribe(
+                chunk_path,
+                language_override=language_override,
+                use_resume=False,
+            )
+            if not is_mic and _info.get("language"):
+                self._last_detected_language = str(_info["language"])
         finally:
             chunk_path.unlink(missing_ok=True)
 
@@ -461,6 +469,8 @@ class LiveTranscriber:
                 use_resume=False,
                 skip_mic_on_monitor_partial=False,
             )
+            if _info.get("language"):
+                self._last_detected_language = str(_info["language"])
         finally:
             mic_path.unlink(missing_ok=True)
             monitor_path.unlink(missing_ok=True)

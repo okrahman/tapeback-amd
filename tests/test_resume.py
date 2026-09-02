@@ -6,7 +6,10 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from tapeback import _resume
+from tapeback import audio as audio_mod
+from tapeback import pipeline as pipeline_mod
 from tapeback.models import Segment, Word
+from tapeback.settings import Settings
 from tapeback.transcriber import Transcriber
 
 
@@ -185,3 +188,80 @@ def test_prune_keeps_the_newest(tmp_path):
 def test_default_dir_honours_xdg(monkeypatch, tmp_path):
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
     assert _resume.default_resume_dir() == tmp_path / "xdg" / "tapeback" / "resume"
+
+
+def test_process_file_deterministic_staging_preserves_resume_keys(tmp_path, monkeypatch):
+    """process_file creates deterministic staging dirs and preserves mtimes for resume cache."""
+    settings = Settings(
+        vault_path=tmp_path / "vault",
+        resume_cache=True,
+        resume_cache_dir=tmp_path / "resume",
+        device="cpu",
+    )
+    fake_wav = tmp_path / "meeting.wav"
+    wav_header = (
+        b"RIFF\x24\x00\x00\x00WAVEfmt \x10\x00\x00\x00\x01\x00\x02\x00"
+        b"\x80>\x00\x00\x00}\x00\x00\x04\x00\x10\x00data\x00\x00\x00\x00"
+    )
+    fake_wav.write_bytes(wav_header)
+
+    split_keys_1: list[str] = []
+
+    def mock_transcribe_stereo_1(mic_16k, mon_16k, **kwargs):
+        k_mon = _resume.resume_key(mon_16k, "test_fp", "transcribe monitor")
+        k_mic = _resume.resume_key(mic_16k, "test_fp", "transcribe mic")
+        assert k_mon is not None and k_mic is not None
+        split_keys_1.extend([k_mon.digest, k_mic.digest])
+        return [], [], {"duration": 1.0}
+
+    monkeypatch.setattr(pipeline_mod, "load_stereo_channels", lambda p: (None, None, 16000))
+    monkeypatch.setattr(
+        audio_mod,
+        "split_channels_16k",
+        lambda p, out: (out / "mic_16k.wav", out / "monitor_16k.wav"),
+    )
+
+    def mock_split(stereo_wav, output_dir):
+        m = output_dir / "mic_16k.wav"
+        mo = output_dir / "monitor_16k.wav"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        m.write_bytes(b"mic audio")
+        mo.write_bytes(b"mon audio")
+        st = stereo_wav.stat()
+        os.utime(m, (st.st_atime, st.st_mtime))
+        os.utime(mo, (st.st_atime, st.st_mtime))
+        return m, mo
+
+    monkeypatch.setattr(pipeline_mod, "split_channels_16k", mock_split)
+    monkeypatch.setattr(pipeline_mod, "gate_wav_inactive", lambda *args: None)
+    monkeypatch.setattr(pipeline_mod, "split_on_silence", lambda segs, *args, **kw: segs)
+    monkeypatch.setattr(pipeline_mod, "filter_silent_segments", lambda segs, *args, **kw: segs)
+    monkeypatch.setattr(pipeline_mod, "diarization_available", lambda: False)
+    monkeypatch.setattr(pipeline_mod, "is_stereo", lambda p: True)
+
+    mock_transcriber = MagicMock()
+    mock_transcriber.describe.return_value = "mock_backend"
+    mock_transcriber.transcribe_stereo.side_effect = mock_transcribe_stereo_1
+    monkeypatch.setattr(pipeline_mod, "load_transcriber", lambda s: mock_transcriber)
+
+    pipeline_mod.process_file(
+        fake_wav, settings, name="test_session", diarize=False, do_summarize=False
+    )
+
+    # Second run on the same file should produce identical resume keys
+    split_keys_2: list[str] = []
+
+    def mock_transcribe_stereo_2(mic_16k, mon_16k, **kwargs):
+        k_mon = _resume.resume_key(mon_16k, "test_fp", "transcribe monitor")
+        k_mic = _resume.resume_key(mic_16k, "test_fp", "transcribe mic")
+        assert k_mon is not None and k_mic is not None
+        split_keys_2.extend([k_mon.digest, k_mic.digest])
+        return [], [], {"duration": 1.0}
+
+    mock_transcriber.transcribe_stereo.side_effect = mock_transcribe_stereo_2
+    pipeline_mod.process_file(
+        fake_wav, settings, name="test_session", diarize=False, do_summarize=False
+    )
+
+    assert len(split_keys_1) == 2
+    assert split_keys_1 == split_keys_2
