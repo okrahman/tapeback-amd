@@ -44,12 +44,15 @@ configuration, or interrupt.
 from __future__ import annotations
 
 import hashlib
+import http.client
 import ipaddress
 import json
 import math
 import re
+import socket
 import struct
 import time
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -429,6 +432,20 @@ def _tokens(text: str) -> list[str]:
     return [token for token in re.split(r"[^a-z0-9]+", text.lower()) if token]
 
 
+_CJK_RANGES = r"\u4e00-\u9fff\u3400-\u4dbf\u3040-\u30ff\uac00-\ud7af\uf900-\ufaff"
+_UTTERANCE_TOKEN_PATTERN = re.compile(rf"[{_CJK_RANGES}]|[^\W_]+")
+
+
+def _utterance_tokens(text: str) -> list[str]:
+    """Unicode-aware, case-folded tokenization for utterance comparison and overlap dedup.
+
+    Normalizes Unicode via NFKC, case-folds, splits individual CJK characters, and extracts
+    words for alphabetic and syllabic scripts (Latin, Cyrillic, Arabic, Hebrew, Greek, etc.).
+    """
+    normalized = unicodedata.normalize("NFKC", text).casefold()
+    return _UTTERANCE_TOKEN_PATTERN.findall(normalized)
+
+
 def _has_phrase(tokens: list[str], phrase: str) -> bool:
     """Whether the token list contains ``phrase`` as consecutive whole tokens.
 
@@ -593,13 +610,151 @@ class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
         return None
 
 
+class _DeadlineSocket:
+    """Socket wrapper that recalculates and updates the socket timeout before every operation."""
+
+    def __init__(self, sock: Any, deadline: float) -> None:
+        self._sock = sock
+        self._deadline = deadline
+
+    def _update_timeout(self) -> None:
+        remaining = self._deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("Lemonade request exceeded end-to-end deadline")
+        self._sock.settimeout(max(_MIN_SOCKET_TIMEOUT_SECONDS, remaining))
+
+    def send(self, *args: Any, **kwargs: Any) -> int:
+        self._update_timeout()
+        return self._sock.send(*args, **kwargs)
+
+    def sendall(self, *args: Any, **kwargs: Any) -> None:
+        self._update_timeout()
+        return self._sock.sendall(*args, **kwargs)
+
+    def recv(self, *args: Any, **kwargs: Any) -> bytes:
+        self._update_timeout()
+        return self._sock.recv(*args, **kwargs)
+
+    def recv_into(self, *args: Any, **kwargs: Any) -> int:
+        self._update_timeout()
+        return self._sock.recv_into(*args, **kwargs)
+
+    def makefile(self, *args: Any, **kwargs: Any) -> Any:
+        self._update_timeout()
+        return self._sock.makefile(*args, **kwargs)
+
+    def settimeout(self, timeout: float) -> None:
+        remaining = self._deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("Lemonade request exceeded end-to-end deadline")
+        self._sock.settimeout(min(timeout, max(_MIN_SOCKET_TIMEOUT_SECONDS, remaining)))
+
+    def close(self) -> None:
+        return self._sock.close()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._sock, name)
+
+
+class _DeadlineHTTPConnection(http.client.HTTPConnection):
+    """HTTPConnection enforcing an absolute deadline across connect, write, and headers."""
+
+    def __init__(self, *args: Any, deadline: float | None = None, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._deadline = deadline
+
+    def connect(self) -> None:
+        if self._deadline is not None:
+            remaining = self._deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(
+                    "Lemonade request exceeded end-to-end deadline before connection"
+                )
+            timeout = max(_MIN_SOCKET_TIMEOUT_SECONDS, remaining)
+        else:
+            timeout = self.timeout
+        self.sock = socket.create_connection(
+            (self.host, self.port), timeout, self.source_address
+        )
+        if self._deadline is not None:
+            self.sock = _DeadlineSocket(self.sock, self._deadline)
+
+
+class _DeadlineHTTPSConnection(http.client.HTTPSConnection):
+    """HTTPSConnection enforcing an absolute deadline across connect, TLS, write, and headers."""
+
+    def __init__(self, *args: Any, deadline: float | None = None, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._deadline = deadline
+
+    def connect(self) -> None:
+        if self._deadline is not None:
+            remaining = self._deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(
+                    "Lemonade request exceeded end-to-end deadline before connection"
+                )
+            timeout = max(_MIN_SOCKET_TIMEOUT_SECONDS, remaining)
+        else:
+            timeout = self.timeout
+        sock = socket.create_connection(
+            (self.host, self.port), timeout, self.source_address
+        )
+        if self._deadline is not None:
+            remaining = self._deadline - time.monotonic()
+            if remaining <= 0:
+                sock.close()
+                raise TimeoutError(
+                    "Lemonade request exceeded end-to-end deadline before TLS handshake"
+                )
+            sock.settimeout(max(_MIN_SOCKET_TIMEOUT_SECONDS, remaining))
+        self.sock = self._context.wrap_socket(sock, server_hostname=self.host)
+        if self._deadline is not None:
+            self.sock = _DeadlineSocket(self.sock, self._deadline)
+
+
+class _DeadlineHTTPHandler(urllib.request.HTTPHandler):
+    def http_open(self, req: urllib.request.Request) -> Any:
+        deadline = getattr(req, "_tapeback_deadline", None)
+        if deadline is not None:
+            return self.do_open(
+                lambda host, **kw: _DeadlineHTTPConnection(host, deadline=deadline, **kw),
+                req,
+            )
+        return super().http_open(req)
+
+
+class _DeadlineHTTPSHandler(urllib.request.HTTPSHandler):
+    def https_open(self, req: urllib.request.Request) -> Any:
+        deadline = getattr(req, "_tapeback_deadline", None)
+        if deadline is not None:
+            return self.do_open(
+                lambda host, **kw: _DeadlineHTTPSConnection(host, deadline=deadline, **kw),
+                req,
+                context=self._context,
+            )
+        return super().https_open(req)
+
+
 _NO_PROXY_OPENER = urllib.request.build_opener(
-    urllib.request.ProxyHandler({}), _NoRedirectHandler()
+    urllib.request.ProxyHandler({}),
+    _NoRedirectHandler(),
+    _DeadlineHTTPHandler(),
+    _DeadlineHTTPSHandler(),
 )
-_DEFAULT_OPENER = urllib.request.build_opener(_NoRedirectHandler())
+_DEFAULT_OPENER = urllib.request.build_opener(
+    _NoRedirectHandler(),
+    _DeadlineHTTPHandler(),
+    _DeadlineHTTPSHandler(),
+)
 
 
-def _open_url(request: urllib.request.Request, timeout: float, *, bypass_proxies: bool) -> Any:
+def _open_url(
+    request: urllib.request.Request,
+    timeout: float,
+    *,
+    bypass_proxies: bool,
+) -> Any:
     """Open one URL, bypassing the inherited proxy configuration for loopback.
 
     Redirects are never followed on either path — see `_NoRedirectHandler`.
@@ -1061,8 +1216,8 @@ class _MergeState:
     @staticmethod
     def _same_utterance(left: Segment, right: Segment) -> bool:
         """Whether overlap candidates say the same thing, allowing token prefixes."""
-        left_tokens = _tokens(left.text)
-        right_tokens = _tokens(right.text)
+        left_tokens = _utterance_tokens(left.text)
+        right_tokens = _utterance_tokens(right.text)
         if not left_tokens or not right_tokens:
             return False
         short, long = (
@@ -1471,9 +1626,12 @@ class LemonadeBackend:
         if timeout is None:
             timeout = self._settings.lemonade_timeout_seconds
         deadline = time.monotonic() + timeout
+        request._tapeback_deadline = deadline  # type: ignore[attr-defined]
         try:
             with _open_url(
-                request, _remaining(deadline), bypass_proxies=self._bypass_proxies
+                request,
+                _remaining(deadline),
+                bypass_proxies=self._bypass_proxies,
             ) as response:
                 headers = getattr(response, "headers", None)
                 if headers is not None:

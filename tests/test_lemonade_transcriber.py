@@ -678,3 +678,43 @@ def test_fallback_stereo_mic_key_follows_monitor_language(tmp_path, monkeypatch,
     assert len(fw_calls) == 4  # monitor+mic per stereo run, mic cache never cross-hit
     assert mic_calls[0] == ("mic.wav", "transcribe mic", "en")
     assert mic_calls[-1] == ("mic.wav", "transcribe mic", "fr")
+
+
+def test_fallback_latch_is_installed_before_local_backend_construction(tmp_path, monkeypatch):
+    """If faster-whisper construction fails during fallback, the facade remains latched
+    and never resubmits subsequent requests to Lemonade."""
+    wav = tmp_path / "test.wav"
+    write_wav(wav, 0.5)
+
+    lemonade_calls = install_urlopen(
+        monkeypatch,
+        [
+            TimeoutError("read timed out"),
+            verbose_json([seg(0.0, 0.4, "lemonade should never receive this")]),
+        ],
+    )
+    transcriber = Transcriber(lemon_settings(tmp_path))
+
+    fw_attempts = 0
+
+    def failing_new_fw(self):
+        nonlocal fw_attempts
+        fw_attempts += 1
+        raise RuntimeError("Model download failed")
+
+    monkeypatch.setattr(Transcriber, "_new_fw_backend", failing_new_fw)
+
+    # First attempt: Lemonade times out, fallback initiates and attempts fw construction, which fails
+    with pytest.raises(RuntimeError, match="Model download failed"):
+        transcriber.transcribe(wav)
+
+    assert len(lemonade_calls) == 1
+    assert fw_attempts == 1
+
+    # Second attempt: Transcriber is latched in fallback state. It must NOT call Lemonade again.
+    with pytest.raises(RuntimeError, match="Model download failed"):
+        transcriber.transcribe(wav)
+
+    # Exactly 1 Lemonade call was ever made; the retry tried FW, never Lemonade.
+    assert len(lemonade_calls) == 1
+    assert fw_attempts == 2

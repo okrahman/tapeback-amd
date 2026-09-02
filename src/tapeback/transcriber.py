@@ -54,6 +54,40 @@ def _noop_status(_message: str) -> None:
     """Default status sink — used when transcribe_stereo gets no reporter."""
 
 
+class _LatchedFallbackBackend:
+    """Placeholder backend installed immediately when Lemonade fails.
+
+    Ensures Lemonade is never called again even if faster-whisper construction fails.
+    """
+
+    def __init__(self, cause: LemonadeFallbackError, transcriber: Transcriber) -> None:
+        self._cause = cause
+        self._transcriber = transcriber
+
+    def describe(self) -> str:
+        return f"fallback-latched (cause: {self._cause})"
+
+    def cache_fingerprint(self) -> str:
+        return "fallback-latched"
+
+    def transcribe(
+        self,
+        audio_path: Path,
+        *,
+        stage: str = "transcribe",
+        on_status: Callable[[str], None] = _noop_status,
+        language_override: str | None = None,
+    ) -> tuple[list[Segment], TranscriptionInfo]:
+        fw = self._transcriber._new_fw_backend()
+        self._transcriber._backend = fw
+        return fw.transcribe(
+            audio_path,
+            stage=stage,
+            on_status=on_status,
+            language_override=language_override,
+        )
+
+
 class Transcriber:
     """Backend-agnostic facade over one configured transcription backend."""
 
@@ -173,6 +207,7 @@ class Transcriber:
         the caller opted out of resume IO.
         """
         on_status(f"Lemonade transcription failed ({exc}) — falling back to faster-whisper.")
+        self._backend = _LatchedFallbackBackend(exc, self)
         fw = self._new_fw_backend()
         self._backend = fw
         key = (
@@ -341,6 +376,7 @@ class Transcriber:
             f"Lemonade transcription failed ({exc}) — falling back to faster-whisper "
             "for both channels."
         )
+        self._backend = _LatchedFallbackBackend(exc, self)
         fw = self._new_fw_backend()
         self._backend = fw
         fw_fingerprint = fw.cache_fingerprint()

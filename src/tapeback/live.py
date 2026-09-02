@@ -16,6 +16,7 @@ import numpy as np
 from tapeback import const
 from tapeback._gpu import free_gpu_memory
 from tapeback._lazy import load_transcriber
+from tapeback._lemonade import LemonadeAuthenticationError, LemonadeConfigurationError
 from tapeback.formatter import format_live_markdown
 from tapeback.models import Segment, Word
 from tapeback.settings import Settings
@@ -159,6 +160,8 @@ class LiveTranscriber:
         self._mic_byte_offset = 0  # bytes of PCM data already processed
         self._monitor_byte_offset = 0
         self._segments: list[Segment] = []
+        self._active_backend_fingerprint: str | None = None
+        self._fatal_error: Exception | None = None
 
         self._stop_event = threading.Event()
         self._thread = threading.Thread(
@@ -208,6 +211,9 @@ class LiveTranscriber:
             self._transcriber = None
             free_gpu_memory()
 
+        if self._fatal_error is not None:
+            raise self._fatal_error
+
     def _ensure_transcriber(self) -> Transcriber:
         """Lazily create the Transcriber (loads Whisper model)."""
         if self._transcriber is None:
@@ -222,6 +228,15 @@ class LiveTranscriber:
         while not self._stop_event.wait(timeout=self._settings.live_interval):
             try:
                 self._process_chunk()
+            except (LemonadeAuthenticationError, LemonadeConfigurationError) as exc:
+                self._fatal_error = exc
+                import traceback  # noqa: PLC0415 — only on error
+
+                print(
+                    f"Error: Terminal live transcription error:\n{traceback.format_exc()}",
+                    file=sys.stderr,
+                )
+                break
             except Exception:
                 import traceback  # noqa: PLC0415 — only on error
 
@@ -230,16 +245,25 @@ class LiveTranscriber:
                     file=sys.stderr,
                 )
 
-        # Process final chunk on stop
-        try:
-            self._process_chunk()
-        except Exception:
-            import traceback  # noqa: PLC0415 — only on error
+        # Process final chunk on stop only if no terminal fatal error occurred
+        if self._fatal_error is None:
+            try:
+                self._process_chunk()
+            except (LemonadeAuthenticationError, LemonadeConfigurationError) as exc:
+                self._fatal_error = exc
+                import traceback  # noqa: PLC0415 — only on error
 
-            print(
-                f"Warning: Live transcription final chunk error:\n{traceback.format_exc()}",
-                file=sys.stderr,
-            )
+                print(
+                    f"Error: Terminal live transcription final chunk error:\n{traceback.format_exc()}",
+                    file=sys.stderr,
+                )
+            except Exception:
+                import traceback  # noqa: PLC0415 — only on error
+
+                print(
+                    f"Warning: Live transcription final chunk error:\n{traceback.format_exc()}",
+                    file=sys.stderr,
+                )
 
     def _process_chunk(self) -> None:
         """Read new audio from both channels, transcribe, update markdown.
@@ -298,10 +322,22 @@ class LiveTranscriber:
                 is_mic=False,
             )
 
-        if mic_segments or monitor_segments:
+        current_fp = transcriber._backend.cache_fingerprint()
+        if (
+            self._active_backend_fingerprint is not None
+            and current_fp != self._active_backend_fingerprint
+            and self._segments
+        ):
+            # Backend switch occurred mid-session: re-transcribe all committed audio
+            # from offset 0 with the new backend so the transcript is never mixed.
+            self._segments = self._retranscribe_full(
+                transcriber, mic_new_offset, monitor_new_offset
+            )
+        elif mic_segments or monitor_segments:
             self._segments.extend(mic_segments)
             self._segments.extend(monitor_segments)
             self._segments.sort(key=lambda s: s.start)
+        self._active_backend_fingerprint = current_fp
 
         # Commit both cursors only once the whole interval succeeded — never between
         # the two channels, or an error in the second would skip the first's audio
@@ -429,6 +465,113 @@ class LiveTranscriber:
             monitor_segments, self._monitor_byte_offset, overlap_bytes, is_mic=False
         )
         return mic_segments, monitor_segments
+
+    def _retranscribe_full(
+        self,
+        transcriber: Transcriber,
+        mic_offset: int,
+        monitor_offset: int,
+    ) -> list[Segment]:
+        """Re-transcribe all committed audio from the beginning using the current backend."""
+        mic_pcm = self._read_pcm_range(self._mic_path, 0, mic_offset, is_mic=True)
+        monitor_pcm = self._read_pcm_range(self._monitor_path, 0, monitor_offset, is_mic=False)
+        segments: list[Segment] = []
+
+        if mic_pcm is not None and monitor_pcm is not None:
+            mic_segs, monitor_segs = self._transcribe_pair_audio(transcriber, mic_pcm, monitor_pcm)
+            segments.extend(mic_segs)
+            segments.extend(monitor_segs)
+        elif mic_pcm is not None:
+            segments.extend(self._transcribe_chunk_audio(transcriber, mic_pcm, is_mic=True))
+        elif monitor_pcm is not None:
+            segments.extend(self._transcribe_chunk_audio(transcriber, monitor_pcm, is_mic=False))
+
+        segments.sort(key=lambda s: s.start)
+        return segments
+
+    def _read_pcm_range(
+        self,
+        wav_path: Path,
+        start_byte: int,
+        length_bytes: int,
+        *,
+        is_mic: bool,
+    ) -> bytes | None:
+        """Read a specific range of raw PCM bytes from a WAV file."""
+        if not wav_path.exists() or length_bytes <= 0:
+            return None
+        if is_mic:
+            if self._mic_data_offset is None:
+                self._mic_data_offset = find_data_offset(wav_path)
+            data_offset = self._mic_data_offset
+        else:
+            if self._monitor_data_offset is None:
+                self._monitor_data_offset = find_data_offset(wav_path)
+            data_offset = self._monitor_data_offset
+        with open(wav_path, "rb") as f:
+            f.seek(data_offset + start_byte)
+            pcm_bytes = f.read(length_bytes)
+        if len(pcm_bytes) % BYTES_PER_SAMPLE != 0:
+            pcm_bytes = pcm_bytes[: len(pcm_bytes) - (len(pcm_bytes) % BYTES_PER_SAMPLE)]
+        return pcm_bytes if pcm_bytes else None
+
+    def _transcribe_pair_audio(
+        self,
+        transcriber: Transcriber,
+        mic_pcm: bytes,
+        monitor_pcm: bytes,
+    ) -> tuple[list[Segment], list[Segment]]:
+        """Transcribe a full mic/monitor pair without time offsets or overlap dedup."""
+        mic_samples_16k = resample_48k_to_16k(mic_pcm)
+        monitor_samples_16k = resample_48k_to_16k(monitor_pcm)
+        mic_path = self._mic_path.parent / "chunk_mic.wav"
+        monitor_path = self._mic_path.parent / "chunk_monitor.wav"
+        self._write_chunk_wav(mic_samples_16k, mic_path)
+        self._write_chunk_wav(monitor_samples_16k, monitor_path)
+        try:
+            mic_segs, monitor_segs, _info = transcriber.transcribe_stereo(
+                mic_path,
+                monitor_path,
+                use_resume=False,
+                skip_mic_on_monitor_partial=False,
+            )
+        finally:
+            mic_path.unlink(missing_ok=True)
+            monitor_path.unlink(missing_ok=True)
+
+        mic_segs = [
+            Segment(start=s.start, end=s.end, text=s.text, words=s.words, speaker=const.SPEAKER_YOU)
+            for s in mic_segs
+        ]
+        monitor_segs = [
+            Segment(start=s.start, end=s.end, text=s.text, words=s.words, speaker=const.SPEAKER_OTHER)
+            for s in monitor_segs
+        ]
+        return mic_segs, monitor_segs
+
+    def _transcribe_chunk_audio(
+        self,
+        transcriber: Transcriber,
+        pcm_bytes: bytes,
+        *,
+        is_mic: bool,
+    ) -> list[Segment]:
+        """Transcribe full single-channel audio without time offsets or overlap dedup."""
+        samples_16k = resample_48k_to_16k(pcm_bytes)
+        if len(samples_16k) == 0:
+            return []
+        suffix = "mic" if is_mic else "monitor"
+        chunk_path = self._mic_path.parent / f"chunk_{suffix}.wav"
+        self._write_chunk_wav(samples_16k, chunk_path)
+        try:
+            segments, _info = transcriber.transcribe(chunk_path, use_resume=False)
+        finally:
+            chunk_path.unlink(missing_ok=True)
+        speaker = const.SPEAKER_YOU if is_mic else const.SPEAKER_OTHER
+        return [
+            Segment(start=s.start, end=s.end, text=s.text, words=s.words, speaker=speaker)
+            for s in segments
+        ]
 
     def _finalize_segments(
         self,

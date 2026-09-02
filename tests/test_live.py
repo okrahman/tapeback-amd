@@ -14,7 +14,10 @@ import numpy as np
 import pytest
 
 import tapeback.live as live_mod
-from tapeback._lemonade import LemonadeAuthenticationError
+from tapeback._lemonade import (
+    LemonadeAuthenticationError,
+    LemonadeConfigurationError,
+)
 from tapeback.live import (
     LiveTranscriber,
     adjust_timestamps,
@@ -638,3 +641,137 @@ def test_no_work_after_stop_returns(tmp_path, tmp_vault, monkeypatch):
     time.sleep(0.3)
     assert len(chunk_calls) == chunks_at_stop
     assert len(write_calls) == writes_at_stop
+
+
+def test_live_session_does_not_mix_backends_after_fallback_in_later_interval(
+    tmp_path, tmp_vault, monkeypatch
+):
+    """When a fallback occurs on a later interval, the session must re-transcribe from
+    the beginning so the live note never mixes Lemonade and faster-whisper outputs."""
+    settings = Settings(
+        vault_path=tmp_vault,
+        transcription_backend="lemonade",
+        resume_cache_dir=tmp_path / "resume",
+        live_min_chunk=0.1,
+        live_interval=60,
+    )
+    mic_path = tmp_path / "mic.wav"
+    monitor_path = tmp_path / "monitor.wav"
+    create_mono_wav(mic_path, duration=0.5, sample_rate=48000)
+    create_mono_wav(monitor_path, duration=0.5, sample_rate=48000)
+
+    # Interval 1: Lemonade succeeds for both monitor and mic
+    lemonade_calls = _install_urlopen(
+        monkeypatch,
+        [
+            _lemon_verbose_json("lemonade monitor 1"),
+            _lemon_verbose_json("lemonade mic 1"),
+            TimeoutError("read timed out on interval 2"),
+        ],
+    )
+
+    fw = MagicMock()
+    fw.cache_fingerprint.return_value = "fw-fingerprint"
+
+    def fw_transcribe(path, **kwargs):
+        return [Segment(start=0.0, end=1.0, text="fw full session")], {
+            "language": "en",
+            "duration": 1.0,
+            "partial": False,
+        }
+
+    fw.transcribe.side_effect = fw_transcribe
+    monkeypatch.setattr(Transcriber, "_new_fw_backend", lambda self: fw)
+    monkeypatch.setattr(live_mod, "load_transcriber", lambda s: Transcriber(s))
+
+    lt = LiveTranscriber(settings, "switch-session", mic_path, monitor_path)
+
+    # Interval 1 executes on Lemonade
+    lt._process_chunk()
+    assert len(lemonade_calls) == 2
+    assert set(s.text for s in lt._segments) == {"lemonade monitor 1", "lemonade mic 1"}
+
+    # Grow both audio files for Interval 2
+    with open(mic_path, "ab") as f:
+        f.write(b"\x00\x00" * 24000)
+    with open(monitor_path, "ab") as f:
+        f.write(b"\x00\x00" * 24000)
+
+    # Interval 2 fails on Lemonade, falls back to fw, and re-transcribes committed session
+    lt._process_chunk()
+
+    # Verify all segments are now exclusively from fw, with 0 mixed Lemonade segments
+    assert len(lt._segments) == 2
+    assert all(s.text == "fw full session" for s in lt._segments)
+    assert not any("lemonade" in s.text for s in lt._segments)
+
+    # Verify live markdown contains fw output
+    md_content = lt.live_md_path.read_text()
+    assert "fw full session" in md_content
+    assert "lemonade" not in md_content
+
+
+def test_live_terminal_auth_failure_stops_worker_and_surfaces_on_stop(
+    tmp_path, tmp_vault, monkeypatch
+):
+    """A 401/403 authentication error terminates the live worker loop immediately
+    without retrying, and is re-raised synchronously from stop()."""
+    settings = Settings(
+        vault_path=tmp_vault,
+        transcription_backend="lemonade",
+        live_interval=1,
+        live_min_chunk=0.01,
+    )
+    mic_path = tmp_path / "mic.wav"
+    monitor_path = tmp_path / "monitor.wav"
+    create_mono_wav(mic_path, duration=0.5, sample_rate=48000)
+    create_mono_wav(monitor_path, duration=0.5, sample_rate=48000)
+
+    auth_error = urllib.error.HTTPError("http://x", 401, "auth", Message(), io.BytesIO(b"{}"))
+    lemonade_calls = _install_urlopen(monkeypatch, [auth_error])
+    monkeypatch.setattr(live_mod, "load_transcriber", lambda s: Transcriber(s))
+
+    lt = LiveTranscriber(settings, "fatal-auth-session", mic_path, monitor_path)
+    lt.start()
+
+    # Wait for the worker thread to encounter the fatal error and terminate
+    lt._thread.join(timeout=3)
+    assert not lt._thread.is_alive()
+    # Exactly one request made: loop broke immediately, no repeated credential retries
+    assert len(lemonade_calls) == 1
+
+    # stop() surfaces the fatal error synchronously to caller
+    with pytest.raises(LemonadeAuthenticationError):
+        lt.stop()
+
+
+def test_live_terminal_config_failure_stops_worker_and_surfaces_on_stop(
+    tmp_path, tmp_vault, monkeypatch
+):
+    """A 400 configuration error terminates the live worker loop immediately
+    without retrying, and is re-raised synchronously from stop()."""
+    settings = Settings(
+        vault_path=tmp_vault,
+        transcription_backend="lemonade",
+        live_interval=1,
+        live_min_chunk=0.01,
+    )
+    mic_path = tmp_path / "mic.wav"
+    monitor_path = tmp_path / "monitor.wav"
+    create_mono_wav(mic_path, duration=0.5, sample_rate=48000)
+    create_mono_wav(monitor_path, duration=0.5, sample_rate=48000)
+
+    config_error = urllib.error.HTTPError("http://x", 400, "bad request", Message(), io.BytesIO(b"{}"))
+    lemonade_calls = _install_urlopen(monkeypatch, [config_error])
+    monkeypatch.setattr(live_mod, "load_transcriber", lambda s: Transcriber(s))
+
+    lt = LiveTranscriber(settings, "fatal-config-session", mic_path, monitor_path)
+    lt.start()
+
+    lt._thread.join(timeout=3)
+    assert not lt._thread.is_alive()
+    assert len(lemonade_calls) == 1
+
+    with pytest.raises(LemonadeConfigurationError):
+        lt.stop()
+

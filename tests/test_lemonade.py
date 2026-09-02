@@ -4,6 +4,7 @@ import io
 import json
 import struct
 import threading
+import time
 import urllib.error
 import urllib.request
 import wave
@@ -1477,3 +1478,121 @@ def test_classification_is_unchanged_by_sanitization():
         LemonadeModelError,
     )
     assert isinstance(classify_http_failure(401, {}), LemonadeAuthenticationError)
+
+
+def test_utterance_tokens_unicode_and_cjk():
+    from tapeback._lemonade import _utterance_tokens
+
+    # Cyrillic
+    assert _utterance_tokens("Привет, мир!") == ["привет", "мир"]
+    # Chinese (CJK characters split individually)
+    assert _utterance_tokens("今天天气很好") == ["今", "天", "天", "气", "很", "好"]
+    # Japanese
+    assert _utterance_tokens("こんにちは世界") == ["こ", "ん", "に", "ち", "は", "世", "界"]
+    # Arabic
+    assert _utterance_tokens("مرحبا بالعالم") == ["مرحبا", "بالعالم"]
+    # Mixed Latin and Chinese
+    assert _utterance_tokens("iPhone 很好用") == ["iphone", "很", "好", "用"]
+    # Empty / punctuation only
+    assert _utterance_tokens("... --- ...") == []
+
+
+def test_unicode_overlap_deduplication_cyrillic_and_cjk(tmp_path, monkeypatch):
+    """Unicode transcripts (Cyrillic, CJK, etc.) must be deduplicated across chunk overlaps."""
+    wav = tmp_path / "long_unicode.wav"
+    write_wav(wav, 2.5)  # 1s chunks, 0.5s overlap -> 3 chunks
+
+    # Chunk 0: 0.0-1.0s (overlap: 0.5-1.0s). Chunk 1: 0.5-2.0s (overlap: 0.5-1.0s).
+    # In chunk 0, "Привет, мир!" spans 0.6..0.9s.
+    # In chunk 1, "Привет, мир!" spans 0.1..0.4s (chunk-relative -> file-relative 0.6..0.9s).
+    # This identical Cyrillic utterance in the overlap must be deduplicated!
+    responses = [
+        verbose_json([seg(0.0, 0.4, "Первая часть"), seg(0.6, 0.9, "Привет, мир!")]),
+        verbose_json([seg(0.1, 0.4, "Привет, мир!"), seg(0.6, 1.4, "Вторая часть")]),
+        verbose_json([seg(0.5, 0.8, "Третья часть")]),
+    ]
+    calls = install_urlopen(monkeypatch, responses)
+
+    segments, info = LemonadeBackend(lemon_settings(tmp_path)).transcribe(wav)
+
+    assert len(calls) == 3
+    # "Привет, мир!" from chunk 1's overlap must be deduplicated, not duplicated!
+    assert [s.text for s in segments] == [
+        "Первая часть",
+        "Привет, мир!",
+        "Вторая часть",
+        "Третья часть",
+    ]
+
+
+def test_cjk_overlap_deduplication(tmp_path, monkeypatch):
+    """CJK transcripts with partial prefix in overlap are deduplicated cleanly."""
+    wav = tmp_path / "long_cjk.wav"
+    write_wav(wav, 2.5)
+
+    responses = [
+        verbose_json([seg(0.0, 0.4, "第一部分"), seg(0.6, 0.9, "今天天气很好")]),
+        verbose_json([seg(0.1, 0.4, "今天天气很好"), seg(0.6, 1.4, "第二部分")]),
+        verbose_json([seg(0.5, 0.8, "第三部分")]),
+    ]
+    calls = install_urlopen(monkeypatch, responses)
+
+    segments, info = LemonadeBackend(lemon_settings(tmp_path)).transcribe(wav)
+
+    assert len(calls) == 3
+    assert [s.text for s in segments] == ["第一部分", "今天天气很好", "第二部分", "第三部分"]
+
+
+def test_real_socket_end_to_end_deadline_multi_phase_delay(tmp_path):
+    """A real socket delaying across multiple pre-response phases must trip the total deadline."""
+    import socket
+    import threading
+
+    # Create a loopback TCP server that delays both before reading request and before sending headers
+    server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server_sock.bind(("127.0.0.1", 0))
+    server_sock.listen(1)
+    port = server_sock.getsockname()[1]
+
+    def handle_client():
+        try:
+            conn, _ = server_sock.accept()
+            # Delay phase 1: 0.15s before reading request
+            time.sleep(0.15)
+            try:
+                conn.recv(4096)
+            except Exception:
+                pass
+            # Delay phase 2: 0.20s before sending response headers
+            time.sleep(0.20)
+            try:
+                conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}")
+                conn.close()
+            except Exception:
+                pass
+        except Exception:
+            pass
+        finally:
+            server_sock.close()
+
+    server_thread = threading.Thread(target=handle_client, daemon=True)
+    server_thread.start()
+
+    backend = LemonadeBackend(
+        lemon_settings(
+            tmp_path,
+            lemonade_url=f"http://127.0.0.1:{port}",
+            lemonade_timeout_seconds=0.20,
+            lemonade_diagnostics_timeout_seconds=0.20,
+        )
+    )
+
+    start_time = time.monotonic()
+    with pytest.raises(LemonadeInferenceTimeout):
+        backend.health()
+    elapsed = time.monotonic() - start_time
+
+    # The total delay of the server is 0.15 + 0.20 = 0.35s.
+    # The configured deadline was 0.20s. The client must abort near 0.20s, well before 0.35s.
+    assert elapsed < 0.32
+
