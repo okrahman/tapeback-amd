@@ -116,21 +116,48 @@ def deduplicate_overlap(
     A new segment is considered a duplicate if its start time is within
     DEDUP_TOLERANCE_SEC of any existing segment of the same speaker's start time
     AND it falls within the overlap region (before overlap_start + tolerance).
+
+    If a duplicate candidate in the overlap zone extends past the overlap boundary
+    or has longer text than the matched existing segment, it updates/replaces the
+    existing segment in-place rather than being unconditionally discarded.
     """
     if not existing or overlap_start <= 0:
         return new_segments
 
     kept: list[Segment] = []
+    replaced = False
     for seg in new_segments:
         # Segments clearly past the overlap zone — always keep
         if seg.start >= overlap_start + DEDUP_TOLERANCE_SEC:
             kept.append(seg)
             continue
+
         # Check if this segment duplicates an existing one of the same speaker
-        existing_starts = {s.start for s in existing if s.speaker == seg.speaker}
-        is_dup = any(abs(seg.start - es) < DEDUP_TOLERANCE_SEC for es in existing_starts)
-        if not is_dup:
+        best_match_idx: int | None = None
+        best_diff = DEDUP_TOLERANCE_SEC
+        for i, es in enumerate(existing):
+            if es.speaker == seg.speaker:
+                diff = abs(seg.start - es.start)
+                if diff < best_diff:
+                    best_diff = diff
+                    best_match_idx = i
+
+        if best_match_idx is None:
             kept.append(seg)
+        else:
+            # Reconcile duplicate candidates: if candidate extends past the
+            # overlap boundary or has longer text, update/replace the existing
+            # segment (mirroring _MergeState._prefer).
+            existing_seg = existing[best_match_idx]
+            extends_past_boundary = seg.end > overlap_start and seg.end > existing_seg.end
+            has_longer_text = len(seg.text.strip()) > len(existing_seg.text.strip())
+            if extends_past_boundary or has_longer_text:
+                existing[best_match_idx] = seg
+                replaced = True
+
+    if replaced:
+        existing.sort(key=lambda s: s.start)
+
     return kept
 
 

@@ -196,6 +196,7 @@ def test_describe_names_model_and_endpoint(tmp_path):
         ("language", "de"),
         ("lemonade_chunk_seconds", 120.0),
         ("lemonade_overlap_seconds", 0.9),
+        ("gate_mic_silence", False),
     ],
 )
 def test_fingerprint_changes_with_every_output_shaping_setting(tmp_path, field, value):
@@ -1946,6 +1947,25 @@ def test_send_translates_http_exceptions_to_unavailable(tmp_path, monkeypatch):
     monkeypatch.setattr(lemon, "_open_url", raise_bad_status)
     with pytest.raises(LemonadeUnavailableError, match="Lemonade HTTP protocol failure"):
         backend.health()
+
+
+def test_send_http_exceptions_redacts_api_key(tmp_path, monkeypatch):
+    """Reflected bearer token in http.client.HTTPException is redacted in
+    LemonadeUnavailableError.
+    """
+    backend = LemonadeBackend(
+        lemon_settings(tmp_path, lemonade_api_key=SecretStr("super-secret-token"))
+    )
+
+    def raise_bad_status(*args, **kwargs):
+        raise http.client.BadStatusLine("HTTP/1.1 500 Bad Header Bearer super-secret-token")
+
+    monkeypatch.setattr(lemon, "_open_url", raise_bad_status)
+    with pytest.raises(LemonadeUnavailableError) as exc_info:
+        backend.health()
+
+    assert "super-secret-token" not in str(exc_info.value)
+    assert "[redacted]" in str(exc_info.value)
 
 
 # --- Finding 3: Boundary Clipping Reconciliation Tests ---

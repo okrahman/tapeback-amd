@@ -60,7 +60,15 @@ def test_key_changes_per_channel(cached_settings, audio):
 
 @pytest.mark.parametrize(
     "field",
-    ["whisper_model", "compute_type", "beam_size", "chunk_length", "hotwords", "language"],
+    [
+        "whisper_model",
+        "compute_type",
+        "beam_size",
+        "chunk_length",
+        "hotwords",
+        "language",
+        "gate_mic_silence",
+    ],
 )
 def test_key_changes_when_an_output_affecting_setting_changes(cached_settings, audio, field):
     """A cached channel is only reusable if it would be produced the same way."""
@@ -72,6 +80,7 @@ def test_key_changes_when_an_output_affecting_setting_changes(cached_settings, a
         "chunk_length": 7,
         "hotwords": "different, glossary",
         "language": "de",
+        "gate_mic_silence": False,
     }[field]
     other = cached_settings.model_copy(update={field: changed})
     assert base != _resume.resume_key(audio, _resume.settings_fingerprint(other), "transcribe")
@@ -265,3 +274,16 @@ def test_process_file_deterministic_staging_preserves_resume_keys(tmp_path, monk
 
     assert len(split_keys_1) == 2
     assert split_keys_1 == split_keys_2
+
+
+def test_load_handles_recursion_error(tmp_path, monkeypatch):
+    """Corrupt or deeply nested JSON in the resume cache that raises RecursionError returns None."""
+    key = _resume.ResumeKey("a" * 32)
+    entry = tmp_path / key.filename
+    entry.write_text("{}")
+
+    def _raise_recursion(*args, **kwargs):
+        raise RecursionError("maximum recursion depth exceeded")
+
+    monkeypatch.setattr("tapeback._resume.json.loads", _raise_recursion)
+    assert _resume.load(key, tmp_path) is None

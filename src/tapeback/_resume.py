@@ -97,6 +97,7 @@ def settings_fingerprint(settings: Settings) -> str:
         "language_detection_segments",
         "multilingual",
         "hallucination_silence_threshold",
+        "gate_mic_silence",
     )
     parts = [f"{name}={getattr(settings, name)!r}" for name in output_affecting_settings]
     return hashlib.sha256("\x00".join(parts).encode()).hexdigest()[:32]
@@ -148,7 +149,7 @@ def load(key: ResumeKey, directory: Path) -> tuple[list[Segment], dict[str, Any]
     try:
         payload = json.loads(path.read_text())
         return _from_payload(payload)
-    except (OSError, ValueError, KeyError, TypeError):
+    except (OSError, ValueError, KeyError, TypeError, RecursionError):
         # A corrupt or half-written entry is not worth a failed run; redo the work.
         return None
 

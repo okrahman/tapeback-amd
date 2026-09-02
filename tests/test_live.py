@@ -250,6 +250,48 @@ def test_deduplicate_overlap_zero_overlap():
     assert len(result) == 2
 
 
+def test_deduplicate_overlap_reconciles_boundary_spanning_candidate():
+    """When an overlap candidate spans past the boundary or has longer text,
+    it updates the existing segment in-place and is not duplicated in kept.
+    """
+    existing = [
+        Segment(start=59.0, end=60.0, text="Let's review", speaker="You"),
+    ]
+    new_segments = [
+        # Spans past overlap boundary (60.0s) and has complete utterance
+        Segment(
+            start=59.05,
+            end=64.0,
+            text="Let's review the quarterly results",
+            speaker="You",
+        ),
+        # New utterance completely after boundary
+        Segment(start=65.0, end=68.0, text="Next topic", speaker="You"),
+    ]
+
+    result = deduplicate_overlap(existing, new_segments, overlap_start=60.0)
+
+    # Only the subsequent segment should be in kept
+    assert len(result) == 1
+    assert result[0].text == "Next topic"
+
+    # Existing segment was updated in-place with the complete candidate
+    assert len(existing) == 1
+    assert existing[0].text == "Let's review the quarterly results"
+    assert existing[0].end == 64.0
+
+
+def test_deduplicate_overlap_reconciles_longer_text_within_overlap():
+    """When an overlap candidate has strictly longer text, it replaces the existing segment."""
+    existing = [Segment(start=58.0, end=59.5, text="Hello", speaker="Other")]
+    new_segments = [Segment(start=58.1, end=59.5, text="Hello world", speaker="Other")]
+
+    result = deduplicate_overlap(existing, new_segments, overlap_start=60.0)
+
+    assert len(result) == 0
+    assert existing[0].text == "Hello world"
+
+
 # --- LiveTranscriber ---
 
 

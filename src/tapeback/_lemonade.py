@@ -1662,6 +1662,7 @@ class LemonadeBackend:
             f"chunk_seconds={self._settings.lemonade_chunk_seconds!r}",
             f"overlap_seconds={self._settings.lemonade_overlap_seconds!r}",
             f"dedup_policy={DEDUP_POLICY_VERSION}",
+            f"gate_mic_silence={self._settings.gate_mic_silence!r}",
         )
         return hashlib.sha256("\x00".join(parts).encode()).hexdigest()[:32]
 
@@ -1916,7 +1917,10 @@ class LemonadeBackend:
                 f"Lemonade request could not be built or encoded: {exc}"
             ) from exc
         except http.client.HTTPException as exc:
-            detail = _sanitize_remote_detail(str(exc)) or type(exc).__name__
+            detail = (
+                _sanitize_remote_detail(str(exc), secrets=(self._api_key,) if self._api_key else ())
+                or type(exc).__name__
+            )
             raise LemonadeUnavailableError(f"Lemonade HTTP protocol failure: {detail}") from exc
         except TimeoutError as exc:
             # socket.timeout is TimeoutError on Python 3.10+: this is the
