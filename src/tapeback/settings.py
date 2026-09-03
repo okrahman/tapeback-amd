@@ -148,7 +148,7 @@ class Settings(BaseSettings):
     # choice are externally managed — tapeback never selects or records the
     # accelerator). On an eligible Lemonade failure the façade falls back to
     # faster-whisper for that run; see _lemonade.py for the error hierarchy.
-    transcription_backend: Literal["faster-whisper", "lemonade"] = "faster-whisper"
+    transcription_backend: Literal["faster-whisper", "lemonade"] = "lemonade"
     # Lemonade Server base URL. Must be a syntactically valid http(s) URL with no
     # embedded credentials, query string, or fragment; anything else is refused
     # before a request is ever built (no fallback). The URL is normalized

@@ -14,7 +14,7 @@ Works with any video call platform: Google Meet, Zoom, Teams, Telegram, Discord,
 - **Live transcription** (opt-in): read the transcript while the meeting is still going — Whisper transcribes in the background every 60 seconds (set `TAPEBACK_LIVE=true`)
 - **Platform-agnostic**: captures OS-level audio, works with any app
 - **Local transcription**: faster-whisper on CPU or CUDA GPU
-- **Lemonade backend** (opt-in): transcribe through a [Lemonade Server](https://github.com/lemonade-sdk/lemonade) you run yourself — with automatic fallback to faster-whisper (`TAPEBACK_TRANSCRIPTION_BACKEND=lemonade`)
+- **Lemonade backend**: transcribe through a [Lemonade Server](https://github.com/lemonade-sdk/lemonade) you run yourself — with automatic fallback to faster-whisper (`TAPEBACK_TRANSCRIPTION_BACKEND=faster-whisper` opts back out)
 - **Speaker diarization**: pyannote identifies who said what
 - **Stereo channel separation**: your mic (left) vs. others (right) for accurate "You" attribution
 - **Obsidian-native output**: Markdown with YAML frontmatter, wikilinks to audio files
@@ -172,9 +172,9 @@ for background.
 
 ## Lemonade Server backend
 
-By default tapeback transcribes locally with faster-whisper. You can instead send
-recordings to a [Lemonade Server](https://github.com/lemonade-sdk/lemonade) instance
-you start and manage yourself:
+By default tapeback sends recordings to a [Lemonade Server](https://github.com/lemonade-sdk/lemonade) instance
+you start and manage yourself. To use local faster-whisper instead, set
+`TAPEBACK_TRANSCRIPTION_BACKEND=faster-whisper`.
 
 ```bash
 export TAPEBACK_TRANSCRIPTION_BACKEND=lemonade
@@ -291,10 +291,10 @@ provider (any provider with an API key set).
 
 ### PII masking
 
-With the default faster-whisper backend, summarization is the only thing tapeback
-sends off the machine — recording, transcription and diarization are all local. If
-that request bothers you, either leave summarization off (`TAPEBACK_SUMMARIZE=false`,
-and nothing is ever sent) or turn on masking:
+With the Lemonade backend, the recording is sent to your configured Lemonade Server;
+the summary request is sent to your configured LLM provider. If you want everything
+to remain local, use `TAPEBACK_TRANSCRIPTION_BACKEND=faster-whisper` and leave
+summarization off (`TAPEBACK_SUMMARIZE=false`):
 
 ```bash
 TAPEBACK_MASK_PII=true
@@ -440,7 +440,7 @@ All settings via environment variables (prefix `TAPEBACK_`) or
 
 | Variable | Default | Description |
 |---|---|---|
-| `TAPEBACK_TRANSCRIPTION_BACKEND` | `faster-whisper` | `faster-whisper` (built-in local model) or `lemonade` (send WAVs to a [Lemonade Server](#lemonade-server-backend) you run yourself, with automatic fallback to faster-whisper on eligible failures) |
+| `TAPEBACK_TRANSCRIPTION_BACKEND` | `lemonade` | `faster-whisper` (built-in local model) or `lemonade` (send WAVs to a [Lemonade Server](#lemonade-server-backend) you run yourself, with automatic fallback to faster-whisper on eligible failures) |
 | `TAPEBACK_LEMONADE_URL` | `http://127.0.0.1:13305` | Lemonade Server base URL. Must be a bare URL — no embedded credentials (`user:pass@host`), query string, or fragment. Plaintext `http://` is allowed only for loopback hosts (`localhost`, `127.0.0.0/8`, `::1`); remote endpoints must use `https://` (Lemonade backend only) |
 | `TAPEBACK_LEMONADE_MODEL` | `Whisper-Large-v3-Turbo` | Model identifier as the server knows it (Lemonade backend only) |
 | `TAPEBACK_LEMONADE_API_KEY` | *(off)* | Optional bearer token; sent only in the `Authorization` header, never logged or cached (Lemonade backend only) |
