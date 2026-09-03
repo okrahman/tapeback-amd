@@ -9,7 +9,7 @@ from pathlib import Path
 import numpy as np
 
 from tapeback import const
-from tapeback.channel import gate_inactive_regions
+from tapeback.channel import gate_inactive_regions, is_channel_active
 
 
 def _check_ffmpeg() -> None:
@@ -193,12 +193,14 @@ def gate_wav_inactive(
     target_raw: np.ndarray,
     other_raw: np.ndarray,
     raw_sr: int,
-) -> None:
+) -> bool:
     """Silence the listening regions of a 16 kHz mono WAV in place.
 
     Reads the WAV, zeroes windows where the speaker is inactive (see
     channel.gate_inactive_regions), and writes it back — so Whisper never sees the
     mic channel's pauses and can't hallucinate loops on them.
+
+    Returns whether any nonzero PCM samples remain after gating.
     """
     try:
         orig_stat = wav_path.stat()
@@ -213,13 +215,16 @@ def gate_wav_inactive(
 
     samples = np.frombuffer(frames, dtype=np.int16).astype(np.float32)
     gated = gate_inactive_regions(samples, target_raw, other_raw, raw_sr)
+    gated_pcm = gated.astype(np.int16)
 
     with wave.open(str(wav_path), "wb") as wf:
         wf.setnchannels(1)
         wf.setsampwidth(2)
         wf.setframerate(sample_rate)
-        wf.writeframes(gated.astype(np.int16).tobytes())
+        wf.writeframes(gated_pcm.tobytes())
 
     if orig_mtime is not None:
         with contextlib.suppress(OSError):
             os.utime(wav_path, (orig_atime, orig_mtime))
+
+    return is_channel_active(gated_pcm)

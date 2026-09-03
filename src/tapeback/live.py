@@ -21,6 +21,7 @@ from tapeback._lemonade import (
     LemonadeConfigurationError,
     _utterance_tokens,
 )
+from tapeback.channel import is_channel_active
 from tapeback.formatter import format_live_markdown
 from tapeback.models import Segment, Word
 from tapeback.settings import Settings
@@ -350,6 +351,18 @@ class LiveTranscriber:
         if mic_pcm is None and monitor_pcm is None:
             return
 
+        # Inspect the exact samples that would be submitted after live resampling
+        # before loading a backend or creating temporary WAVs. Even when both sides
+        # are silent, commit the cursors so the same interval is not reconsidered.
+        mic_active = mic_pcm is not None and is_channel_active(resample_48k_to_16k(mic_pcm))
+        monitor_active = monitor_pcm is not None and is_channel_active(
+            resample_48k_to_16k(monitor_pcm)
+        )
+        if not mic_active and not monitor_active:
+            self._mic_byte_offset = mic_new_offset
+            self._monitor_byte_offset = monitor_new_offset
+            return
+
         transcriber = self._ensure_transcriber()
         mic_segments: list[Segment] = []
         monitor_segments: list[Segment] = []
@@ -361,6 +374,8 @@ class LiveTranscriber:
                 mic_pcm,
                 monitor_pcm,
                 overlap_bytes,
+                mic_active=mic_active,
+                monitor_active=monitor_active,
                 existing_segments=staging_segments,
             )
         elif mic_pcm is not None:
@@ -480,7 +495,7 @@ class LiveTranscriber:
     ) -> list[Segment]:
         """Resample, write temp WAV, transcribe, adjust timestamps, deduplicate."""
         samples_16k = resample_48k_to_16k(pcm_bytes)
-        if len(samples_16k) == 0:
+        if len(samples_16k) == 0 or not is_channel_active(samples_16k):
             return []
 
         # Write temp WAV for the backend
@@ -511,30 +526,50 @@ class LiveTranscriber:
             existing_segments=existing_segments,
         )
 
-    def _transcribe_pair(
+    def _transcribe_pair(  # noqa: PLR0913
         self,
         transcriber: Transcriber,
         mic_pcm: bytes,
         monitor_pcm: bytes,
         overlap_bytes: int,
         *,
+        mic_active: bool | None = None,
+        monitor_active: bool | None = None,
         existing_segments: list[Segment] | None = None,
     ) -> tuple[list[Segment], list[Segment]]:
         """Transcribe one mic/monitor pair as ONE backend transaction.
 
         The monitor channel goes first so its detected language is reused for the
         gated mic — the mic is near silence while the user listens, so auto-detection
-        has almost nothing to work from. The facade treats the pair transactionally:
-        a Lemonade fallback on either channel retries BOTH through faster-whisper, so
-        one interval can never mix one Lemonade channel with one faster-whisper
-        channel. Both temp WAVs are ephemeral, so resume IO is disabled for the pair.
+        has almost nothing to work from. The facade treats the active channels
+        transactionally: when both are active, a Lemonade fallback on either retries
+        BOTH through faster-whisper, so one interval can never mix one Lemonade channel
+        with one faster-whisper channel. With one active channel, only that channel
+        falls back. Active temp WAVs are ephemeral, so resume IO is disabled for the pair.
         """
         mic_samples_16k = resample_48k_to_16k(mic_pcm)
         monitor_samples_16k = resample_48k_to_16k(monitor_pcm)
+        if mic_active is None:
+            mic_active = is_channel_active(mic_samples_16k)
+        if monitor_active is None:
+            monitor_active = is_channel_active(monitor_samples_16k)
+        if not mic_active and not monitor_active:
+            return [], []
+
         mic_path = self._mic_path.parent / "chunk_mic.wav"
         monitor_path = self._mic_path.parent / "chunk_monitor.wav"
-        self._write_chunk_wav(mic_samples_16k, mic_path)
-        self._write_chunk_wav(monitor_samples_16k, monitor_path)
+        if mic_active:
+            self._write_chunk_wav(mic_samples_16k, mic_path)
+        if monitor_active:
+            self._write_chunk_wav(monitor_samples_16k, monitor_path)
+
+        # Keep a valid path for both façade arguments without writing an inactive
+        # channel. The activity flags ensure the façade never opens the alias for
+        # backend work, while it can still read the active channel's real duration.
+        if not mic_active:
+            mic_path = monitor_path
+        if not monitor_active:
+            monitor_path = mic_path
 
         try:
             mic_segments, monitor_segments, _info = transcriber.transcribe_stereo(
@@ -542,12 +577,16 @@ class LiveTranscriber:
                 monitor_path,
                 use_resume=False,
                 skip_mic_on_monitor_partial=False,
+                mic_active=mic_active,
+                monitor_active=monitor_active,
             )
             if _info.get("language"):
                 self._last_detected_language = str(_info["language"])
         finally:
-            mic_path.unlink(missing_ok=True)
-            monitor_path.unlink(missing_ok=True)
+            if mic_active:
+                (self._mic_path.parent / "chunk_mic.wav").unlink(missing_ok=True)
+            if monitor_active:
+                (self._mic_path.parent / "chunk_monitor.wav").unlink(missing_ok=True)
 
         mic_segments = self._finalize_segments(
             mic_segments,
@@ -627,20 +666,35 @@ class LiveTranscriber:
         """Transcribe a full mic/monitor pair without time offsets or overlap dedup."""
         mic_samples_16k = resample_48k_to_16k(mic_pcm)
         monitor_samples_16k = resample_48k_to_16k(monitor_pcm)
+        mic_active = is_channel_active(mic_samples_16k)
+        monitor_active = is_channel_active(monitor_samples_16k)
+        if not mic_active and not monitor_active:
+            return [], []
+
         mic_path = self._mic_path.parent / "chunk_mic.wav"
         monitor_path = self._mic_path.parent / "chunk_monitor.wav"
-        self._write_chunk_wav(mic_samples_16k, mic_path)
-        self._write_chunk_wav(monitor_samples_16k, monitor_path)
+        if mic_active:
+            self._write_chunk_wav(mic_samples_16k, mic_path)
+        if monitor_active:
+            self._write_chunk_wav(monitor_samples_16k, monitor_path)
+        if not mic_active:
+            mic_path = monitor_path
+        if not monitor_active:
+            monitor_path = mic_path
         try:
             mic_segs, monitor_segs, _info = transcriber.transcribe_stereo(
                 mic_path,
                 monitor_path,
                 use_resume=False,
                 skip_mic_on_monitor_partial=False,
+                mic_active=mic_active,
+                monitor_active=monitor_active,
             )
         finally:
-            mic_path.unlink(missing_ok=True)
-            monitor_path.unlink(missing_ok=True)
+            if mic_active:
+                (self._mic_path.parent / "chunk_mic.wav").unlink(missing_ok=True)
+            if monitor_active:
+                (self._mic_path.parent / "chunk_monitor.wav").unlink(missing_ok=True)
 
         mic_segs = [
             Segment(
@@ -673,7 +727,7 @@ class LiveTranscriber:
     ) -> list[Segment]:
         """Transcribe full single-channel audio without time offsets or overlap dedup."""
         samples_16k = resample_48k_to_16k(pcm_bytes)
-        if len(samples_16k) == 0:
+        if len(samples_16k) == 0 or not is_channel_active(samples_16k):
             return []
         suffix = "mic" if is_mic else "monitor"
         chunk_path = self._mic_path.parent / f"chunk_{suffix}.wav"

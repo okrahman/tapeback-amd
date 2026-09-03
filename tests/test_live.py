@@ -297,7 +297,12 @@ def test_deduplicate_overlap_reconciles_longer_text_within_overlap():
 
 def test_live_transcriber_start_stop_lifecycle(tmp_path, tmp_vault):
     """LiveTranscriber should start a thread, process final chunk on stop, and clean up."""
-    settings = Settings(vault_path=tmp_vault, live_interval=1, live_min_chunk=0.01)
+    settings = Settings(
+        vault_path=tmp_vault,
+        live_interval=1,
+        live_min_chunk=0.01,
+        transcription_backend="faster-whisper",
+    )
 
     mic_path = tmp_path / "mic.wav"
     monitor_path = tmp_path / "monitor.wav"
@@ -320,7 +325,12 @@ def test_live_transcriber_start_stop_lifecycle(tmp_path, tmp_vault):
 
 def test_live_transcriber_no_crash_on_empty_audio(tmp_path, tmp_vault):
     """LiveTranscriber should not crash when WAV files don't exist yet."""
-    settings = Settings(vault_path=tmp_vault, live_interval=1, live_min_chunk=0.01)
+    settings = Settings(
+        vault_path=tmp_vault,
+        live_interval=1,
+        live_min_chunk=0.01,
+        transcription_backend="faster-whisper",
+    )
 
     mic_path = tmp_path / "mic.wav"
     monitor_path = tmp_path / "monitor.wav"
@@ -368,6 +378,7 @@ def test_live_transcriber_process_chunk_accumulates_segments(tmp_path, tmp_vault
         live_min_chunk=0.01,
         live_overlap=0.0,
         sample_rate=48000,
+        transcription_backend="faster-whisper",
     )
 
     mic_path = tmp_path / "mic.wav"
@@ -476,9 +487,9 @@ def test_live_mic_timeout_latches_and_never_resubmits_to_lemonade(tmp_path, tmp_
 
     # Grow both channels so the next interval has new audio to process.
     with open(mic_path, "ab") as f:
-        f.write(b"\x00\x00" * 16000)
+        f.write(b"\x01\x00" * 16000)
     with open(monitor_path, "ab") as f:
-        f.write(b"\x00\x00" * 16000)
+        f.write(b"\x01\x00" * 16000)
 
     lt._process_chunk()  # later interval: everything via the latched fw backend
 
@@ -532,9 +543,9 @@ def test_live_switch_retranscribes_committed_audio_after_empty_result(
     assert lt._mic_byte_offset > 0 and lt._monitor_byte_offset > 0
 
     with open(mic_path, "ab") as file:
-        file.write(b"\x00\x00" * 24000)
+        file.write(b"\x01\x00" * 24000)
     with open(monitor_path, "ab") as file:
-        file.write(b"\x00\x00" * 24000)
+        file.write(b"\x01\x00" * 24000)
     _install_urlopen(monkeypatch, [TimeoutError("server unavailable")])
 
     lt._process_chunk()
@@ -798,9 +809,9 @@ def test_live_session_does_not_mix_backends_after_fallback_in_later_interval(
 
     # Grow both audio files for Interval 2
     with open(mic_path, "ab") as f:
-        f.write(b"\x00\x00" * 24000)
+        f.write(b"\x01\x00" * 24000)
     with open(monitor_path, "ab") as f:
-        f.write(b"\x00\x00" * 24000)
+        f.write(b"\x01\x00" * 24000)
 
     # Interval 2 fails on Lemonade, falls back to fw, and re-transcribes committed session
     lt._process_chunk()
@@ -965,7 +976,7 @@ def test_live_transcriber_reuses_detected_language_for_single_mic_chunk(tmp_path
     monkeypatch.setattr(lt, "_ensure_transcriber", lambda: mock_transcriber)
 
     # Fake PCM data for single mic chunk
-    fake_pcm = b"\x00\x00" * 16000
+    fake_pcm = b"\x01\x00" * 16000
     lt._transcribe_chunk(mock_transcriber, fake_pcm, 0, 0, is_mic=True)
 
     mock_transcriber.transcribe.assert_called_once()

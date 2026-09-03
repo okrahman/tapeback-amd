@@ -12,7 +12,9 @@ def test_cuda_fallback_to_cpu(tmp_vault):
 
     Bug: Transcriber crashed on machines without CUDA support.
     """
-    s = Settings(vault_path=tmp_vault, compute_type="float16")
+    s = Settings(
+        vault_path=tmp_vault, compute_type="float16", transcription_backend="faster-whisper"
+    )
     call_args = []
 
     def mock_init(model_name, device="cuda", compute_type="float16", local_files_only=True):
@@ -33,7 +35,9 @@ def test_cuda_inference_fallback_to_cpu(tmp_vault, capsys):
     Bug: Model loaded fine on CUDA, but crashed during transcription
     when libcublas.so.12 was missing. No recovery, lost recording.
     """
-    s = Settings(vault_path=tmp_vault, compute_type="float16")
+    s = Settings(
+        vault_path=tmp_vault, compute_type="float16", transcription_backend="faster-whisper"
+    )
 
     mock_segment = MagicMock()
     mock_segment.start = 0.0
@@ -86,7 +90,9 @@ def test_cuda_fallback_when_transcribe_call_raises(tmp_vault, capsys):
     The previous fallback only wrapped _collect_segments(), so this error escaped
     and aborted the recording.
     """
-    s = Settings(vault_path=tmp_vault, compute_type="float16")
+    s = Settings(
+        vault_path=tmp_vault, compute_type="float16", transcription_backend="faster-whisper"
+    )
 
     mock_segment = MagicMock()
     mock_segment.start = 0.0
@@ -130,7 +136,12 @@ def test_cuda_inference_fallback_preserves_auto_language(tmp_vault):
     Bug: transcriber.py line 145 used self._settings.language ("auto") instead
     of the resolved variable (None). Whisper doesn't accept "auto" as a language code.
     """
-    s = Settings(vault_path=tmp_vault, compute_type="float16", language="auto")
+    s = Settings(
+        vault_path=tmp_vault,
+        compute_type="float16",
+        language="auto",
+        transcription_backend="faster-whisper",
+    )
 
     mock_segment = MagicMock()
     mock_segment.start = 0.0

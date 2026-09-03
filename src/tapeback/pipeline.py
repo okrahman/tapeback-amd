@@ -28,6 +28,7 @@ from tapeback.channel import (
     classify_segment_by_channel,
     filter_silent_segments,
     identify_user_speaker,
+    is_channel_active,
     load_stereo_channels,
     split_on_silence,
 )
@@ -224,6 +225,12 @@ def process_stereo_file(
     with stage_timer("load channels", on_status):
         mic_raw, monitor_raw, raw_sr = load_stereo_channels(stereo_path)
 
+    # Exact digital silence is the only pre-transcription activity rule. Keep this
+    # separate from the RMS-based post-transcription filters below so quiet speech is
+    # still sent to the backend.
+    mic_active = True if mic_raw is None else is_channel_active(mic_raw)
+    monitor_active = True if monitor_raw is None else is_channel_active(monitor_raw)
+
     on_status("Splitting channels...")
     with stage_timer("split", on_status):
         mic_16k, monitor_16k = split_channels_16k(stereo_path, output_dir)
@@ -231,7 +238,12 @@ def process_stereo_file(
     if settings.gate_mic_silence:
         # Silence the mic where the user only listens, so Whisper doesn't loop on it.
         with stage_timer("gate mic", on_status):
-            gate_wav_inactive(mic_16k, mic_raw, monitor_raw, raw_sr)
+            gated_mic_active = gate_wav_inactive(mic_16k, mic_raw, monitor_raw, raw_sr)
+            # Keep compatibility with callers that replace the old side-effect-only
+            # helper in tests or integrations; the production helper always returns
+            # a bool based on its post-gating PCM.
+            if gated_mic_active is not None:
+                mic_active = bool(gated_mic_active)
 
     on_status("Transcribing (this may take a few minutes)...")
     with stage_timer("load model", on_status):
@@ -240,7 +252,11 @@ def process_stereo_file(
     try:
         with sample_gpu(on_status, enabled=_gpu_telemetry_enabled(settings)):
             mic_segments, monitor_segments, info = transcriber.transcribe_stereo(
-                mic_16k, monitor_16k, on_status=on_status
+                mic_16k,
+                monitor_16k,
+                on_status=on_status,
+                mic_active=mic_active,
+                monitor_active=monitor_active,
             )
     finally:
         # Release VRAM even when the stage raised, so a failure here does not starve

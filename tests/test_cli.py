@@ -32,6 +32,7 @@ def test_process_mono_pipeline(runner, tmp_path, monkeypatch, vault_env):
     """process command: mono WAV → transcribe → save markdown + audio to vault.
     Also tests --name for custom output filename."""
     monkeypatch.setenv("TAPEBACK_DIARIZE", "false")
+    monkeypatch.setenv("TAPEBACK_TRANSCRIPTION_BACKEND", "faster-whisper")
 
     audio = tmp_path / "2026-03-20_10-00-00.wav"
     create_silent_wav(audio, duration=2.0, sample_rate=48000)
@@ -77,6 +78,7 @@ def test_process_mono_pipeline(runner, tmp_path, monkeypatch, vault_env):
 def test_process_with_diarization(runner, tmp_path, monkeypatch, vault_env):
     """process command with diarization: transcribe → diarize → speakers in markdown."""
     monkeypatch.setenv("TAPEBACK_HF_TOKEN", "hf_fake")
+    monkeypatch.setenv("TAPEBACK_TRANSCRIPTION_BACKEND", "faster-whisper")
 
     audio = tmp_path / "2026-03-20_10-00-00.wav"
     create_silent_wav(audio, duration=2.0)
@@ -117,6 +119,7 @@ def test_process_stereo_dual_channel(runner, tmp_path, monkeypatch, vault_env):
     Dual-channel pipeline: split channels → transcribe each → mic gets "You" label.
     """
     monkeypatch.setenv("TAPEBACK_DIARIZE", "false")
+    monkeypatch.setenv("TAPEBACK_TRANSCRIPTION_BACKEND", "faster-whisper")
 
     audio = tmp_path / "2026-03-20_10-00-00.wav"
     create_stereo_wav_segments(audio, 48000, [(1.0, 0.8, 0.003), (1.0, 0.003, 0.8)])
@@ -292,7 +295,11 @@ def test_stop_and_process_enters_pipeline_only_after_live_exit(tmp_vault, tmp_pa
 @pytest.mark.skipif(not shutil.which("ffmpeg"), reason="ffmpeg required")
 def test_stop_and_process_pipeline(tmp_vault, session_wavs):
     """_stop_and_process: full dual-channel pipeline with mocked ML models."""
-    settings = Settings(vault_path=tmp_vault, hf_token=SecretStr("hf_fake"))
+    settings = Settings(
+        vault_path=tmp_vault,
+        hf_token=SecretStr("hf_fake"),
+        transcription_backend="faster-whisper",
+    )
     session_dir, monitor_wav, mic_wav = session_wavs("2026-03-20_10-00-00")
 
     mock_recorder = MagicMock()
@@ -322,7 +329,7 @@ def test_stop_and_process_pipeline(tmp_vault, session_wavs):
 @pytest.mark.skipif(not shutil.which("ffmpeg"), reason="ffmpeg required")
 def test_stop_and_process_no_diarize(tmp_vault, session_wavs):
     """_stop_and_process with diarize=False skips pyannote entirely."""
-    settings = Settings(vault_path=tmp_vault)
+    settings = Settings(vault_path=tmp_vault, transcription_backend="faster-whisper")
     _session_dir, monitor_wav, mic_wav = session_wavs("2026-03-20_11-00-00")
 
     mock_recorder = MagicMock()
@@ -345,7 +352,7 @@ def test_stop_and_process_no_diarize(tmp_vault, session_wavs):
 @pytest.mark.skipif(not shutil.which("ffmpeg"), reason="ffmpeg required")
 def test_process_stereo_file_function(tmp_path, tmp_vault):
     """_process_stereo_file: splits channels, transcribes each, merges."""
-    settings = Settings(vault_path=tmp_vault)
+    settings = Settings(vault_path=tmp_vault, transcription_backend="faster-whisper")
 
     stereo = tmp_path / "stereo.wav"
     create_stereo_wav_segments(stereo, 48000, [(1.0, 0.8, 0.003), (1.0, 0.003, 0.8)])
@@ -424,6 +431,7 @@ def test_summarize_command_no_api_key(runner, tmp_path, monkeypatch, vault_env):
 def test_process_with_summarization(runner, tmp_path, monkeypatch, vault_env):
     """Full pipeline: process → transcribe → summarize → file has summary."""
     monkeypatch.setenv("TAPEBACK_DIARIZE", "false")
+    monkeypatch.setenv("TAPEBACK_TRANSCRIPTION_BACKEND", "faster-whisper")
     monkeypatch.setenv("TAPEBACK_LLM_API_KEY", "sk-test")
 
     audio = tmp_path / "2026-03-20_10-00-00.wav"
@@ -448,6 +456,7 @@ def test_process_with_summarization(runner, tmp_path, monkeypatch, vault_env):
 def test_process_no_summarize_flag(runner, tmp_path, monkeypatch, vault_env):
     """--no-summarize → no LLM call."""
     monkeypatch.setenv("TAPEBACK_DIARIZE", "false")
+    monkeypatch.setenv("TAPEBACK_TRANSCRIPTION_BACKEND", "faster-whisper")
 
     audio = tmp_path / "2026-03-20_10-00-00.wav"
     create_silent_wav(audio, duration=2.0, sample_rate=48000)
@@ -468,7 +477,11 @@ def test_process_no_summarize_flag(runner, tmp_path, monkeypatch, vault_env):
 @pytest.mark.skipif(not shutil.which("ffmpeg"), reason="ffmpeg required")
 def test_stop_and_process_summarization_failure(tmp_vault, session_wavs):
     """LLM fails → warning printed, transcript still saved."""
-    settings = Settings(vault_path=tmp_vault, llm_api_key=SecretStr("sk-test"))
+    settings = Settings(
+        vault_path=tmp_vault,
+        llm_api_key=SecretStr("sk-test"),
+        transcription_backend="faster-whisper",
+    )
     _session_dir, monitor_wav, mic_wav = session_wavs("2026-03-20_12-00-00")
 
     mock_recorder = MagicMock()

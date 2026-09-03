@@ -25,7 +25,7 @@ def test_process_stereo_no_diarize_returns_no_raw_segments(tmp_path):
     """
     vault = tmp_path / "vault"
     vault.mkdir()
-    settings = Settings(vault_path=vault)
+    settings = Settings(vault_path=vault, transcription_backend="faster-whisper")
 
     stereo = tmp_path / "stereo.wav"
     create_stereo_wav_segments(stereo, 48000, [(1.0, 0.8, 0.003), (1.0, 0.003, 0.8)])
@@ -54,7 +54,9 @@ def test_process_stereo_times_every_heavy_stage(tmp_path):
     """
     vault = tmp_path / "vault"
     vault.mkdir()
-    settings = Settings(vault_path=vault, gate_mic_silence=True)
+    settings = Settings(
+        vault_path=vault, gate_mic_silence=True, transcription_backend="faster-whisper"
+    )
 
     stereo = tmp_path / "stereo.wav"
     create_stereo_wav_segments(stereo, 48000, [(1.0, 0.8, 0.003), (1.0, 0.003, 0.8)])
@@ -82,7 +84,12 @@ def test_process_stereo_reports_resolved_device(tmp_path):
     """
     vault = tmp_path / "vault"
     vault.mkdir()
-    settings = Settings(vault_path=vault, device="cpu", compute_type="int8")
+    settings = Settings(
+        vault_path=vault,
+        device="cpu",
+        compute_type="int8",
+        transcription_backend="faster-whisper",
+    )
 
     stereo = tmp_path / "stereo.wav"
     create_stereo_wav_segments(stereo, 48000, [(1.0, 0.8, 0.003)])
@@ -105,7 +112,9 @@ def test_process_stereo_diarize_without_hf_token_returns_no_raw_segments(tmp_pat
     so raw_segments must be None (no duplicate section)."""
     vault = tmp_path / "vault"
     vault.mkdir()
-    settings = Settings(vault_path=vault, hf_token=SecretStr(""))
+    settings = Settings(
+        vault_path=vault, hf_token=SecretStr(""), transcription_backend="faster-whisper"
+    )
 
     stereo = tmp_path / "stereo.wav"
     create_stereo_wav_segments(stereo, 48000, [(1.0, 0.8, 0.003), (1.0, 0.003, 0.8)])

@@ -9,6 +9,16 @@ from tapeback import const
 from tapeback.models import DiarizationSegment, Segment
 
 
+def is_channel_active(samples: np.ndarray) -> bool:
+    """Return whether PCM samples contain any nonzero value.
+
+    This is deliberately an exact digital-silence check. A single nonzero sample
+    (including a very quiet sample with amplitude 1) keeps the channel active; RMS
+    thresholds belong to the separate post-transcription quality filters.
+    """
+    return bool(np.any(samples != 0))
+
+
 def _rms_for_range(
     start: float,
     end: float,

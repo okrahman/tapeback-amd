@@ -242,7 +242,7 @@ def test_process_file_deterministic_staging_preserves_resume_keys(tmp_path, monk
         return m, mo
 
     monkeypatch.setattr(pipeline_mod, "split_channels_16k", mock_split)
-    monkeypatch.setattr(pipeline_mod, "gate_wav_inactive", lambda *args: None)
+    monkeypatch.setattr(pipeline_mod, "gate_wav_inactive", lambda *args: True)
     monkeypatch.setattr(pipeline_mod, "split_on_silence", lambda segs, *args, **kw: segs)
     monkeypatch.setattr(pipeline_mod, "filter_silent_segments", lambda segs, *args, **kw: segs)
     monkeypatch.setattr(pipeline_mod, "diarization_available", lambda: False)

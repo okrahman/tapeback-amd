@@ -565,6 +565,18 @@ Lines worth watching:
   a card found clamped is skipped in favour of the CPU. Disable the reporting with
   `TAPEBACK_GPU_TELEMETRY=false`.
 
+### Lemonade: a stereo channel is digitally silent
+
+Tapeback checks each submitted PCM channel for exact digital silence before calling
+Lemonade. A channel is skipped only when every sample is zero; very quiet audio, including
+amplitude-1 samples and recordings shorter than 30 seconds, still follows the normal
+transcription path. The skipped channel returns an empty complete result with its real
+duration, and the status output says `Skipping monitor transcription — channel is digitally
+silent.` (or the corresponding mic message). This prevention is separate from Lemonade's
+timestamp validation: a response from an active channel still must contain valid segment
+and word timestamps, and an out-of-range value such as a hallucinated `29.98s` end remains
+an error rather than being clamped or accepted.
+
 ### A run failed or you interrupted it — what happened?
 
 Every run writes a JSON record to `~/.local/share/tapeback/runs/`:
