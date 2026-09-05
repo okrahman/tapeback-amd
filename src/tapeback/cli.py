@@ -35,7 +35,8 @@ def cli() -> None:
 
     \b
     Configuration:
-      All settings via TAPEBACK_* env vars or ~/.config/tapeback/.env or .env file.
+      All settings via TAPEBACK_* env vars or ~/.config/tapeback/.env.
+      (A working-directory .env is never read.)
       See: https://github.com/yastcher/tapeback#configuration
     """
 
