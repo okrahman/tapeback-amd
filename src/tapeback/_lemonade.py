@@ -69,7 +69,7 @@ from typing import Any, NoReturn
 
 from tapeback._backends import StatusCallback, TranscriptionInfo
 from tapeback._timing import ProgressReporter
-from tapeback.models import Segment, Word
+from tapeback.models import Segment
 from tapeback.settings import Settings
 
 __all__ = [
@@ -120,7 +120,7 @@ class LemonadeAuthenticationError(LemonadeError):
 
 # Bumped whenever chunk/dedup behaviour changes what output a given WAV produces,
 # so cached channel results from an older policy are never reused.
-DEDUP_POLICY_VERSION = 2
+DEDUP_POLICY_VERSION = 3
 
 # Conservative internal cap on one chunk's WAV payload. A 300 s mono 16 kHz PCM chunk
 # is ~9.6 MB, so this binds only for unusual formats — it is a memory guard, not a
@@ -152,13 +152,10 @@ _DNS_RESOLVER_SLOTS = threading.BoundedSemaphore(2)
 
 # Schema limits on per-response payload size to guard against pathological memory / CPU usage.
 _MAX_RESPONSE_SEGMENTS = 5000
-_MAX_SEGMENT_WORDS = 1000
 _MAX_SEGMENT_TEXT_CHARS = 10_000
-_MAX_WORD_TEXT_CHARS = 250
 
 # Cumulative bounds on total output across all chunk responses for a single transcription.
 _MAX_CUMULATIVE_SEGMENTS = 50_000
-_MAX_CUMULATIVE_WORDS = 500_000
 _MAX_CUMULATIVE_TEXT_CHARS = 5_000_000
 
 # The multipart part name under which audio is uploaded. Always opaque: the source
@@ -1334,85 +1331,6 @@ def _require_segments(
     return []
 
 
-def _convert_words(
-    raw_words: Any,
-    offset: float,
-    *,
-    segment_start: float,
-    segment_end: float,
-    chunk_end: float | None = None,
-) -> list[Word]:
-    """Convert a response segment's word list, shifted into file-relative time.
-
-    Word timestamps and probabilities are validated as strictly as segments: a
-    boolean/NaN/negative timestamp or a probability outside [0, 1] — including
-    one the server sent as a string — is a schema failure and rejects the whole
-    response as a LemonadeCapabilityError, never a ValueError escaping the
-    hierarchy or a fabricated default silently recorded.
-
-    Words are also bounded the way segments are: each word must lie inside its
-    containing segment and inside the audio that was actually sent (``chunk_end``,
-    file-relative, when known), both modulo the same boundary slack the segment
-    check applies. Raw word times arrive chunk-relative and are shifted into
-    file-relative time *before* every bound check, so all comparisons — bounds
-    and words alike — run in one coordinate system. An in-bounds segment must not
-    smuggle words far past the recording — diarization rebuilds segment
-    boundaries from these words and the resume cache persists them.
-    """
-    words: list[Word] = []
-    if not isinstance(raw_words, list):
-        return words
-    if len(raw_words) > _MAX_SEGMENT_WORDS:
-        raise LemonadeCapabilityError(
-            f"Lemonade returned too many words in one segment "
-            f"({len(raw_words)} > {_MAX_SEGMENT_WORDS})"
-        )
-    for raw in raw_words:
-        if not isinstance(raw, dict):
-            continue
-        start = _usable_timestamp(raw.get("start"), "word start")
-        end = _usable_timestamp(raw.get("end"), "word end")
-        if end < start:
-            raise LemonadeCapabilityError("Lemonade returned a word whose end precedes its start")
-        # Shift into file-relative time before any bound check. segment_start,
-        # segment_end and chunk_end are file-relative; comparing the still
-        # chunk-relative word times against them would reject every valid word
-        # in any chunk whose offset exceeds the boundary slack.
-        start = offset + start
-        end = offset + end
-        if (
-            start < segment_start - _TIMESTAMP_SLACK_SECONDS
-            or end > segment_end + _TIMESTAMP_SLACK_SECONDS
-        ):
-            raise LemonadeCapabilityError("Lemonade returned a word outside its containing segment")
-        if chunk_end is not None and end > chunk_end + _TIMESTAMP_SLACK_SECONDS:
-            raise LemonadeCapabilityError(
-                "Lemonade returned a word ending past the audio it was sent"
-            )
-        raw_probability = raw.get("probability")
-        if raw_probability is None:
-            probability = 0.0
-        else:
-            probability = _finite_number(raw_probability)
-            if probability is None or not 0.0 <= probability <= 1.0:
-                raise LemonadeCapabilityError("Lemonade returned a word probability outside [0, 1]")
-        word_text = str(raw.get("word") or "")
-        if len(word_text) > _MAX_WORD_TEXT_CHARS:
-            raise LemonadeCapabilityError(
-                f"Lemonade returned a word exceeding the text size limit "
-                f"({len(word_text)} > {_MAX_WORD_TEXT_CHARS})"
-            )
-        words.append(
-            Word(
-                start=start,
-                end=end,
-                word=word_text,
-                probability=probability,
-            )
-        )
-    return words
-
-
 @dataclass
 class _MergeState:
     """Accumulated result of the chunk merge, mutated request by request."""
@@ -1420,7 +1338,6 @@ class _MergeState:
     segments: list[Segment]
     pinned: str | None
     probability: float | None
-    total_words: int = 0
     total_text_chars: int = 0
 
     def _check_cumulative_bounds(self) -> None:
@@ -1428,11 +1345,6 @@ class _MergeState:
             raise LemonadeCapabilityError(
                 f"Lemonade transcription exceeded cumulative segment limit "
                 f"({len(self.segments)} > {_MAX_CUMULATIVE_SEGMENTS})"
-            )
-        if self.total_words > _MAX_CUMULATIVE_WORDS:
-            raise LemonadeCapabilityError(
-                f"Lemonade transcription exceeded cumulative word limit "
-                f"({self.total_words} > {_MAX_CUMULATIVE_WORDS})"
             )
         if self.total_text_chars > _MAX_CUMULATIVE_TEXT_CHARS:
             raise LemonadeCapabilityError(
@@ -1500,8 +1412,6 @@ class _MergeState:
                 and s.start >= offset - _TIMESTAMP_SLACK_SECONDS
                 and self._is_token_subsequence(_utterance_tokens(s.text), cand_tokens)
             ):
-                s_words = len(s.words) if s.words else 0
-                self.total_words -= s_words
                 self.total_text_chars -= len(s.text)
             else:
                 pruned.append(s)
@@ -1550,19 +1460,13 @@ class _MergeState:
         for raw in raw_segments:
             start = offset + float(raw["start"])
             end = offset + float(raw["end"])
-            words = _convert_words(
-                raw.get("words"),
-                offset,
-                segment_start=start,
-                segment_end=end,
-                chunk_end=None if chunk_duration is None else offset + chunk_duration,
-            )
             candidates.append(
                 Segment(
                     start=start,
                     end=end,
-                    text=str(raw.get("text") or "").strip(),
-                    words=words or None,
+                    text=str(raw.get("text") or ""),
+                    # Lemonade emits BPE tokens here, not lexical word timings.
+                    words=None,
                 )
             )
         # Compare only adjacent-chunk candidates occupying their shared overlap.
@@ -1586,8 +1490,6 @@ class _MergeState:
                         duplicate_index = existing_index
                         break
             if duplicate_index is None:
-                candidate_words = len(candidate.words) if candidate.words else 0
-                self.total_words += candidate_words
                 self.total_text_chars += len(candidate.text)
                 self.segments.append(candidate)
                 self._check_cumulative_bounds()
@@ -1613,9 +1515,6 @@ class _MergeState:
                 current_index=index - 1,
                 candidate_index=index,
             ):
-                existing_words = len(existing.words) if existing.words else 0
-                candidate_words = len(candidate.words) if candidate.words else 0
-                self.total_words += candidate_words - existing_words
                 self.total_text_chars += len(candidate.text) - len(existing.text)
                 self.segments[duplicate_index] = candidate
                 self._purge_subsumed(duplicate_index, candidate, offset)

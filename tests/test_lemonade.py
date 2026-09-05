@@ -24,11 +24,8 @@ import tapeback._lemonade as lemon
 from tapeback._lemonade import (
     _MAX_CUMULATIVE_SEGMENTS,
     _MAX_CUMULATIVE_TEXT_CHARS,
-    _MAX_CUMULATIVE_WORDS,
     _MAX_RESPONSE_SEGMENTS,
     _MAX_SEGMENT_TEXT_CHARS,
-    _MAX_SEGMENT_WORDS,
-    _MAX_WORD_TEXT_CHARS,
     DEDUP_POLICY_VERSION,
     LemonadeAuthenticationError,
     LemonadeBackend,
@@ -38,7 +35,6 @@ from tapeback._lemonade import (
     LemonadeInferenceTimeout,
     LemonadeModelError,
     LemonadeUnavailableError,
-    _convert_words,
     _MergeState,
     _normalize_base_url,
     _require_segments,
@@ -46,6 +42,7 @@ from tapeback._lemonade import (
     classify_http_failure,
     normalize_language,
 )
+from tapeback._resume import resume_key
 from tapeback.models import Segment
 from tapeback.settings import Settings
 
@@ -223,6 +220,17 @@ def test_fingerprint_tracks_the_dedup_policy_version(tmp_path, monkeypatch):
     assert backend.cache_fingerprint() != before
 
 
+def test_token_bearing_cache_entries_are_not_reused_after_policy_bump(tmp_path, monkeypatch):
+    wav = tmp_path / "a.wav"
+    write_wav(wav, 0.5)
+    backend = LemonadeBackend(lemon_settings(tmp_path))
+    current = backend.cache_fingerprint()
+    monkeypatch.setattr("tapeback._lemonade.DEDUP_POLICY_VERSION", DEDUP_POLICY_VERSION - 1)
+    stale = backend.cache_fingerprint()
+
+    assert resume_key(wav, stale, "transcribe mic") != resume_key(wav, current, "transcribe mic")
+
+
 def test_url_normalization_makes_trailing_slash_equivalent(tmp_path):
     backend = LemonadeBackend(lemon_settings(tmp_path, lemonade_url="http://127.0.0.1:1/"))
     other = LemonadeBackend(lemon_settings(tmp_path, lemonade_url="http://127.0.0.1:1"))
@@ -376,113 +384,36 @@ def test_language_probability_only_when_validly_supplied(tmp_path, monkeypatch):
     assert info["language_probability"] == pytest.approx(0.42)
 
 
-def test_words_are_shifted_into_file_relative_time(tmp_path, monkeypatch):
-    wav = tmp_path / "long.wav"
-    write_wav(wav, 2.5)
-    chunk2 = {
-        "text": "two",
-        "language": "russian",
+def test_bpe_tokens_are_ignored_and_segment_text_is_preserved(tmp_path, monkeypatch):
+    """Lemonade's BPE token stream is not a lexical word-timing interface."""
+    wav = tmp_path / "a.wav"
+    write_wav(wav, 0.5)
+    text = "I'm transcribing Lemonade, timer."
+    payload = {
+        "text": text,
+        "language": "english",
         "segments": [
             {
-                "start": 0.6,
-                "end": 1.4,
-                "text": " two",
+                "start": 0.0,
+                "end": 0.47,
+                "text": text,
                 "words": [
-                    {"start": 0.6, "end": 0.9, "word": "tw", "probability": 0.5},
-                    {"start": 1.0, "end": 1.4, "word": "o", "probability": 0.9},
+                    {"start": 0.0, "end": 0.1, "word": " trans"},
+                    {"start": 9_999, "end": -1, "word": "cribing"},
+                    {"start": "unknown", "word": " I"},
+                    {"word": "'m"},
+                    {"word": ","},
+                    {"word": " timer"},
+                    {"word": "."},
                 ],
             }
         ],
     }
-    install_urlopen(
-        monkeypatch,
-        [verbose_json([seg(0.0, 0.9)]), json.dumps(chunk2).encode(), verbose_json([])],
-    )
-
-    segments, _ = LemonadeBackend(lemon_settings(tmp_path)).transcribe(wav)
-
-    two = next(s for s in segments if s.text == "two")
-    assert two.words is not None
-    assert two.words[0].start == pytest.approx(1.1)
-    assert two.words[1].end == pytest.approx(1.9)  # 0.5 audio_start + 1.4 chunk time
-
-
-def test_word_timestamps_survive_an_offset_greater_than_the_slack(tmp_path, monkeypatch):
-    """A later chunk's offset exceeds the slack: words must be validated against
-    file-relative segment bounds, not compared across coordinate systems.
-
-    Regression: chunk-relative word times were compared against file-relative
-    segment bounds, so every word-bearing chunk after the first failed
-    validation as a capability error whenever its offset exceeded
-    _TIMESTAMP_SLACK_SECONDS — with the default 300 s chunks, that is every
-    chunk. The small offsets of earlier tests hid the bug inside the slack.
-    """
-    wav = tmp_path / "long.wav"
-    write_wav(wav, 2.5)
-    chunk2 = {  # offset 1.5 s (1.0 s chunks, 0.5 s overlap) > 1.0 s slack
-        "text": "three",
-        "language": "russian",
-        "segments": [
-            {
-                "start": 0.5,
-                "end": 1.0,
-                "text": " three",
-                "words": [{"start": 0.5, "end": 0.7, "word": "three", "probability": 0.9}],
-            }
-        ],
-    }
-    install_urlopen(
-        monkeypatch,
-        [
-            verbose_json([seg(0.0, 0.9)]),
-            verbose_json([seg(0.6, 1.4)]),
-            json.dumps(chunk2).encode(),
-        ],
-    )
+    install_urlopen(monkeypatch, [json.dumps(payload).encode()])
 
     segments, _info = LemonadeBackend(lemon_settings(tmp_path)).transcribe(wav)
 
-    three = next(s for s in segments if s.text == "three")
-    assert three.words is not None
-    assert three.words[0].start == pytest.approx(2.0)  # 1.5 offset + 0.5 chunk time
-    assert three.words[0].end == pytest.approx(2.2)
-
-
-def test_word_past_the_sent_audio_is_rejected_in_later_chunks(tmp_path, monkeypatch):
-    """The sent-audio bound works in file-relative time for later chunks too.
-
-    With the slack tightened so the arithmetic is observable: a word may outrun
-    its chunk's audio by no more than the boundary slack, even in a chunk whose
-    offset is large. Before the coordinate fix the bound was unreachable for
-    every chunk after the first, because a chunk-relative end can never exceed a
-    file-relative limit.
-    """
-    monkeypatch.setattr(lemon, "_TIMESTAMP_SLACK_SECONDS", 0.1)
-    wav = tmp_path / "long.wav"
-    write_wav(wav, 2.5)
-    chunk1 = {  # offset 0.5 s; audio 0.5-2.0 s (1.5 s with overlap), chunk_end = 2.0
-        "text": "two",
-        "language": "russian",
-        "segments": [
-            {
-                "start": 0.9,
-                "end": 1.6,  # exactly chunk duration + slack: segment accepted
-                "text": " two",
-                "words": [{"start": 0.9, "end": 1.65, "word": "tw", "probability": 0.5}],
-            }
-        ],
-    }
-    install_urlopen(
-        monkeypatch,
-        [verbose_json([seg(0.0, 0.9)]), json.dumps(chunk1).encode(), verbose_json([])],
-    )
-
-    with pytest.raises(LemonadeCapabilityError) as excinfo:
-        LemonadeBackend(lemon_settings(tmp_path)).transcribe(wav)
-
-    # The word lies inside its segment (2.15 <= 2.1 + 0.1) but past the audio
-    # that was sent (2.15 > 2.0 + 0.1): only the chunk bound may reject it.
-    assert "past the audio" in str(excinfo.value)
+    assert [(s.start, s.end, s.text, s.words) for s in segments] == [(0.0, 0.47, text, None)]
 
 
 def test_interrupt_keeps_completed_chunks_as_partial(tmp_path, monkeypatch):
@@ -1066,14 +997,6 @@ def test_too_many_chunks_is_a_configuration_error(tmp_path, monkeypatch):
 # --- hostile numeric values in responses ---
 
 
-def word_seg(start=0.0, end=0.4, words=None):
-    return {"start": start, "end": end, "text": "hello", "words": words or []}
-
-
-def word(start=0.0, end=0.2, text="hi", probability=0.9):
-    return {"start": start, "end": end, "word": text, "probability": probability}
-
-
 @pytest.mark.parametrize(
     "payload",
     [
@@ -1084,12 +1007,6 @@ def word(start=0.0, end=0.2, text="hi", probability=0.9):
         verbose_json([seg(-0.5, 1.0)]),  # negative
         verbose_json([seg(1.0, 0.5)]),  # end before start
         json.dumps({"text": "hi", "segments": ["not-a-segment"], "language": "english"}).encode(),
-        verbose_json([word_seg(words=[word(probability="not-a-number")])]),
-        verbose_json([word_seg(words=[word(probability=True)])]),
-        verbose_json([word_seg(words=[word(probability=float("nan"))])]),
-        verbose_json([word_seg(words=[word(probability=1.5)])]),
-        verbose_json([word_seg(words=[word(start=0.2, end=0.1)])]),
-        verbose_json([word_seg(words=[word(start=-0.1, end=0.2)])]),
     ],
 )
 def test_hostile_numeric_response_is_a_capability_error(tmp_path, monkeypatch, payload):
@@ -1102,36 +1019,6 @@ def test_hostile_numeric_response_is_a_capability_error(tmp_path, monkeypatch, p
 
     with pytest.raises(LemonadeCapabilityError):
         LemonadeBackend(lemon_settings(tmp_path)).transcribe(wav)
-
-
-def test_valid_words_still_convert(tmp_path, monkeypatch):
-    """Strict validation must not reject a well-formed word list."""
-    wav = tmp_path / "a.wav"
-    write_wav(wav, 0.5)
-    install_urlopen(
-        monkeypatch,
-        [
-            verbose_json(
-                [
-                    word_seg(
-                        words=[
-                            word(0.0, 0.2, "hel", 0.9),
-                            word(0.2, 0.4, "lo", None),
-                        ]
-                    )
-                ]
-            )
-        ],
-    )
-
-    segments, _info = LemonadeBackend(lemon_settings(tmp_path)).transcribe(wav)
-
-    words = segments[0].words
-    assert words is not None
-    assert [w.word for w in words] == ["hel", "lo"]
-    assert words[0].probability == 0.9
-    # An absent probability stays the historical 0.0, not an invented value.
-    assert words[1].probability == 0.0
 
 
 def test_segment_past_the_sent_audio_is_rejected(tmp_path, monkeypatch):
@@ -1784,26 +1671,8 @@ def test_require_segments_rejects_excessive_segment_text():
         _require_segments(payload)
 
 
-def test_convert_words_rejects_excessive_word_count():
-    """A segment containing more than _MAX_SEGMENT_WORDS words is rejected."""
-    excessive_words = [
-        {"start": 0.0, "end": 0.1, "word": "hi", "probability": 0.9}
-        for _ in range(_MAX_SEGMENT_WORDS + 1)
-    ]
-    with pytest.raises(LemonadeCapabilityError, match="too many words"):
-        _convert_words(excessive_words, 0.0, segment_start=0.0, segment_end=1.0)
-
-
-def test_convert_words_rejects_excessive_word_text():
-    """A word whose text exceeds _MAX_WORD_TEXT_CHARS is rejected."""
-    long_word = "w" * (_MAX_WORD_TEXT_CHARS + 1)
-    raw_words = [{"start": 0.0, "end": 0.1, "word": long_word, "probability": 0.9}]
-    with pytest.raises(LemonadeCapabilityError, match="exceeding the text size limit"):
-        _convert_words(raw_words, 0.0, segment_start=0.0, segment_end=1.0)
-
-
 def test_merge_state_cumulative_caps():
-    """_MergeState rejects cumulative segments, words, and text exceeding total bounds."""
+    """_MergeState rejects cumulative segments and text exceeding total bounds."""
     state = _MergeState(segments=[], pinned=None, probability=None)
 
     # Cumulative segments
@@ -1813,28 +1682,6 @@ def test_merge_state_cumulative_caps():
     with pytest.raises(LemonadeCapabilityError, match="cumulative segment limit"):
         state.absorb(
             {"segments": [{"start": 0.0, "end": 1.0, "text": "extra"}], "language": "en"},
-            offset=0.0,
-            core_start=0.0,
-            index=0,
-        )
-
-    # Cumulative words
-    state2 = _MergeState(
-        segments=[], pinned=None, probability=None, total_words=_MAX_CUMULATIVE_WORDS
-    )
-    with pytest.raises(LemonadeCapabilityError, match="cumulative word limit"):
-        state2.absorb(
-            {
-                "segments": [
-                    {
-                        "start": 0.0,
-                        "end": 1.0,
-                        "text": "hi",
-                        "words": [{"start": 0.0, "end": 1.0, "word": "hi"}],
-                    }
-                ],
-                "language": "en",
-            },
             offset=0.0,
             core_start=0.0,
             index=0,

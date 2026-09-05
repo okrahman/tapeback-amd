@@ -180,7 +180,12 @@ def _format_segments_block(segments: list[Segment]) -> list[str]:
 
     Low-confidence words (probability < 0.5) are marked with *italics*.
     """
-    long_enough = [s for s in segments if s.end - s.start >= const.MIN_SEGMENT_DURATION]
+    # Wordless decoder segments carry authoritative text but no timing confidence;
+    # retain brief speech such as whisper.cpp's final "timer." fragment. Genuine
+    # word-timed output keeps the VAD-artifact duration guard.
+    long_enough = [
+        s for s in segments if not s.words or s.end - s.start >= const.MIN_SEGMENT_DURATION
+    ]
     long_enough = [_strip_hallucinated_text(s) for s in long_enough]
     long_enough = [s for s in long_enough if has_speech(s.text)]
     long_enough = [_mark_low_confidence_words(s) for s in long_enough]

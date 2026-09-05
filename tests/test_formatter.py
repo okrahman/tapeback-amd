@@ -15,7 +15,13 @@ def test_format_markdown_pipeline():
     speaker labels, short-segment filtering, and consecutive-speaker merging."""
     segments = [
         # Short segment — should be filtered out (< 1s)
-        Segment(start=0.0, end=0.5, text="Too short.", speaker="You"),
+        Segment(
+            start=0.0,
+            end=0.5,
+            text="Too short.",
+            words=[Word(start=0.0, end=0.5, word="Too short.", probability=0.9)],
+            speaker="You",
+        ),
         # Two consecutive "You" segments — should merge
         Segment(start=1.0, end=5.0, text="Hello there.", speaker="You"),
         Segment(start=5.0, end=10.0, text="How are you?", speaker="You"),
@@ -85,6 +91,20 @@ def test_format_markdown_preserves_pauses():
     assert "**You:** After pause." in result
     assert "First block. After pause." not in result
     assert result.count("[00:") == 2
+
+
+def test_format_markdown_preserves_short_wordless_speech():
+    result = format_markdown(
+        [Segment(start=10.0, end=10.47, text="timer.")],
+        TranscriptMeta(
+            session_name="2026-03-17_14-30-00",
+            audio_rel_path="audio.wav",
+            duration_seconds=11.0,
+            language="en",
+        ),
+    )
+
+    assert "[00:00:10] timer." in result
 
 
 def test_format_markdown_with_raw_segments():

@@ -225,6 +225,14 @@ What the backend does with your audio:
 - Reuses the resume cache under its own fingerprint, so a Lemonade result is never
   confused with a faster-whisper one.
 
+Lemonade's bundled ROCm `whisper.cpp` is supported directly; no separate
+`whisper.cpp` installation is required. Tapeback treats Lemonade segment text and
+timestamps as authoritative. It supports segment-level RMS filtering and
+segment-level speaker attribution, but does not use Lemonade's BPE-token `words`
+array for word-level confidence markup, word-boundary diarization, or word-level
+crosstalk removal. Those word-level features remain available with faster-whisper,
+which supplies genuine lexical word timings.
+
 Fallback, and what never falls back: when the server is unreachable, the model is
 missing or unloadable, the endpoint cannot serve timestamped segments (including
 text-only FLM-style backends — tapeback requires segment timestamps and rejects
