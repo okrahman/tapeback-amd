@@ -143,11 +143,14 @@ class Settings(BaseSettings):
     # a machine that cools adequately.
     stage_pause_seconds: float = Field(default=0.0, ge=0.0)
 
-    # Transcription backend. "faster-whisper" is the built-in local model; "lemonade"
-    # sends WAV files to a Lemonade Server endpoint (whose lifecycle and hardware
-    # choice are externally managed — tapeback never selects or records the
-    # accelerator). On an eligible Lemonade failure the façade falls back to
-    # faster-whisper for that run; see _lemonade.py for the error hierarchy.
+    # Transcription backend. The default, "lemonade", sends WAV files to a
+    # Lemonade Server endpoint (whose lifecycle and hardware choice are
+    # externally managed — tapeback never selects or records the accelerator);
+    # this means raw recording audio leaves the machine on every run unless the
+    # user opts out. "faster-whisper" is the built-in local model and keeps
+    # transcription fully local. On an eligible Lemonade failure the façade
+    # falls back to faster-whisper for that run; see _lemonade.py for the error
+    # hierarchy.
     transcription_backend: Literal["faster-whisper", "lemonade"] = "lemonade"
     # Lemonade Server base URL. Must be a syntactically valid http(s) URL with no
     # embedded credentials, query string, or fragment; anything else is refused

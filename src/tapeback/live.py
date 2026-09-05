@@ -265,6 +265,11 @@ class LiveTranscriber:
         """Lazily create the Transcriber (loads Whisper model)."""
         if self._transcriber is None:
             self._transcriber = load_transcriber(self._settings)
+            # Match the post-recording pipeline, which reports the backend through
+            # the status callback: live transcription must disclose which backend
+            # is active — and, for Lemonade, that audio leaves this machine — the
+            # same way once, when the backend is actually loaded.
+            print(f"Live transcription backend: {self._transcriber.describe()}", file=sys.stderr)
         return self._transcriber
 
     def _transcription_loop(self) -> None:
