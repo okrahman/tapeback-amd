@@ -1,12 +1,24 @@
 """Live transcription tests — LiveTranscriber, WAV parsing, resampling, dedup."""
 
+import io
+import json
 import struct
+import threading
+import time
+import urllib.error
 import wave
+from email.message import Message
 from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
 
+import tapeback.live as live_mod
+import tapeback.pipeline as pipeline_mod
+from tapeback._lemonade import (
+    LemonadeAuthenticationError,
+    LemonadeConfigurationError,
+)
 from tapeback.live import (
     LiveTranscriber,
     adjust_timestamps,
@@ -16,7 +28,68 @@ from tapeback.live import (
 )
 from tapeback.models import Segment, Word
 from tapeback.settings import Settings
+from tapeback.transcriber import Transcriber
 from tests.fixtures import create_mono_wav, mock_whisper_transcribe
+
+
+class _FakeResponse:
+    """A urllib response that yields its body once, then EOF."""
+
+    def __init__(self, body: bytes | bytearray):
+        self._body = bytes(body)
+        self._consumed = False
+
+    def read(self, n: int = -1):
+        if self._consumed:
+            return b""
+        self._consumed = True
+        return self._body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+
+def _lemon_verbose_json(text: str, language: str = "russian") -> bytes:
+    """A successful Lemonade verbose_json response body."""
+    return json.dumps(
+        {
+            "text": text,
+            "segments": [{"start": 0.0, "end": 0.4, "text": text, "words": []}],
+            "language": language,
+            "language_probability": 0.9,
+        }
+    ).encode()
+
+
+def _install_urlopen(monkeypatch, bodies: list[object]) -> list[object]:
+    """Queue urllib responses (bytes or exceptions); repeat the last for later requests.
+
+    Routes BOTH tapeback HTTP paths (default urlopen and the loopback no-proxy
+    opener) through the same fake, and returns the recorded request list.
+    """
+    calls: list[object] = []
+
+    def fake_urlopen(request, timeout=None):
+        calls.append(request)
+        body = bodies[min(len(calls) - 1, len(bodies) - 1)]
+        if isinstance(body, BaseException):
+            raise body
+        if isinstance(body, (bytes, bytearray)):
+            return _FakeResponse(body)
+        return body  # a pre-built response-like object
+
+    class _FakeOpener:
+        def open(self, request, timeout=None):
+            return fake_urlopen(request, timeout=timeout)
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    monkeypatch.setattr("tapeback._lemonade._DEFAULT_OPENER", _FakeOpener())
+    monkeypatch.setattr("tapeback._lemonade._NO_PROXY_OPENER", _FakeOpener())
+    return calls
+
 
 # --- find_data_offset ---
 
@@ -177,12 +250,59 @@ def test_deduplicate_overlap_zero_overlap():
     assert len(result) == 2
 
 
+def test_deduplicate_overlap_reconciles_boundary_spanning_candidate():
+    """When an overlap candidate spans past the boundary or has longer text,
+    it updates the existing segment in-place and is not duplicated in kept.
+    """
+    existing = [
+        Segment(start=59.0, end=60.0, text="Let's review", speaker="You"),
+    ]
+    new_segments = [
+        # Spans past overlap boundary (60.0s) and has complete utterance
+        Segment(
+            start=59.05,
+            end=64.0,
+            text="Let's review the quarterly results",
+            speaker="You",
+        ),
+        # New utterance completely after boundary
+        Segment(start=65.0, end=68.0, text="Next topic", speaker="You"),
+    ]
+
+    result = deduplicate_overlap(existing, new_segments, overlap_start=60.0)
+
+    # Only the subsequent segment should be in kept
+    assert len(result) == 1
+    assert result[0].text == "Next topic"
+
+    # Existing segment was updated in-place with the complete candidate
+    assert len(existing) == 1
+    assert existing[0].text == "Let's review the quarterly results"
+    assert existing[0].end == 64.0
+
+
+def test_deduplicate_overlap_reconciles_longer_text_within_overlap():
+    """When an overlap candidate has strictly longer text, it replaces the existing segment."""
+    existing = [Segment(start=58.0, end=59.5, text="Hello", speaker="Other")]
+    new_segments = [Segment(start=58.1, end=59.5, text="Hello world", speaker="Other")]
+
+    result = deduplicate_overlap(existing, new_segments, overlap_start=60.0)
+
+    assert len(result) == 0
+    assert existing[0].text == "Hello world"
+
+
 # --- LiveTranscriber ---
 
 
 def test_live_transcriber_start_stop_lifecycle(tmp_path, tmp_vault):
     """LiveTranscriber should start a thread, process final chunk on stop, and clean up."""
-    settings = Settings(vault_path=tmp_vault, live_interval=1, live_min_chunk=0.01)
+    settings = Settings(
+        vault_path=tmp_vault,
+        live_interval=1,
+        live_min_chunk=0.01,
+        transcription_backend="faster-whisper",
+    )
 
     mic_path = tmp_path / "mic.wav"
     monitor_path = tmp_path / "monitor.wav"
@@ -191,7 +311,7 @@ def test_live_transcriber_start_stop_lifecycle(tmp_path, tmp_vault):
 
     mock_model = mock_whisper_transcribe([(0.0, 0.5, "Test speech.")])
 
-    with patch("tapeback.transcriber.WhisperModel", return_value=mock_model):
+    with patch("tapeback._fw_backend.WhisperModel", return_value=mock_model):
         lt = LiveTranscriber(settings, "2026-04-18_10-00-00", mic_path, monitor_path)
         lt.start()
         # Let it run briefly — the thread will pick up the audio
@@ -205,7 +325,12 @@ def test_live_transcriber_start_stop_lifecycle(tmp_path, tmp_vault):
 
 def test_live_transcriber_no_crash_on_empty_audio(tmp_path, tmp_vault):
     """LiveTranscriber should not crash when WAV files don't exist yet."""
-    settings = Settings(vault_path=tmp_vault, live_interval=1, live_min_chunk=0.01)
+    settings = Settings(
+        vault_path=tmp_vault,
+        live_interval=1,
+        live_min_chunk=0.01,
+        transcription_backend="faster-whisper",
+    )
 
     mic_path = tmp_path / "mic.wav"
     monitor_path = tmp_path / "monitor.wav"
@@ -234,7 +359,7 @@ def test_live_transcriber_no_crash_on_transcription_error(tmp_path, tmp_vault):
     mock_model = MagicMock()
     mock_model.transcribe.side_effect = RuntimeError("CUDA out of memory")
 
-    with patch("tapeback.transcriber.WhisperModel", return_value=mock_model):
+    with patch("tapeback._fw_backend.WhisperModel", return_value=mock_model):
         lt = LiveTranscriber(settings, "error-session", mic_path, monitor_path)
         lt.start()
         lt._stop_event.wait(timeout=0.1)
@@ -253,6 +378,7 @@ def test_live_transcriber_process_chunk_accumulates_segments(tmp_path, tmp_vault
         live_min_chunk=0.01,
         live_overlap=0.0,
         sample_rate=48000,
+        transcription_backend="faster-whisper",
     )
 
     mic_path = tmp_path / "mic.wav"
@@ -262,7 +388,7 @@ def test_live_transcriber_process_chunk_accumulates_segments(tmp_path, tmp_vault
 
     mock_model = mock_whisper_transcribe([(0.0, 1.0, "Hello world.")])
 
-    with patch("tapeback.transcriber.WhisperModel", return_value=mock_model):
+    with patch("tapeback._fw_backend.WhisperModel", return_value=mock_model):
         lt = LiveTranscriber(settings, "chunk-test", mic_path, monitor_path)
         lt._process_chunk()
 
@@ -301,3 +427,704 @@ def test_write_chunk_wav_creates_valid_wav(tmp_path):
         assert wf.getframerate() == 16000
         assert wf.getsampwidth() == 2
         assert wf.getnframes() == 5
+
+
+# --- Lemonade fallback latch in live mode ---
+
+
+def test_live_mic_timeout_latches_and_never_resubmits_to_lemonade(tmp_path, tmp_vault, monkeypatch):
+    """A Lemonade timeout in live mode latches the facade to faster-whisper.
+
+    The paired monitor/mic call in the same interval, and every later interval,
+    must never submit to Lemonade again — no mixed-backend live transcript and no
+    pile-up of timed-out server jobs. The monitor transcribes first, so this
+    exercises the FIRST channel failing; the sibling test below covers the second.
+    """
+    settings = Settings(
+        vault_path=tmp_vault,
+        transcription_backend="lemonade",
+        resume_cache_dir=tmp_path / "resume",
+        live_min_chunk=0.1,
+        live_interval=60,
+    )
+    mic_path = tmp_path / "mic.wav"
+    monitor_path = tmp_path / "monitor.wav"
+    create_mono_wav(mic_path, duration=0.5, sample_rate=48000)
+    create_mono_wav(monitor_path, duration=0.5, sample_rate=48000)
+
+    lemonade_calls: list[object] = []
+
+    def fake_urlopen(request, timeout=None):
+        lemonade_calls.append(request)
+        raise TimeoutError("read timed out")
+
+    class _FakeOpener:
+        def open(self, request, timeout=None):
+            return fake_urlopen(request, timeout=timeout)
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    monkeypatch.setattr("tapeback._lemonade._DEFAULT_OPENER", _FakeOpener())
+    monkeypatch.setattr("tapeback._lemonade._NO_PROXY_OPENER", _FakeOpener())
+
+    fw = MagicMock()
+    fw.cache_fingerprint.return_value = "fw-fingerprint"
+
+    def fw_transcribe(path, **kwargs):
+        return [Segment(start=0.0, end=0.4, text="fw text")], {
+            "language": "en",
+            "duration": 0.5,
+            "partial": False,
+        }
+
+    fw.transcribe.side_effect = fw_transcribe
+    monkeypatch.setattr(Transcriber, "_new_fw_backend", lambda self: fw)
+    monkeypatch.setattr(live_mod, "load_transcriber", lambda s: Transcriber(s))
+
+    lt = LiveTranscriber(settings, "latch-session", mic_path, monitor_path)
+    lt._process_chunk()  # mic times out on Lemonade -> fallback + latch; monitor via fw
+
+    assert len(lemonade_calls) == 1  # only the first mic attempt reached Lemonade
+
+    # Grow both channels so the next interval has new audio to process.
+    with open(mic_path, "ab") as f:
+        f.write(b"\x01\x00" * 16000)
+    with open(monitor_path, "ab") as f:
+        f.write(b"\x01\x00" * 16000)
+
+    lt._process_chunk()  # later interval: everything via the latched fw backend
+
+    assert len(lemonade_calls) == 1  # still exactly one Lemonade request, ever
+    texts = [s.text for s in lt._segments]
+    assert texts and all(t == "fw text" for t in texts)  # both channels came from fw
+
+
+def test_live_switch_retranscribes_committed_audio_after_empty_result(
+    tmp_path, tmp_vault, monkeypatch
+):
+    """An empty old-backend result is still committed audio, not unprocessed silence."""
+    settings = Settings(
+        vault_path=tmp_vault,
+        transcription_backend="lemonade",
+        resume_cache_dir=tmp_path / "resume",
+        live_min_chunk=0.1,
+        live_interval=60,
+        live_overlap=0.0,
+    )
+    mic_path = tmp_path / "mic.wav"
+    monitor_path = tmp_path / "monitor.wav"
+    create_mono_wav(mic_path, duration=0.5, sample_rate=48000)
+    create_mono_wav(monitor_path, duration=0.5, sample_rate=48000)
+
+    empty = json.dumps(
+        {"text": "", "segments": [], "language": "english", "language_probability": 0.9}
+    ).encode()
+    _install_urlopen(monkeypatch, [empty, empty])
+
+    fw_frame_counts: list[int] = []
+    fw = MagicMock()
+    fw.cache_fingerprint.return_value = "fw-fingerprint"
+
+    def fw_transcribe(path, **kwargs):
+        with wave.open(str(path), "rb") as wav:
+            fw_frame_counts.append(wav.getnframes())
+        return [Segment(start=0.0, end=0.4, text="recovered speech")], {
+            "language": "en",
+            "duration": 0.5,
+            "partial": False,
+        }
+
+    fw.transcribe.side_effect = fw_transcribe
+    monkeypatch.setattr(Transcriber, "_new_fw_backend", lambda self: fw)
+    monkeypatch.setattr(live_mod, "load_transcriber", lambda s: Transcriber(s))
+
+    lt = LiveTranscriber(settings, "empty-switch", mic_path, monitor_path)
+    lt._process_chunk()
+    assert lt._segments == []
+    assert lt._mic_byte_offset > 0 and lt._monitor_byte_offset > 0
+
+    with open(mic_path, "ab") as file:
+        file.write(b"\x01\x00" * 24000)
+    with open(monitor_path, "ab") as file:
+        file.write(b"\x01\x00" * 24000)
+    _install_urlopen(monkeypatch, [TimeoutError("server unavailable")])
+
+    lt._process_chunk()
+
+    # The first two fw calls retry the new 0.5 s interval. The final two are the
+    # full 1.0 s session, proving that the earlier empty result was reconsidered.
+    assert fw_frame_counts == [8000, 8000, 16000, 16000]
+    assert [segment.text for segment in lt._segments] == [
+        "recovered speech",
+        "recovered speech",
+    ]
+
+
+def test_live_second_channel_fallback_leaves_no_mixed_interval(tmp_path, tmp_vault, monkeypatch):
+    """A fallback on an interval's SECOND channel must not commit a Lemonade first
+    channel beside faster-whisper output.
+
+    Regression: mic and monitor were two independent mono calls; a monitor timeout
+    retried only the monitor through faster-whisper and the already-successful
+    Lemonade mic segments were committed beside it. The pair now transcribes as ONE
+    transaction, so a second-channel fallback discards both and resolves both through
+    faster-whisper.
+    """
+    settings = Settings(
+        vault_path=tmp_vault,
+        transcription_backend="lemonade",
+        resume_cache_dir=tmp_path / "resume",
+        live_min_chunk=0.1,
+        live_interval=60,
+    )
+    mic_path = tmp_path / "mic.wav"
+    monitor_path = tmp_path / "monitor.wav"
+    create_mono_wav(mic_path, duration=0.5, sample_rate=48000)
+    create_mono_wav(monitor_path, duration=0.5, sample_rate=48000)
+
+    # Stereo transcribes the monitor first: it succeeds on Lemonade, then the mic
+    # times out — the fallback must redo BOTH channels on faster-whisper.
+    lemonade_calls = _install_urlopen(
+        monkeypatch,
+        [_lemon_verbose_json("lemonade-monitor"), TimeoutError("read timed out")],
+    )
+
+    fw = MagicMock()
+    fw.cache_fingerprint.return_value = "fw-fingerprint"
+
+    def fw_transcribe(path, **kwargs):
+        return [Segment(start=0.0, end=0.4, text="fw text")], {
+            "language": "en",
+            "duration": 0.5,
+            "partial": False,
+        }
+
+    fw.transcribe.side_effect = fw_transcribe
+    monkeypatch.setattr(Transcriber, "_new_fw_backend", lambda self: fw)
+    monkeypatch.setattr(live_mod, "load_transcriber", lambda s: Transcriber(s))
+
+    lt = LiveTranscriber(settings, "pair-fallback", mic_path, monitor_path)
+    lt._process_chunk()
+
+    assert len(lemonade_calls) == 2  # monitor -> Lemonade ok, mic -> Lemonade timeout
+    assert [s.text for s in lt._segments] == ["fw text", "fw text"]  # never mixed
+    assert fw.transcribe.call_count == 2  # first-cycle fallback needs no full replay
+    assert lt._transcriber is not None
+    assert lt._transcriber._backend is fw  # latched for every later interval
+
+
+def test_live_channel_error_rolls_back_both_cursors(tmp_path, tmp_vault, monkeypatch):
+    """An error on one channel must not advance the other channel's cursor, or the
+    successful interval is permanently dropped.
+
+    Regression: the mic cursor advanced as soon as the mic mono call returned; a later
+    monitor auth/config error exited before segments were committed, so the next cycle
+    started past that mic audio and never re-read it.
+    """
+    settings = Settings(
+        vault_path=tmp_vault,
+        transcription_backend="lemonade",
+        resume_cache_dir=tmp_path / "resume",
+        live_min_chunk=0.1,
+        live_interval=60,
+    )
+    mic_path = tmp_path / "mic.wav"
+    monitor_path = tmp_path / "monitor.wav"
+    create_mono_wav(mic_path, duration=0.5, sample_rate=48000)
+    create_mono_wav(monitor_path, duration=0.5, sample_rate=48000)
+
+    auth_error = urllib.error.HTTPError("http://x", 401, "auth", Message(), io.BytesIO(b"{}"))
+    # The monitor is the first channel of the pair; a non-fallback auth error must
+    # propagate out of _process_chunk with both cursors untouched.
+    _install_urlopen(monkeypatch, [auth_error])
+    monkeypatch.setattr(live_mod, "load_transcriber", lambda s: Transcriber(s))
+
+    lt = LiveTranscriber(settings, "rollback", mic_path, monitor_path)
+    with pytest.raises(LemonadeAuthenticationError):
+        lt._process_chunk()
+
+    assert lt._mic_byte_offset == 0
+    assert lt._monitor_byte_offset == 0
+    assert lt._segments == []
+
+    # The server recovers: the same interval is re-read and nothing was lost.
+    _install_urlopen(monkeypatch, [_lemon_verbose_json("monitor"), _lemon_verbose_json("mic")])
+    lt._process_chunk()
+
+    assert lt._mic_byte_offset > 0
+    assert lt._monitor_byte_offset > 0
+    assert len(lt._segments) == 2
+    assert {"You", "Other"} == {s.speaker for s in lt._segments}
+
+
+# --- stop() lifecycle ---
+
+
+def test_live_lemonade_settings_pass_through_untouched(tmp_vault):
+    """Live work keeps the configured timeout; fallback can outlast one request."""
+    settings = Settings(
+        vault_path=tmp_vault,
+        transcription_backend="lemonade",
+        lemonade_timeout_seconds=600.0,
+    )
+    lt = LiveTranscriber(
+        settings, "budget-session", tmp_vault / "mic.wav", tmp_vault / "monitor.wav"
+    )
+
+    assert lt._settings.lemonade_timeout_seconds == 600.0
+
+
+def test_live_faster_whisper_settings_pass_through_untouched(tmp_vault):
+    """Constructing live transcription does not rewrite unrelated backend settings."""
+    settings = Settings(vault_path=tmp_vault, lemonade_timeout_seconds=600.0)
+    lt = LiveTranscriber(
+        settings, "passthrough-session", tmp_vault / "mic.wav", tmp_vault / "monitor.wav"
+    )
+
+    assert lt._settings.lemonade_timeout_seconds == 600.0
+
+
+def test_stop_does_not_return_while_the_worker_is_alive(tmp_path, tmp_vault, monkeypatch):
+    """A healthy long-running worker is awaited with progress, not timed out."""
+    settings = Settings(vault_path=tmp_vault, live_interval=1, live_min_chunk=0.01)
+
+    entered = threading.Event()
+    release = threading.Event()
+
+    def stalled_chunk(self):
+        entered.set()
+        release.wait(timeout=10)
+
+    monkeypatch.setattr(LiveTranscriber, "_process_chunk", stalled_chunk)
+    monkeypatch.setattr(live_mod, "_STOP_PROGRESS_INTERVAL_SECONDS", 0.05)
+
+    lt = LiveTranscriber(settings, "stall-session", tmp_path / "mic.wav", tmp_path / "monitor.wav")
+    lt.start()
+    assert entered.wait(timeout=5)
+
+    statuses: list[str] = []
+    errors: list[BaseException] = []
+
+    def stop_live() -> None:
+        try:
+            lt.stop(statuses.append)
+        except BaseException as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+
+    stop_thread = threading.Thread(target=stop_live)
+    stop_thread.start()
+    deadline = time.monotonic() + 2
+    while not statuses and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+    assert stop_thread.is_alive()
+    assert statuses
+    assert "Still waiting for live transcription" in statuses[-1]
+
+    release.set()
+    stop_thread.join(timeout=5)
+    assert not stop_thread.is_alive()
+    assert not errors
+    assert not lt._thread.is_alive()
+
+
+def test_no_work_after_stop_returns(tmp_path, tmp_vault, monkeypatch):
+    """After stop() returns, the worker is dead: no further chunk processing,
+    remote request, or live-note write can happen afterwards."""
+    settings = Settings(vault_path=tmp_vault, live_interval=1, live_min_chunk=0.01)
+    mic_path = tmp_path / "mic.wav"
+    monitor_path = tmp_path / "monitor.wav"
+    create_mono_wav(mic_path, duration=0.5, sample_rate=48000)
+    create_mono_wav(monitor_path, duration=0.5, sample_rate=48000)
+
+    chunk_calls: list[int] = []
+    write_calls: list[int] = []
+
+    def counting_chunk(self):
+        chunk_calls.append(1)
+        self._write_live_markdown()
+
+    monkeypatch.setattr(LiveTranscriber, "_process_chunk", counting_chunk)
+    monkeypatch.setattr(LiveTranscriber, "_write_live_markdown", lambda self: write_calls.append(1))
+
+    lt = LiveTranscriber(settings, "poststop-session", mic_path, monitor_path)
+    lt.start()
+    time.sleep(0.3)  # a couple of intervals
+    lt.stop()
+
+    assert not lt._thread.is_alive()
+    chunks_at_stop = len(chunk_calls)
+    writes_at_stop = len(write_calls)
+    time.sleep(0.3)
+    assert len(chunk_calls) == chunks_at_stop
+    assert len(write_calls) == writes_at_stop
+
+
+def test_live_session_does_not_mix_backends_after_fallback_in_later_interval(
+    tmp_path, tmp_vault, monkeypatch
+):
+    """When a fallback occurs on a later interval, the session must re-transcribe from
+    the beginning so the live note never mixes Lemonade and faster-whisper outputs."""
+    settings = Settings(
+        vault_path=tmp_vault,
+        transcription_backend="lemonade",
+        resume_cache_dir=tmp_path / "resume",
+        live_min_chunk=0.1,
+        live_interval=60,
+    )
+    mic_path = tmp_path / "mic.wav"
+    monitor_path = tmp_path / "monitor.wav"
+    create_mono_wav(mic_path, duration=0.5, sample_rate=48000)
+    create_mono_wav(monitor_path, duration=0.5, sample_rate=48000)
+
+    # Interval 1: Lemonade succeeds for both monitor and mic
+    lemonade_calls = _install_urlopen(
+        monkeypatch,
+        [
+            _lemon_verbose_json("lemonade monitor 1"),
+            _lemon_verbose_json("lemonade mic 1"),
+            TimeoutError("read timed out on interval 2"),
+        ],
+    )
+
+    fw = MagicMock()
+    fw.cache_fingerprint.return_value = "fw-fingerprint"
+
+    def fw_transcribe(path, **kwargs):
+        return [Segment(start=0.0, end=1.0, text="fw full session")], {
+            "language": "en",
+            "duration": 1.0,
+            "partial": False,
+        }
+
+    fw.transcribe.side_effect = fw_transcribe
+    monkeypatch.setattr(Transcriber, "_new_fw_backend", lambda self: fw)
+    monkeypatch.setattr(live_mod, "load_transcriber", lambda s: Transcriber(s))
+
+    lt = LiveTranscriber(settings, "switch-session", mic_path, monitor_path)
+
+    # Interval 1 executes on Lemonade
+    lt._process_chunk()
+    assert len(lemonade_calls) == 2
+    assert set(s.text for s in lt._segments) == {"lemonade monitor 1", "lemonade mic 1"}
+
+    # Grow both audio files for Interval 2
+    with open(mic_path, "ab") as f:
+        f.write(b"\x01\x00" * 24000)
+    with open(monitor_path, "ab") as f:
+        f.write(b"\x01\x00" * 24000)
+
+    # Interval 2 fails on Lemonade, falls back to fw, and re-transcribes committed session
+    lt._process_chunk()
+
+    # Verify all segments are now exclusively from fw, with 0 mixed Lemonade segments
+    assert len(lt._segments) == 2
+    assert all(s.text == "fw full session" for s in lt._segments)
+    assert not any("lemonade" in s.text for s in lt._segments)
+
+    # Verify live markdown contains fw output
+    md_content = lt.live_md_path.read_text()
+    assert "fw full session" in md_content
+    assert "lemonade" not in md_content
+
+
+def test_live_terminal_auth_failure_stops_worker_and_surfaces_on_stop(
+    tmp_path, tmp_vault, monkeypatch
+):
+    """A 401/403 authentication error terminates the live worker loop immediately
+    without retrying, and is re-raised synchronously from stop()."""
+    settings = Settings(
+        vault_path=tmp_vault,
+        transcription_backend="lemonade",
+        live_interval=1,
+        live_min_chunk=0.01,
+    )
+    mic_path = tmp_path / "mic.wav"
+    monitor_path = tmp_path / "monitor.wav"
+    create_mono_wav(mic_path, duration=0.5, sample_rate=48000)
+    create_mono_wav(monitor_path, duration=0.5, sample_rate=48000)
+
+    auth_error = urllib.error.HTTPError("http://x", 401, "auth", Message(), io.BytesIO(b"{}"))
+    lemonade_calls = _install_urlopen(monkeypatch, [auth_error])
+    monkeypatch.setattr(live_mod, "load_transcriber", lambda s: Transcriber(s))
+
+    lt = LiveTranscriber(settings, "fatal-auth-session", mic_path, monitor_path)
+    lt.start()
+
+    # Wait for the worker thread to encounter the fatal error and terminate
+    lt._thread.join(timeout=3)
+    assert not lt._thread.is_alive()
+    # Exactly one request made: loop broke immediately, no repeated credential retries
+    assert len(lemonade_calls) == 1
+
+    # stop() surfaces the fatal error synchronously to caller
+    with pytest.raises(LemonadeAuthenticationError):
+        lt.stop()
+
+
+def test_live_terminal_config_failure_stops_worker_and_surfaces_on_stop(
+    tmp_path, tmp_vault, monkeypatch
+):
+    """A 400 configuration error terminates the live worker loop immediately
+    without retrying, and is re-raised synchronously from stop()."""
+    settings = Settings(
+        vault_path=tmp_vault,
+        transcription_backend="lemonade",
+        live_interval=1,
+        live_min_chunk=0.01,
+    )
+    mic_path = tmp_path / "mic.wav"
+    monitor_path = tmp_path / "monitor.wav"
+    create_mono_wav(mic_path, duration=0.5, sample_rate=48000)
+    create_mono_wav(monitor_path, duration=0.5, sample_rate=48000)
+
+    config_error = urllib.error.HTTPError(
+        "http://x", 400, "bad request", Message(), io.BytesIO(b"{}")
+    )
+    lemonade_calls = _install_urlopen(monkeypatch, [config_error])
+    monkeypatch.setattr(live_mod, "load_transcriber", lambda s: Transcriber(s))
+
+    lt = LiveTranscriber(settings, "fatal-config-session", mic_path, monitor_path)
+    lt.start()
+
+    lt._thread.join(timeout=3)
+    assert not lt._thread.is_alive()
+    assert len(lemonade_calls) == 1
+
+    with pytest.raises(LemonadeConfigurationError):
+        lt.stop()
+
+
+def test_read_new_pcm_odd_byte_count_aligns_to_sample_boundaries(tmp_path):
+    """When a growing WAV has an odd byte count, available_pcm and offsets are
+    aligned to 16-bit boundaries.
+    """
+    settings = Settings(vault_path=tmp_path / "vault", live_interval=1, live_min_chunk=0.01)
+    mic_path = tmp_path / "mic.wav"
+    monitor_path = tmp_path / "monitor.wav"
+
+    # Write 44-byte WAV header + odd number of PCM bytes (e.g. 1001 bytes)
+    header = (
+        b"RIFF"
+        + struct.pack("<I", 36 + 1001)
+        + b"WAVEfmt "
+        + struct.pack("<IHHIIHH", 16, 1, 1, 48000, 96000, 2, 16)
+        + b"data"
+        + struct.pack("<I", 1001)
+    )
+    pcm_data = b"\x01\x02" * 500 + b"\x03"  # 1001 bytes
+    mic_path.write_bytes(header + pcm_data)
+
+    lt = LiveTranscriber(settings, "odd-pcm-session", mic_path, monitor_path)
+    pcm_bytes, new_offset = lt._read_new_pcm(
+        mic_path, 0, min_bytes=10, overlap_bytes=0, is_mic=True
+    )
+
+    assert pcm_bytes is not None
+    assert len(pcm_bytes) % 2 == 0
+    assert new_offset % 2 == 0
+    assert new_offset == 1000
+    assert len(pcm_bytes) == 1000
+
+    # Append more bytes (e.g. 500 bytes)
+    with open(mic_path, "ab") as f:
+        f.write(b"\x04\x05" * 250)
+
+    pcm_bytes_2, new_offset_2 = lt._read_new_pcm(
+        mic_path, new_offset, min_bytes=10, overlap_bytes=0, is_mic=True
+    )
+    assert pcm_bytes_2 is not None
+    assert len(pcm_bytes_2) % 2 == 0
+    assert new_offset_2 % 2 == 0
+    assert new_offset_2 == 1500
+    # First two bytes must be the 1000-th sample (\x03 and next \x04)
+    assert pcm_bytes_2[:2] == b"\x03\x04"
+
+
+def test_deduplicate_overlap_scopes_to_same_speaker():
+    """Deduplication only drops candidate segments matching an existing segment
+    of the same speaker.
+    """
+    existing = [
+        Segment(start=58.5, end=59.5, text="I am speaking on mic", speaker="You"),
+        Segment(start=58.0, end=59.0, text="Other speaker earlier", speaker="Other"),
+    ]
+
+    # Monitor segment from "Other" at 58.6s (within tolerance of "You" at 58.5s)
+    new_other = [Segment(start=58.6, end=59.8, text="Remote speaker in overlap", speaker="Other")]
+    kept_other = deduplicate_overlap(existing, new_other, overlap_start=60.0)
+    # Must NOT be dropped by "You" at 58.5s (different speaker)
+    assert len(kept_other) == 1
+    assert kept_other[0].text == "Remote speaker in overlap"
+
+    # Duplicate "You" segment at 58.5s should be dropped
+    new_you = [Segment(start=58.55, end=59.6, text="I am speaking on mic", speaker="You")]
+    kept_you = deduplicate_overlap(existing, new_you, overlap_start=60.0)
+    assert len(kept_you) == 0
+
+
+def test_live_transcriber_reuses_detected_language_for_single_mic_chunk(tmp_path, monkeypatch):
+    """Single mic chunk transcribes with language_override when language was previously detected."""
+    settings = Settings(vault_path=tmp_path, live=True, transcription_backend="lemonade")
+    mic_path = tmp_path / "mic.wav"
+    monitor_path = tmp_path / "monitor.wav"
+
+    lt = LiveTranscriber(settings, "lang-coord", mic_path, monitor_path)
+    lt._last_detected_language = "fr"
+
+    mock_transcriber = MagicMock()
+    mock_transcriber.transcribe.return_value = ([], {"language": "fr"})
+    monkeypatch.setattr(lt, "_ensure_transcriber", lambda: mock_transcriber)
+
+    # Fake PCM data for single mic chunk
+    fake_pcm = b"\x01\x00" * 16000
+    lt._transcribe_chunk(mock_transcriber, fake_pcm, 0, 0, is_mic=True)
+
+    mock_transcriber.transcribe.assert_called_once()
+    assert mock_transcriber.transcribe.call_args[1]["language_override"] == "fr"
+
+
+def test_stop_and_process_survives_live_transcriber_fatal_error(tmp_path, monkeypatch):
+    """pipeline.stop_and_process does not crash when live_transcriber.stop() raises fatal error."""
+    settings = Settings(vault_path=tmp_path, live=True)
+    mock_recorder = MagicMock()
+    session_dir = tmp_path / "sess_123"
+    session_dir.mkdir(parents=True)
+    mon = session_dir / "monitor.wav"
+    mic = session_dir / "mic.wav"
+    wav_header = (
+        b"RIFF\x24\x00\x00\x00WAVEfmt \x10\x00\x00\x00\x01\x00\x01\x00"
+        b"\x80>\x00\x00\x00}\x00\x00\x02\x00\x10\x00data\x00\x00\x00\x00"
+    )
+    mon.write_bytes(wav_header)
+    mic.write_bytes(wav_header)
+    mock_recorder.stop.return_value = (mon, mic)
+
+    mock_lt = MagicMock()
+    mock_lt.stop.side_effect = LemonadeAuthenticationError("Invalid API key")
+
+    monkeypatch.setattr(pipeline_mod, "merge_channels", lambda m, mi, out: out / "stereo.wav")
+    monkeypatch.setattr(pipeline_mod, "save_audio_to_vault", lambda p, s, n: tmp_path / f"{n}.wav")
+    monkeypatch.setattr(
+        pipeline_mod,
+        "process_stereo_file",
+        lambda p, out, s, diarize, on_status: ([], {"duration": 1.0}, []),
+    )
+
+    # Must complete and return markdown path without crashing
+    md_path = pipeline_mod.stop_and_process(
+        recorder=mock_recorder,
+        settings=settings,
+        live_transcriber=mock_lt,
+        do_summarize=False,
+    )
+    assert md_path.exists()
+
+
+def test_deduplicate_overlap_does_not_overwrite_distinct_speech():
+    """Distinct speech starting near chunk boundary must never overwrite preceding speech."""
+    existing = [
+        Segment(start=59.5, end=59.9, text="Thank you.", speaker="You"),
+    ]
+    # In chunk 1, boundary is 60.0. Segment starts at 59.95s (within 0.5s tolerance)
+    # but says completely different words.
+    new_segments = [
+        Segment(start=59.95, end=62.5, text="Next topic is budget.", speaker="You"),
+    ]
+    result = deduplicate_overlap(existing, new_segments, overlap_start=60.0)
+    # Neither segment should be dropped or overwritten
+    assert len(existing) == 1
+    assert existing[0].text == "Thank you."
+    assert len(result) == 1
+    assert result[0].text == "Next topic is budget."
+
+
+def test_deduplicate_overlap_keeps_segments_at_or_past_boundary_immediately():
+    """Segments starting >= overlap_start are kept immediately even within tolerance."""
+    existing = [
+        Segment(start=59.8, end=60.0, text="Hello", speaker="You"),
+    ]
+    new_segments = [
+        Segment(start=60.1, end=61.0, text="World", speaker="You"),
+    ]
+    result = deduplicate_overlap(existing, new_segments, overlap_start=60.0)
+    assert len(existing) == 1
+    assert existing[0].text == "Hello"
+    assert len(result) == 1
+    assert result[0].text == "World"
+
+
+def test_write_markdown_failure_does_not_corrupt_segments_or_offsets(tmp_path, monkeypatch):
+    """Failed markdown write leaves segments and offsets uncommitted."""
+    settings = Settings(vault_path=tmp_path, live=True)
+    mic_path = tmp_path / "mic.wav"
+    monitor_path = tmp_path / "monitor.wav"
+    header = (
+        b"RIFF\x24\x00\x00\x00WAVEfmt \x10\x00\x00\x00\x01\x00\x01\x00"
+        b"\x80>\x00\x00\x00}\x00\x00\x02\x00\x10\x00data\x00\x00\x00\x00"
+    )
+    pcm_data = b"\x01\x00" * 48000 * 6  # 6 seconds
+    mic_path.write_bytes(header + pcm_data)
+    monitor_path.write_bytes(header + pcm_data)
+
+    lt = LiveTranscriber(settings, "atomic-test", mic_path, monitor_path)
+    mock_transcriber = MagicMock()
+    mock_transcriber._backend.cache_fingerprint.return_value = "fp1"
+    mock_transcriber.transcribe_stereo.return_value = (
+        [Segment(start=0.0, end=1.0, text="Hello", speaker="You")],
+        [],
+        {"duration": 1.0, "language": "en"},
+    )
+    monkeypatch.setattr(lt, "_ensure_transcriber", lambda: mock_transcriber)
+
+    # First attempt: simulate write error
+    err_mock = MagicMock(side_effect=OSError("Disk full"))
+    monkeypatch.setattr("tapeback.live.save_live_markdown", err_mock)
+    with pytest.raises(OSError):
+        lt._process_chunk()
+
+    # In-memory segments and offsets must remain uncommitted (empty / 0)
+    assert lt._segments == []
+    assert lt._mic_byte_offset == 0
+    assert lt._monitor_byte_offset == 0
+
+    # Second attempt: write succeeds
+    monkeypatch.setattr("tapeback.live.save_live_markdown", MagicMock())
+    lt._process_chunk()
+
+    assert len(lt._segments) == 1
+    assert lt._segments[0].text == "Hello"
+    assert lt._mic_byte_offset > 0
+
+
+def test_live_stop_processes_tail_audio_under_min_chunk(tmp_path, monkeypatch):
+    """Stop cleans up tail audio even if less than live_min_chunk (e.g. 2s < 5s)."""
+    settings = Settings(vault_path=tmp_path, live=True, live_min_chunk=5.0)
+    mic_path = tmp_path / "mic.wav"
+    monitor_path = tmp_path / "monitor.wav"
+    header = (
+        b"RIFF\x24\x00\x00\x00WAVEfmt \x10\x00\x00\x00\x01\x00\x01\x00"
+        b"\x80>\x00\x00\x00}\x00\x00\x02\x00\x10\x00data\x00\x00\x00\x00"
+    )
+    pcm_2s = b"\x01\x00" * 48000 * 2  # 2 seconds (< 5s min chunk)
+    mic_path.write_bytes(header + pcm_2s)
+    monitor_path.write_bytes(header + pcm_2s)
+
+    lt = LiveTranscriber(settings, "tail-test", mic_path, monitor_path)
+    mock_transcriber = MagicMock()
+    mock_transcriber._backend.cache_fingerprint.return_value = "fp1"
+    mock_transcriber.transcribe_stereo.return_value = (
+        [Segment(start=0.0, end=1.5, text="Tail segment", speaker="You")],
+        [],
+        {"duration": 1.5, "language": "en"},
+    )
+    monkeypatch.setattr(lt, "_ensure_transcriber", lambda: mock_transcriber)
+    monkeypatch.setattr("tapeback.live.save_live_markdown", MagicMock())
+
+    # Normal process_chunk should ignore 2s because min_bytes is 5s
+    lt._process_chunk(is_final=False)
+    assert len(lt._segments) == 0
+
+    # Stop / final chunk should process it
+    lt._process_chunk(is_final=True)
+    assert len(lt._segments) == 1
+    assert lt._segments[0].text == "Tail segment"

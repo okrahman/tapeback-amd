@@ -1,3 +1,5 @@
+import contextlib
+import os
 import shutil
 import subprocess
 import sys
@@ -7,7 +9,7 @@ from pathlib import Path
 import numpy as np
 
 from tapeback import const
-from tapeback.channel import gate_inactive_regions
+from tapeback.channel import gate_inactive_regions, is_channel_active
 
 
 def _check_ffmpeg() -> None:
@@ -134,6 +136,11 @@ def split_channels_16k(stereo_wav: Path, output_dir: Path) -> tuple[Path, Path]:
         check=True,
     )
 
+    with contextlib.suppress(OSError):
+        src_stat = stereo_wav.stat()
+        os.utime(mic_16k_path, (src_stat.st_atime, src_stat.st_mtime))
+        os.utime(monitor_16k_path, (src_stat.st_atime, src_stat.st_mtime))
+
     return mic_16k_path, monitor_16k_path
 
 
@@ -174,6 +181,10 @@ def convert_to_mono16k(input_file: Path, output_dir: Path) -> Path:
         check=True,
     )
 
+    with contextlib.suppress(OSError):
+        src_stat = input_file.stat()
+        os.utime(output_path, (src_stat.st_atime, src_stat.st_mtime))
+
     return output_path
 
 
@@ -182,22 +193,38 @@ def gate_wav_inactive(
     target_raw: np.ndarray,
     other_raw: np.ndarray,
     raw_sr: int,
-) -> None:
+) -> bool:
     """Silence the listening regions of a 16 kHz mono WAV in place.
 
     Reads the WAV, zeroes windows where the speaker is inactive (see
     channel.gate_inactive_regions), and writes it back — so Whisper never sees the
     mic channel's pauses and can't hallucinate loops on them.
+
+    Returns whether any nonzero PCM samples remain after gating.
     """
+    try:
+        orig_stat = wav_path.stat()
+        orig_atime = orig_stat.st_atime
+        orig_mtime = orig_stat.st_mtime
+    except OSError:
+        orig_mtime = None
+
     with wave.open(str(wav_path), "rb") as wf:
         sample_rate = wf.getframerate()
         frames = wf.readframes(wf.getnframes())
 
     samples = np.frombuffer(frames, dtype=np.int16).astype(np.float32)
     gated = gate_inactive_regions(samples, target_raw, other_raw, raw_sr)
+    gated_pcm = gated.astype(np.int16)
 
     with wave.open(str(wav_path), "wb") as wf:
         wf.setnchannels(1)
         wf.setsampwidth(2)
         wf.setframerate(sample_rate)
-        wf.writeframes(gated.astype(np.int16).tobytes())
+        wf.writeframes(gated_pcm.tobytes())
+
+    if orig_mtime is not None:
+        with contextlib.suppress(OSError):
+            os.utime(wav_path, (orig_atime, orig_mtime))
+
+    return is_channel_active(gated_pcm)

@@ -12,6 +12,8 @@ from __future__ import annotations
 import datetime
 import json
 import os
+import re
+import urllib.parse
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -51,10 +53,45 @@ RECORDED_SETTINGS = (
     "gate_mic_silence",
     "diarize",
     "pause_threshold",
+    "transcription_backend",
+    "lemonade_model",
+    "lemonade_chunk_seconds",
+    "lemonade_overlap_seconds",
+    "lemonade_timeout_seconds",
+    "lemonade_diagnostics_timeout_seconds",
 )
 
 # Keep the directory from growing without bound; oldest records are dropped first.
 MAX_RUN_RECORDS = 200
+
+# Terminal-control characters (C0, C1, and line/paragraph separators) never belong
+# in a persisted diagnostic line: ESC sequences could disguise or corrupt output
+# when the file is catted into a terminal, and they have no legitimate use here.
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029]")
+
+
+_REDACTED_LABEL = "[redacted]"
+_INVALID_URL_LABEL = "[invalid/redacted]"
+_DEFAULT_URL_PORTS = {"http": 80, "https": 443}
+
+
+def redact_text(text: str, redactions: tuple[str, ...] = ()) -> str:
+    """Strip terminal-control characters and replace configured secrets.
+
+    Applied to everything captured into the run record: status lines are echoed
+    by remote-facing backends and error messages are influenced by remote error
+    bodies, so a reflected credential must not survive the write even if an
+    upstream sanitizer missed it.
+
+    Secrets are deduplicated and sorted longest-first so that overlapping keys
+    (e.g., prefix or suffix matches) are replaced completely rather than leaving
+    reconstructable fragments.
+    """
+    out: str = str(_CONTROL_CHARS_RE.sub("", text))
+    unique_secrets: set[str] = {secret for secret in redactions if secret}
+    for secret in sorted(unique_secrets, key=lambda value: len(value), reverse=True):
+        out = out.replace(secret, _REDACTED_LABEL)
+    return out
 
 
 def default_run_log_dir() -> Path:
@@ -68,9 +105,51 @@ def _utc_now_iso() -> str:
     return datetime.datetime.now(datetime.UTC).isoformat()
 
 
+def _safe_url_origin(raw: str) -> str:
+    """Return only a credential-free http(s) origin for the run record.
+
+    The backend performs authoritative URL validation. This persistence-boundary
+    sanitizer is intentionally conservative and never returns userinfo, path,
+    query, or fragment data: any of those components can carry a reusable secret.
+    """
+    if (
+        not raw
+        or not raw.isascii()
+        or raw != raw.strip()
+        or any(ch.isspace() or not ch.isprintable() for ch in raw)
+    ):
+        return _INVALID_URL_LABEL
+    try:
+        parsed = urllib.parse.urlsplit(raw)
+        scheme = parsed.scheme.lower()
+        hostname = parsed.hostname
+        username = parsed.username
+        password = parsed.password
+        port = parsed.port
+    except ValueError:
+        return _INVALID_URL_LABEL
+    if (
+        scheme not in _DEFAULT_URL_PORTS
+        or not hostname
+        or not hostname.isascii()
+        or username is not None
+        or password is not None
+        or parsed.query
+        or parsed.fragment
+    ):
+        return _INVALID_URL_LABEL
+    host = hostname.lower()
+    if port == _DEFAULT_URL_PORTS[scheme]:
+        port = None
+    host_part = f"[{host}]" if ":" in host else host
+    return f"{scheme}://{host_part}" + (f":{port}" if port is not None else "")
+
+
 def _config_snapshot(settings: Settings) -> dict[str, object]:
     """Copy the transcription-relevant settings, and only those."""
-    return {name: getattr(settings, name) for name in RECORDED_SETTINGS}
+    config = {name: getattr(settings, name) for name in RECORDED_SETTINGS}
+    config["lemonade_url"] = _safe_url_origin(settings.lemonade_url)
+    return config
 
 
 @dataclass
@@ -84,15 +163,25 @@ class RunLog:
     outcome: str = OUTCOME_UNKNOWN
     error: str | None = None
     finished_at: str | None = None
+    # Secret strings replaced with "[redacted]" in every captured line and in the
+    # error field. Populated by `run_log` from the settings; empty when constructed
+    # directly (tests). Status text reaches this file from remote-facing backends,
+    # and a reflected credential must not survive the write even if an upstream
+    # sanitizer missed it.
+    redactions: tuple[str, ...] = ()
+
+    def _sanitize(self, message: str) -> str:
+        """Redact configured secrets and strip terminal-control characters."""
+        return redact_text(message, self.redactions)
 
     def record(self, message: str) -> None:
-        """Capture one status line verbatim.
+        """Capture one status line, redacted of configured secrets.
 
         The status lines already are the human-readable record of the run, so they
         are stored as written rather than parsed back into fields — re-parsing our
         own formatted output would break every time a message is reworded.
         """
-        self.events.append(message)
+        self.events.append(self._sanitize(message))
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -161,6 +250,11 @@ def run_log(
     interrupted or failed is exactly the run worth having a record of, so the
     outcome is classified rather than the exception being swallowed — it is
     re-raised unchanged.
+
+    Every captured status line and the error field are redacted of the
+    credentials the settings carry (`lemonade_api_key`, `hf_token`,
+    `llm_api_key`): a remote-facing error can reflect a configured secret, and a
+    post-mortem file the user may share must never hold a reusable credential.
     """
     if not settings.run_log:
         yield on_status
@@ -171,6 +265,15 @@ def run_log(
         session=session,
         started_at=_utc_now_iso(),
         config=_config_snapshot(settings),
+        redactions=tuple(
+            value
+            for value in (
+                settings.lemonade_api_key.get_secret_value(),
+                settings.hf_token.get_secret_value(),
+                settings.llm_api_key.get_secret_value(),
+            )
+            if value
+        ),
     )
 
     def reporter(message: str) -> None:
@@ -186,7 +289,9 @@ def run_log(
         record.outcome = OUTCOME_FAILED
         # Type and message only — a full traceback in a file the user may share
         # can carry local paths, and the message is what identifies the failure.
-        record.error = f"{type(exc).__name__}: {exc}"
+        # The message is remote-influenced text, so it is redacted and stripped
+        # of control characters at this, the final persistence boundary.
+        record.error = redact_text(f"{type(exc).__name__}: {exc}", record.redactions)
         raise
     else:
         record.outcome = OUTCOME_COMPLETED

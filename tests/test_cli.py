@@ -32,6 +32,7 @@ def test_process_mono_pipeline(runner, tmp_path, monkeypatch, vault_env):
     """process command: mono WAV → transcribe → save markdown + audio to vault.
     Also tests --name for custom output filename."""
     monkeypatch.setenv("TAPEBACK_DIARIZE", "false")
+    monkeypatch.setenv("TAPEBACK_TRANSCRIPTION_BACKEND", "faster-whisper")
 
     audio = tmp_path / "2026-03-20_10-00-00.wav"
     create_silent_wav(audio, duration=2.0, sample_rate=48000)
@@ -43,7 +44,7 @@ def test_process_mono_pipeline(runner, tmp_path, monkeypatch, vault_env):
         ]
     )
 
-    with patch("tapeback.transcriber.WhisperModel", return_value=mock_model):
+    with patch("tapeback._fw_backend.WhisperModel", return_value=mock_model):
         result = runner.invoke(cli, ["process", str(audio), "--no-diarize"])
 
     assert result.exit_code == 0, result.output + str(result.exception or "")
@@ -64,7 +65,7 @@ def test_process_mono_pipeline(runner, tmp_path, monkeypatch, vault_env):
     create_silent_wav(audio2, duration=2.0)
     mock_model2 = mock_whisper_transcribe([(0.0, 5.0, "Speech.")])
 
-    with patch("tapeback.transcriber.WhisperModel", return_value=mock_model2):
+    with patch("tapeback._fw_backend.WhisperModel", return_value=mock_model2):
         result2 = runner.invoke(
             cli, ["process", str(audio2), "--name", "my-meeting", "--no-diarize"]
         )
@@ -77,6 +78,7 @@ def test_process_mono_pipeline(runner, tmp_path, monkeypatch, vault_env):
 def test_process_with_diarization(runner, tmp_path, monkeypatch, vault_env):
     """process command with diarization: transcribe → diarize → speakers in markdown."""
     monkeypatch.setenv("TAPEBACK_HF_TOKEN", "hf_fake")
+    monkeypatch.setenv("TAPEBACK_TRANSCRIPTION_BACKEND", "faster-whisper")
 
     audio = tmp_path / "2026-03-20_10-00-00.wav"
     create_silent_wav(audio, duration=2.0)
@@ -95,7 +97,7 @@ def test_process_with_diarization(runner, tmp_path, monkeypatch, vault_env):
     )
 
     with (
-        patch("tapeback.transcriber.WhisperModel", return_value=mock_model),
+        patch("tapeback._fw_backend.WhisperModel", return_value=mock_model),
         patch("pyannote.audio.Pipeline") as mock_pipeline_cls,
     ):
         mock_pipeline = MagicMock()
@@ -117,6 +119,7 @@ def test_process_stereo_dual_channel(runner, tmp_path, monkeypatch, vault_env):
     Dual-channel pipeline: split channels → transcribe each → mic gets "You" label.
     """
     monkeypatch.setenv("TAPEBACK_DIARIZE", "false")
+    monkeypatch.setenv("TAPEBACK_TRANSCRIPTION_BACKEND", "faster-whisper")
 
     audio = tmp_path / "2026-03-20_10-00-00.wav"
     create_stereo_wav_segments(audio, 48000, [(1.0, 0.8, 0.003), (1.0, 0.003, 0.8)])
@@ -127,7 +130,7 @@ def test_process_stereo_dual_channel(runner, tmp_path, monkeypatch, vault_env):
         ]
     )
 
-    with patch("tapeback.transcriber.WhisperModel", return_value=mock_model):
+    with patch("tapeback._fw_backend.WhisperModel", return_value=mock_model):
         result = runner.invoke(cli, ["process", str(audio), "--no-diarize"])
 
     assert result.exit_code == 0, result.output + str(result.exception or "")
@@ -170,13 +173,133 @@ def test_status_command(runner, vault_env):
         assert "Recording in progress: 2026-03-20_10-00-00" in result.output
 
 
+def test_status_command_with_lemonade_shows_normalized_endpoint(runner, vault_env):
+    """status shows the normalized URL, never the raw configured string."""
+    with patch("tapeback.cli.get_settings") as mock_settings:
+        mock_settings.return_value = Settings(
+            vault_path=vault_env,
+            transcription_backend="lemonade",
+            lemonade_url="http://LocalHost:13305/",
+        )
+        with (
+            patch("tapeback.recorder.Recorder.get_session_info", return_value=None),
+            patch("tapeback._lemonade.LemonadeBackend.health", return_value={"status": "ok"}),
+            patch("tapeback._lemonade.LemonadeBackend.system_info", return_value={}),
+        ):
+            result = runner.invoke(cli, ["status"])
+    assert result.exit_code == 0
+    assert "Lemonade endpoint: http://localhost:13305" in result.output
+    assert "Health:" in result.output
+
+
+def test_status_command_with_invalid_lemonade_url_reports_and_survives(runner, vault_env):
+    """A bad URL is reported as a line — status must stay usable for diagnosing it."""
+    with patch("tapeback.cli.get_settings") as mock_settings:
+        mock_settings.return_value = Settings(
+            vault_path=vault_env,
+            transcription_backend="lemonade",
+            lemonade_url="http://alice:s3cret@127.0.0.1:13305",
+        )
+        with patch("tapeback.recorder.Recorder.get_session_info", return_value=None):
+            result = runner.invoke(cli, ["status"])
+    assert result.exit_code == 0
+    assert "configuration invalid" in result.stderr
+    # The rejected URL carried embedded credentials; status must not display the
+    # raw configured value — status output never shows raw userinfo.
+    assert "alice" not in result.stderr
+    assert "s3cret" not in result.stderr
+    assert "127.0.0.1" not in result.stderr
+
+
 # --- _stop_and_process (dual-channel pipeline) ---
+
+
+def test_stop_and_process_stops_recorder_before_live_teardown(tmp_vault, tmp_path):
+    """Recording is finalized even when live-preview teardown fails."""
+    settings = Settings(vault_path=tmp_vault)
+    session_dir = tmp_path / "session"
+    session_dir.mkdir(parents=True, exist_ok=True)
+    monitor_wav = session_dir / "monitor.wav"
+    mic_wav = session_dir / "mic.wav"
+    monitor_wav.write_bytes(b"mon")
+    mic_wav.write_bytes(b"mic")
+    order: list[str] = []
+    on_status = MagicMock()
+
+    recorder = MagicMock()
+    recorder.stop.side_effect = lambda: (
+        order.append("recorder-stopped") or monitor_wav,
+        mic_wav,
+    )
+    live_transcriber = MagicMock()
+
+    def fail_live_stop(callback):
+        order.append("live-stop-failed")
+        raise RuntimeError("preview teardown failed")
+
+    live_transcriber.stop.side_effect = fail_live_stop
+
+    with (
+        patch("tapeback.pipeline.merge_channels", return_value=session_dir / "stereo.wav"),
+        patch("tapeback.pipeline.save_audio_to_vault", return_value=tmp_vault / "audio.wav"),
+        patch(
+            "tapeback.pipeline.process_stereo_file",
+            return_value=([], {"duration": 1.0}, []),
+        ),
+    ):
+        md_path = stop_and_process(
+            recorder,
+            settings,
+            live_transcriber=live_transcriber,
+            on_status=on_status,
+            do_summarize=False,
+        )
+
+    assert md_path.exists()
+    assert order == ["recorder-stopped", "live-stop-failed"]
+    live_transcriber.stop.assert_called_once_with(on_status)
+    assert any(
+        "Warning: Live transcription stopped with error" in str(c) for c in on_status.mock_calls
+    )
+
+
+def test_stop_and_process_enters_pipeline_only_after_live_exit(tmp_vault, tmp_path):
+    """Final processing starts only after recording and the live worker stop."""
+    settings = Settings(vault_path=tmp_vault)
+    session_dir = tmp_path / "session"
+    monitor_wav = session_dir / "monitor.wav"
+    mic_wav = session_dir / "mic.wav"
+    order: list[str] = []
+
+    recorder = MagicMock()
+    recorder.stop.side_effect = lambda: (
+        order.append("recorder-stopped") or monitor_wav,
+        mic_wav,
+    )
+    live_transcriber = MagicMock()
+    live_transcriber.stop.side_effect = lambda _callback: order.append("live-exited")
+
+    def pipeline_started(*_args, **_kwargs):
+        order.append("pipeline-started")
+        raise RuntimeError("stop after ordering assertion")
+
+    with (
+        patch("tapeback.pipeline.merge_channels", side_effect=pipeline_started),
+        pytest.raises(RuntimeError, match="stop after ordering assertion"),
+    ):
+        stop_and_process(recorder, settings, live_transcriber=live_transcriber)
+
+    assert order == ["recorder-stopped", "live-exited", "pipeline-started"]
 
 
 @pytest.mark.skipif(not shutil.which("ffmpeg"), reason="ffmpeg required")
 def test_stop_and_process_pipeline(tmp_vault, session_wavs):
     """_stop_and_process: full dual-channel pipeline with mocked ML models."""
-    settings = Settings(vault_path=tmp_vault, hf_token=SecretStr("hf_fake"))
+    settings = Settings(
+        vault_path=tmp_vault,
+        hf_token=SecretStr("hf_fake"),
+        transcription_backend="faster-whisper",
+    )
     session_dir, monitor_wav, mic_wav = session_wavs("2026-03-20_10-00-00")
 
     mock_recorder = MagicMock()
@@ -186,7 +309,7 @@ def test_stop_and_process_pipeline(tmp_vault, session_wavs):
     annotation = mock_pyannote_annotation([(0.0, 2.0, "SPEAKER_00")])
 
     with (
-        patch("tapeback.transcriber.WhisperModel", return_value=mock_model),
+        patch("tapeback._fw_backend.WhisperModel", return_value=mock_model),
         patch("pyannote.audio.Pipeline") as mock_pipeline_cls,
     ):
         mock_pipeline = MagicMock()
@@ -206,7 +329,7 @@ def test_stop_and_process_pipeline(tmp_vault, session_wavs):
 @pytest.mark.skipif(not shutil.which("ffmpeg"), reason="ffmpeg required")
 def test_stop_and_process_no_diarize(tmp_vault, session_wavs):
     """_stop_and_process with diarize=False skips pyannote entirely."""
-    settings = Settings(vault_path=tmp_vault)
+    settings = Settings(vault_path=tmp_vault, transcription_backend="faster-whisper")
     _session_dir, monitor_wav, mic_wav = session_wavs("2026-03-20_11-00-00")
 
     mock_recorder = MagicMock()
@@ -214,7 +337,7 @@ def test_stop_and_process_no_diarize(tmp_vault, session_wavs):
     mock_model = mock_whisper_transcribe([(0.0, 5.0, "No diarize.")])
 
     with (
-        patch("tapeback.transcriber.WhisperModel", return_value=mock_model),
+        patch("tapeback._fw_backend.WhisperModel", return_value=mock_model),
         patch("pyannote.audio.Pipeline") as mock_pipeline_cls,
     ):
         stop_and_process(mock_recorder, settings, diarize=False)
@@ -229,7 +352,7 @@ def test_stop_and_process_no_diarize(tmp_vault, session_wavs):
 @pytest.mark.skipif(not shutil.which("ffmpeg"), reason="ffmpeg required")
 def test_process_stereo_file_function(tmp_path, tmp_vault):
     """_process_stereo_file: splits channels, transcribes each, merges."""
-    settings = Settings(vault_path=tmp_vault)
+    settings = Settings(vault_path=tmp_vault, transcription_backend="faster-whisper")
 
     stereo = tmp_path / "stereo.wav"
     create_stereo_wav_segments(stereo, 48000, [(1.0, 0.8, 0.003), (1.0, 0.003, 0.8)])
@@ -239,7 +362,7 @@ def test_process_stereo_file_function(tmp_path, tmp_vault):
 
     mock_model = mock_whisper_transcribe([(0.0, 1.0, "Speech.")])
 
-    with patch("tapeback.transcriber.WhisperModel", return_value=mock_model):
+    with patch("tapeback._fw_backend.WhisperModel", return_value=mock_model):
         segments, _info, _raw = process_stereo_file(stereo, output_dir, settings, diarize=False)
 
     assert len(segments) > 0
@@ -308,6 +431,7 @@ def test_summarize_command_no_api_key(runner, tmp_path, monkeypatch, vault_env):
 def test_process_with_summarization(runner, tmp_path, monkeypatch, vault_env):
     """Full pipeline: process → transcribe → summarize → file has summary."""
     monkeypatch.setenv("TAPEBACK_DIARIZE", "false")
+    monkeypatch.setenv("TAPEBACK_TRANSCRIPTION_BACKEND", "faster-whisper")
     monkeypatch.setenv("TAPEBACK_LLM_API_KEY", "sk-test")
 
     audio = tmp_path / "2026-03-20_10-00-00.wav"
@@ -316,7 +440,7 @@ def test_process_with_summarization(runner, tmp_path, monkeypatch, vault_env):
     mock_model = mock_whisper_transcribe([(0.0, 5.0, "Hello from the meeting.")])
 
     with (
-        patch("tapeback.transcriber.WhisperModel", return_value=mock_model),
+        patch("tapeback._fw_backend.WhisperModel", return_value=mock_model),
         patch("tapeback.summarizer._call_llm", return_value=VALID_LLM_RESPONSE_MINIMAL),
     ):
         result = runner.invoke(cli, ["process", str(audio), "--no-diarize"])
@@ -332,13 +456,14 @@ def test_process_with_summarization(runner, tmp_path, monkeypatch, vault_env):
 def test_process_no_summarize_flag(runner, tmp_path, monkeypatch, vault_env):
     """--no-summarize → no LLM call."""
     monkeypatch.setenv("TAPEBACK_DIARIZE", "false")
+    monkeypatch.setenv("TAPEBACK_TRANSCRIPTION_BACKEND", "faster-whisper")
 
     audio = tmp_path / "2026-03-20_10-00-00.wav"
     create_silent_wav(audio, duration=2.0, sample_rate=48000)
     mock_model = mock_whisper_transcribe([(0.0, 5.0, "Speech.")])
 
     with (
-        patch("tapeback.transcriber.WhisperModel", return_value=mock_model),
+        patch("tapeback._fw_backend.WhisperModel", return_value=mock_model),
         patch("tapeback.summarizer._call_llm") as mock_llm,
     ):
         result = runner.invoke(cli, ["process", str(audio), "--no-diarize", "--no-summarize"])
@@ -352,7 +477,11 @@ def test_process_no_summarize_flag(runner, tmp_path, monkeypatch, vault_env):
 @pytest.mark.skipif(not shutil.which("ffmpeg"), reason="ffmpeg required")
 def test_stop_and_process_summarization_failure(tmp_vault, session_wavs):
     """LLM fails → warning printed, transcript still saved."""
-    settings = Settings(vault_path=tmp_vault, llm_api_key=SecretStr("sk-test"))
+    settings = Settings(
+        vault_path=tmp_vault,
+        llm_api_key=SecretStr("sk-test"),
+        transcription_backend="faster-whisper",
+    )
     _session_dir, monitor_wav, mic_wav = session_wavs("2026-03-20_12-00-00")
 
     mock_recorder = MagicMock()
@@ -360,7 +489,7 @@ def test_stop_and_process_summarization_failure(tmp_vault, session_wavs):
     mock_model = mock_whisper_transcribe([(0.0, 5.0, "Important content.")])
 
     with (
-        patch("tapeback.transcriber.WhisperModel", return_value=mock_model),
+        patch("tapeback._fw_backend.WhisperModel", return_value=mock_model),
         patch("pyannote.audio.Pipeline"),
         patch("tapeback.summarizer._call_llm", side_effect=RuntimeError("API error")),
     ):

@@ -1,0 +1,2072 @@
+"""Lemonade backend: HTTP transport, chunking, language handling, error mapping."""
+
+import contextlib
+import http.client
+import io
+import json
+import socket
+import struct
+import threading
+import time
+import urllib.error
+import urllib.request
+import wave
+from email.message import Message
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
+from typing import Any, cast
+from unittest.mock import MagicMock
+
+import pytest
+from pydantic import SecretStr
+
+import tapeback._lemonade as lemon
+from tapeback._lemonade import (
+    _MAX_CUMULATIVE_SEGMENTS,
+    _MAX_CUMULATIVE_TEXT_CHARS,
+    _MAX_RESPONSE_SEGMENTS,
+    _MAX_SEGMENT_TEXT_CHARS,
+    DEDUP_POLICY_VERSION,
+    LemonadeAuthenticationError,
+    LemonadeBackend,
+    LemonadeCapabilityError,
+    LemonadeConfigurationError,
+    LemonadeError,
+    LemonadeInferenceTimeout,
+    LemonadeModelError,
+    LemonadeUnavailableError,
+    _MergeState,
+    _normalize_base_url,
+    _require_segments,
+    _utterance_tokens,
+    classify_http_failure,
+    normalize_language,
+)
+from tapeback._resume import resume_key
+from tapeback.models import Segment
+from tapeback.settings import Settings
+
+# --- helpers ---
+
+
+def write_wav(path: Path, duration_s: float, rate: int = 16000) -> None:
+    """A silent PCM WAV of the requested duration."""
+    with wave.open(str(path), "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(rate)
+        wf.writeframes(b"\x00\x00" * int(duration_s * rate))
+
+
+def lemon_settings(tmp_path, **overrides) -> Settings:
+    base: dict[str, Any] = {
+        "transcription_backend": "lemonade",
+        "resume_cache_dir": tmp_path / "resume",
+        # 1s chunks and 0.5s overlap make the chunk arithmetic easy to assert.
+        "lemonade_chunk_seconds": 1.0,
+        "lemonade_overlap_seconds": 0.5,
+    }
+    base.update(overrides)
+    return Settings(**base)
+
+
+def verbose_json(segments, language="english", probability=0.87) -> bytes:
+    payload = {
+        "text": " ".join(s.get("text", "") for s in segments),
+        "segments": segments,
+        "language": language,
+    }
+    if probability is not None:
+        payload["language_probability"] = probability
+    return json.dumps(payload).encode()
+
+
+def seg(start, end, text="hello"):
+    return {"start": start, "end": end, "text": text, "words": []}
+
+
+class _FakeResponse:
+    def __init__(self, body: bytes) -> None:
+        self._body = body
+        self._consumed = False
+
+    def read(self, n: int = -1) -> bytes:
+        # Emulate stream semantics: one read yields the body, further reads EOF.
+        if self._consumed:
+            return b""
+        self._consumed = True
+        return self._body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+
+def install_urlopen(monkeypatch, bodies):
+    """Queue responses (bytes or exception instances) for successive requests.
+
+    Routes BOTH HTTP paths tapeback can take — the default opener and the loopback
+    no-proxy opener — through the same fake, so tests intercept every request
+    regardless of which opener the backend chose.
+    """
+    calls: list[object] = []
+
+    def fake_urlopen(request, timeout=None):
+        calls.append(request)
+        index = min(len(calls) - 1, len(bodies) - 1)
+        body = bodies[index]
+        if isinstance(body, BaseException):
+            raise body
+        if isinstance(body, (bytes, bytearray)):
+            return _FakeResponse(body)
+        return body  # a pre-built response-like object, passed through
+
+    class _FakeOpener:
+        def open(self, request, timeout=None):
+            return fake_urlopen(request, timeout=timeout)
+
+    monkeypatch.setattr("tapeback._lemonade._DEFAULT_OPENER", _FakeOpener())
+    monkeypatch.setattr("tapeback._lemonade._NO_PROXY_OPENER", _FakeOpener())
+    return calls
+
+
+def http_error(status: int, payload: dict | str | bytes = "") -> urllib.error.HTTPError:
+    body = payload if isinstance(payload, bytes) else json.dumps(payload).encode()
+    return urllib.error.HTTPError("http://x", status, "err", Message(), io.BytesIO(body))
+
+
+# --- construction and configuration ---
+
+
+def test_invalid_url_is_a_configuration_error(tmp_path):
+    with pytest.raises(LemonadeConfigurationError) as exc_info:
+        LemonadeBackend(lemon_settings(tmp_path, lemonade_url="not-a-url"))
+    # The raw configured value is never echoed: it may carry credentials or
+    # terminal-control characters, and the message reaches status and run logs.
+    assert "not-a-url" not in str(exc_info.value)
+    with pytest.raises(LemonadeConfigurationError):
+        LemonadeBackend(lemon_settings(tmp_path, lemonade_url="ftp://host:1"))
+
+
+def test_invalid_url_error_never_echoes_credentials_or_control_characters(tmp_path):
+    """Raw input must not survive into the invalid-scheme/invalid-port messages."""
+    # Invalid scheme carrying a terminal-control sequence.
+    with pytest.raises(LemonadeConfigurationError) as exc_info:
+        LemonadeBackend(lemon_settings(tmp_path, lemonade_url="ht\x1b]0;pwned\x07tp://host"))
+    message = str(exc_info.value)
+    assert "\x1b" not in message
+    assert "\x07" not in message
+    # Invalid port: the fixed message carries neither the host nor the port value.
+    with pytest.raises(LemonadeConfigurationError) as exc_info:
+        LemonadeBackend(lemon_settings(tmp_path, lemonade_url="https://host:99999"))
+    assert "99999" not in str(exc_info.value)
+    # The userinfo rejection never contained the raw URL, but pin it down:
+    with pytest.raises(LemonadeConfigurationError) as exc_info:
+        LemonadeBackend(lemon_settings(tmp_path, lemonade_url="http://alice:pw@127.0.0.1:13305"))
+    assert "alice" not in str(exc_info.value) and "pw@" not in str(exc_info.value)
+
+
+def test_malformed_api_key_is_a_configuration_error(tmp_path):
+    with pytest.raises(LemonadeConfigurationError):
+        LemonadeBackend(lemon_settings(tmp_path, lemonade_api_key=SecretStr("two tokens")))
+    with pytest.raises(LemonadeConfigurationError):
+        LemonadeBackend(lemon_settings(tmp_path, lemonade_api_key=SecretStr("bad\ntoken")))
+
+
+def test_describe_names_model_and_endpoint(tmp_path):
+    backend = LemonadeBackend(lemon_settings(tmp_path))
+    described = backend.describe()
+    assert "Whisper-Large-v3-Turbo" in described
+    assert "127.0.0.1:13305" in described
+
+
+# --- cache fingerprint ---
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("lemonade_url", "http://127.0.0.1:9999"),
+        ("lemonade_model", "Whisper-Small"),
+        ("language", "de"),
+        ("lemonade_chunk_seconds", 120.0),
+        ("lemonade_overlap_seconds", 0.9),
+        ("gate_mic_silence", False),
+    ],
+)
+def test_fingerprint_changes_with_every_output_shaping_setting(tmp_path, field, value):
+    backend = LemonadeBackend(lemon_settings(tmp_path))
+    other = LemonadeBackend(lemon_settings(tmp_path, **{field: value}))
+    assert backend.cache_fingerprint() != other.cache_fingerprint()
+
+
+def test_fingerprint_excludes_secrets_timeouts_and_hardware(tmp_path):
+    """Nothing that fails to change transcription output may invalidate the cache."""
+    plain = LemonadeBackend(lemon_settings(tmp_path))
+    with_key = LemonadeBackend(lemon_settings(tmp_path, lemonade_api_key=SecretStr("token-abc")))
+    with_timeout = LemonadeBackend(lemon_settings(tmp_path, lemonade_timeout_seconds=1.0))
+    assert plain.cache_fingerprint() == with_key.cache_fingerprint()
+    assert plain.cache_fingerprint() == with_timeout.cache_fingerprint()
+    # And the key itself is nowhere in the fingerprint material.
+    assert "token-abc" not in plain.cache_fingerprint()
+
+
+def test_fingerprint_tracks_the_dedup_policy_version(tmp_path, monkeypatch):
+    backend = LemonadeBackend(lemon_settings(tmp_path))
+    before = backend.cache_fingerprint()
+    monkeypatch.setattr("tapeback._lemonade.DEDUP_POLICY_VERSION", DEDUP_POLICY_VERSION + 1)
+    assert backend.cache_fingerprint() != before
+
+
+def test_token_bearing_cache_entries_are_not_reused_after_policy_bump(tmp_path, monkeypatch):
+    wav = tmp_path / "a.wav"
+    write_wav(wav, 0.5)
+    backend = LemonadeBackend(lemon_settings(tmp_path))
+    current = backend.cache_fingerprint()
+    monkeypatch.setattr("tapeback._lemonade.DEDUP_POLICY_VERSION", DEDUP_POLICY_VERSION - 1)
+    stale = backend.cache_fingerprint()
+
+    assert resume_key(wav, stale, "transcribe mic") != resume_key(wav, current, "transcribe mic")
+
+
+def test_url_normalization_makes_trailing_slash_equivalent(tmp_path):
+    backend = LemonadeBackend(lemon_settings(tmp_path, lemonade_url="http://127.0.0.1:1/"))
+    other = LemonadeBackend(lemon_settings(tmp_path, lemonade_url="http://127.0.0.1:1"))
+    assert backend.cache_fingerprint() == other.cache_fingerprint()
+
+
+# --- requests ---
+
+
+def test_multipart_request_carries_model_format_and_file(tmp_path, monkeypatch):
+    wav = tmp_path / "a.wav"
+    write_wav(wav, 0.5)
+    calls = install_urlopen(monkeypatch, [verbose_json([seg(0.0, 0.4)])])
+
+    LemonadeBackend(lemon_settings(tmp_path)).transcribe(wav)
+
+    request = calls[0]
+    assert request.full_url == "http://127.0.0.1:13305/v1/audio/transcriptions"
+    body = request.data.decode("utf-8", errors="replace")
+    assert 'name="model"' in body and "Whisper-Large-v3-Turbo" in body
+    assert 'name="response_format"' in body and "verbose_json" in body
+    assert 'name="file"' in body and 'filename="audio.wav"' in body
+    assert request.headers["Content-type"].startswith("multipart/form-data")
+
+
+def test_bearer_token_sent_only_when_configured(tmp_path, monkeypatch):
+    wav = tmp_path / "a.wav"
+    write_wav(wav, 0.5)
+
+    calls = install_urlopen(monkeypatch, [verbose_json([seg(0.0, 0.4)])])
+    LemonadeBackend(lemon_settings(tmp_path)).transcribe(wav)
+    assert "Authorization" not in calls[0].headers
+
+    calls = install_urlopen(monkeypatch, [verbose_json([seg(0.0, 0.4)])])
+    backend = LemonadeBackend(lemon_settings(tmp_path, lemonade_api_key=SecretStr("tok-1")))
+    backend.transcribe(wav)
+    assert calls[0].headers["Authorization"] == "Bearer tok-1"
+
+
+def test_no_hotwords_or_prompt_field_is_sent(tmp_path, monkeypatch):
+    """Tapeback's hotwords are a faster-whisper decoder bias, not a portable knob."""
+    wav = tmp_path / "a.wav"
+    write_wav(wav, 0.5)
+    calls = install_urlopen(monkeypatch, [verbose_json([seg(0.0, 0.4)])])
+    backend = LemonadeBackend(lemon_settings(tmp_path, hotwords="tapeback, Acme"))
+    backend.transcribe(wav)
+    assert "prompt" not in calls[0].data.decode("utf-8", errors="replace")
+
+
+# --- chunking, offsets, dedup, progress ---
+
+
+def test_long_wav_is_chunked_with_overlap_and_shifted_timestamps(tmp_path, monkeypatch):
+    wav = tmp_path / "long.wav"
+    write_wav(wav, 2.5)  # 1s chunks, 0.5s overlap -> 3 chunks
+    responses = [
+        verbose_json([seg(0.0, 0.9, "one")]),
+        verbose_json([seg(0.0, 0.2, "overlap-echo"), seg(0.6, 1.4, "two")]),
+        verbose_json([seg(0.5, 0.6, "three")]),
+    ]
+    calls = install_urlopen(monkeypatch, responses)
+
+    segments, info = LemonadeBackend(lemon_settings(tmp_path)).transcribe(wav)
+
+    assert len(calls) == 3
+    # A different utterance in the shared audio is retained.  Dedup compares
+    # neighboring candidates by overlap *and* normalized transcript text rather
+    # than dropping every segment whose midpoint happens to fall before the core.
+    assert [s.text for s in segments] == ["one", "overlap-echo", "two", "three"]
+    # File-relative times: chunk 2's 0.6..1.4 becomes 1.1..1.9, chunk 3's 0.0 becomes 2.0.
+    assert segments[2].start == pytest.approx(1.1)
+    assert segments[2].end == pytest.approx(1.9)
+    assert segments[3].start == pytest.approx(2.0)
+    assert info["duration"] == pytest.approx(2.5)
+    assert info["partial"] is False
+
+
+def test_chunk_requests_carry_the_pinned_language_after_detection(tmp_path, monkeypatch):
+    wav = tmp_path / "long.wav"
+    write_wav(wav, 2.5)
+    responses = [
+        verbose_json([seg(0.0, 0.9)], language="russian"),
+        verbose_json([seg(0.6, 1.4)], language="whichever"),
+        verbose_json([seg(0.0, 0.1)], language="whichever"),
+    ]
+    calls = install_urlopen(monkeypatch, responses)
+
+    _segments, info = LemonadeBackend(lemon_settings(tmp_path)).transcribe(wav)
+
+    first_body = calls[0].data.decode("utf-8", errors="replace")
+    later_body = calls[1].data.decode("utf-8", errors="replace")
+    assert 'name="language"' not in first_body  # detection is the server's job
+    assert 'name="language"' in later_body and "ru" in later_body
+    assert info["language"] == "ru"
+
+
+def test_empty_leading_chunks_are_ignored_for_language_detection(tmp_path, monkeypatch):
+    wav = tmp_path / "long.wav"
+    write_wav(wav, 2.5)
+    responses = [
+        verbose_json([], language="", probability=None),
+        verbose_json([seg(0.6, 1.4)], language="English"),
+        verbose_json([seg(0.5, 0.6)], language="whatever"),
+    ]
+    calls = install_urlopen(monkeypatch, responses)
+
+    segments, info = LemonadeBackend(lemon_settings(tmp_path)).transcribe(wav)
+
+    assert 'name="language"' not in calls[0].data.decode(errors="replace")
+    assert "en" in calls[2].data.decode(errors="replace")
+    assert info["language"] == "en"
+    assert [s.text for s in segments] == ["hello", "hello"]
+
+
+def test_explicit_language_is_sent_on_every_request(tmp_path, monkeypatch):
+    wav = tmp_path / "long.wav"
+    write_wav(wav, 2.5)
+    responses = [verbose_json([seg(0.0, 0.9)], language="de") for _ in range(3)]
+    calls = install_urlopen(monkeypatch, responses)
+
+    LemonadeBackend(lemon_settings(tmp_path, language="de")).transcribe(wav)
+
+    assert all('name="language"' in c.data.decode(errors="replace") for c in calls)
+
+
+def test_language_probability_only_when_validly_supplied(tmp_path, monkeypatch):
+    wav = tmp_path / "a.wav"
+    write_wav(wav, 0.5)
+
+    install_urlopen(monkeypatch, [verbose_json([seg(0.0, 0.4)])])
+    _, info = LemonadeBackend(lemon_settings(tmp_path)).transcribe(wav)
+    assert info["language_probability"] == pytest.approx(0.87)
+
+    install_urlopen(monkeypatch, [verbose_json([seg(0.0, 0.4)], probability=None)])
+    _, info = LemonadeBackend(lemon_settings(tmp_path)).transcribe(wav)
+    assert "language_probability" not in info
+
+    install_urlopen(monkeypatch, [verbose_json([seg(0.0, 0.4)], probability=7.5)])
+    _, info = LemonadeBackend(lemon_settings(tmp_path)).transcribe(wav)
+    assert "language_probability" not in info
+
+    # Some Lemonade versions report the probability under detected_language_probability.
+    alt = {
+        "text": "hello",
+        "segments": [seg(0.0, 0.4)],
+        "language": "english",
+        "detected_language_probability": 0.42,
+    }
+    install_urlopen(monkeypatch, [json.dumps(alt).encode()])
+    _, info = LemonadeBackend(lemon_settings(tmp_path)).transcribe(wav)
+    assert info["language_probability"] == pytest.approx(0.42)
+
+
+def test_bpe_tokens_are_ignored_and_segment_text_is_preserved(tmp_path, monkeypatch):
+    """Lemonade's BPE token stream is not a lexical word-timing interface."""
+    wav = tmp_path / "a.wav"
+    write_wav(wav, 0.5)
+    text = "I'm transcribing Lemonade, timer."
+    payload = {
+        "text": text,
+        "language": "english",
+        "segments": [
+            {
+                "start": 0.0,
+                "end": 0.47,
+                "text": text,
+                "words": [
+                    {"start": 0.0, "end": 0.1, "word": " trans"},
+                    {"start": 9_999, "end": -1, "word": "cribing"},
+                    {"start": "unknown", "word": " I"},
+                    {"word": "'m"},
+                    {"word": ","},
+                    {"word": " timer"},
+                    {"word": "."},
+                ],
+            }
+        ],
+    }
+    install_urlopen(monkeypatch, [json.dumps(payload).encode()])
+
+    segments, _info = LemonadeBackend(lemon_settings(tmp_path)).transcribe(wav)
+
+    assert [(s.start, s.end, s.text, s.words) for s in segments] == [(0.0, 0.47, text, None)]
+
+
+def test_interrupt_keeps_completed_chunks_as_partial(tmp_path, monkeypatch):
+    """Ctrl+C mid-chunks: keep what finished, mark partial, never raise."""
+    wav = tmp_path / "long.wav"
+    write_wav(wav, 2.5)
+    bodies = [verbose_json([seg(0.0, 0.9, "one")]), KeyboardInterrupt()]
+    install_urlopen(monkeypatch, bodies)
+
+    segments, info = LemonadeBackend(lemon_settings(tmp_path)).transcribe(wav)
+
+    assert [s.text for s in segments] == ["one"]
+    assert info["partial"] is True
+    # The interrupt lands inside the chunk loop; the duration must still be the
+    # recording's real length, derived from the WAV header before the loop.
+    assert info["duration"] == pytest.approx(2.5)
+
+
+# --- text-only / capability ---
+
+
+def test_flm_style_text_only_response_is_rejected(tmp_path, monkeypatch):
+    wav = tmp_path / "a.wav"
+    write_wav(wav, 0.5)
+    install_urlopen(monkeypatch, [json.dumps({"text": "just prose, no timestamps"}).encode()])
+
+    with pytest.raises(LemonadeCapabilityError):
+        LemonadeBackend(lemon_settings(tmp_path)).transcribe(wav)
+
+
+def test_non_json_response_is_a_capability_error(tmp_path, monkeypatch):
+    wav = tmp_path / "a.wav"
+    write_wav(wav, 0.5)
+    install_urlopen(monkeypatch, [b"compact plain-text answer"])
+
+    with pytest.raises(LemonadeCapabilityError):
+        LemonadeBackend(lemon_settings(tmp_path)).transcribe(wav)
+
+
+def test_empty_response_is_silence_not_an_error(tmp_path, monkeypatch):
+    wav = tmp_path / "a.wav"
+    write_wav(wav, 0.5)
+    install_urlopen(monkeypatch, [verbose_json([])])
+
+    segments, info = LemonadeBackend(lemon_settings(tmp_path)).transcribe(wav)
+    assert segments == []
+    assert info["partial"] is False
+
+
+def test_recursion_error_on_transcription_is_a_capability_error(tmp_path, monkeypatch):
+    """RecursionError during JSON parsing must raise LemonadeCapabilityError."""
+    wav = tmp_path / "a.wav"
+    write_wav(wav, 0.5)
+    install_urlopen(monkeypatch, [b'{"raw": "test"}'])
+
+    def fake_loads(*args, **kwargs):
+        raise RecursionError("maximum recursion depth exceeded")
+
+    monkeypatch.setattr("json.loads", fake_loads)
+
+    with pytest.raises(LemonadeCapabilityError):
+        LemonadeBackend(lemon_settings(tmp_path)).transcribe(wav)
+
+
+def test_recursion_error_on_http_error_falls_back_to_status_classification(tmp_path, monkeypatch):
+    """RecursionError during error JSON parsing must fall back to status classification."""
+    wav = tmp_path / "a.wav"
+    write_wav(wav, 0.5)
+    install_urlopen(monkeypatch, [http_error(500, b"{}")])
+
+    def fake_loads(*args, **kwargs):
+        raise RecursionError("maximum recursion depth exceeded")
+
+    monkeypatch.setattr("json.loads", fake_loads)
+
+    with pytest.raises(LemonadeUnavailableError):
+        LemonadeBackend(lemon_settings(tmp_path)).transcribe(wav)
+
+
+def test_recursion_error_on_diagnostics_returns_raw_dict(tmp_path, monkeypatch):
+    """RecursionError during diagnostics JSON parsing must return raw dictionary."""
+    install_urlopen(monkeypatch, [b'{"health": "ok"}'])
+
+    def fake_loads(*args, **kwargs):
+        raise RecursionError("maximum recursion depth exceeded")
+
+    monkeypatch.setattr("json.loads", fake_loads)
+    backend = LemonadeBackend(lemon_settings(tmp_path))
+    assert backend.health() == {"raw": '{"health": "ok"}'}
+
+
+# --- structured error classification ---
+
+
+def test_404_missing_endpoint_is_a_capability_error():
+    err = classify_http_failure(404, {"detail": "Not Found"})
+    assert isinstance(err, LemonadeCapabilityError)
+
+
+def test_404_missing_model_is_a_model_error():
+    body = {
+        "error": {
+            "type": "invalid_request_error",
+            "code": "model_not_found",
+            "message": "no such model",
+        }
+    }
+    err = classify_http_failure(404, body)
+    assert isinstance(err, LemonadeModelError)
+
+
+def test_400_rejected_model_is_a_model_error():
+    err = classify_http_failure(
+        400, {"error": {"type": "invalid_request_error", "message": "Model Bogus is not available"}}
+    )
+    assert isinstance(err, LemonadeModelError)
+
+
+def test_400_client_invalid_request_is_a_configuration_error():
+    err = classify_http_failure(
+        400, {"error": {"type": "invalid_request_error", "message": "field x is required"}}
+    )
+    assert isinstance(err, LemonadeConfigurationError)
+
+
+@pytest.mark.parametrize("status", [401, 403])
+def test_auth_statuses_never_fall_back(status):
+    err = classify_http_failure(status, {"detail": "unauthorized"})
+    assert isinstance(err, LemonadeAuthenticationError)
+
+
+def test_auth_error_code_wins_over_status():
+    err = classify_http_failure(400, {"error": {"code": "invalid_api_key", "message": "bad key"}})
+    assert isinstance(err, LemonadeAuthenticationError)
+
+
+def test_rate_limit_and_server_failures_are_unavailable():
+    assert isinstance(classify_http_failure(429, {}), LemonadeUnavailableError)
+    assert isinstance(classify_http_failure(500, {}), LemonadeUnavailableError)
+    assert isinstance(classify_http_failure(503, {}), LemonadeUnavailableError)
+
+
+def test_5xx_model_load_failure_is_a_model_error():
+    err = classify_http_failure(
+        500, {"error": {"message": "failed to load model Whisper-Large-v3-Turbo"}}
+    )
+    assert isinstance(err, LemonadeModelError)
+
+
+def test_connection_refused_is_unavailable(tmp_path, monkeypatch):
+    wav = tmp_path / "a.wav"
+    write_wav(wav, 0.5)
+    install_urlopen(monkeypatch, [urllib.error.URLError(ConnectionRefusedError(111))])
+
+    with pytest.raises(LemonadeUnavailableError):
+        LemonadeBackend(lemon_settings(tmp_path)).transcribe(wav)
+
+
+def test_read_timeout_never_resubmits(tmp_path, monkeypatch):
+    """Read/inference timeout -> InferenceTimeout, one request only, no retry."""
+    wav = tmp_path / "long.wav"
+    write_wav(wav, 2.5)
+    calls = install_urlopen(monkeypatch, [TimeoutError("read timed out")])
+
+    with pytest.raises(LemonadeInferenceTimeout):
+        LemonadeBackend(lemon_settings(tmp_path)).transcribe(wav)
+
+    assert len(calls) == 1
+
+
+def test_connect_timeout_is_unavailable(tmp_path, monkeypatch):
+    wav = tmp_path / "a.wav"
+    write_wav(wav, 0.5)
+    install_urlopen(monkeypatch, [urllib.error.URLError(TimeoutError("connect timed out"))])
+
+    with pytest.raises(LemonadeUnavailableError):
+        LemonadeBackend(lemon_settings(tmp_path)).transcribe(wav)
+
+
+# --- language normalization ---
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        ("russian", "ru"),
+        ("English", "en"),
+        ("  RU ", "ru"),
+        ("zh-cn", "zh"),
+        ("de", "de"),
+        ("klingon", "klingon"),  # never invented, passed through
+    ],
+)
+def test_normalize_language(raw, expected):
+    assert normalize_language(raw) == expected
+
+
+# --- diagnostics ---
+
+
+def test_health_and_system_info_are_gets_with_auth(tmp_path, monkeypatch):
+    calls = install_urlopen(monkeypatch, [b'{"status": "ok"}', b'{"os": "whatever"}'])
+    backend = LemonadeBackend(lemon_settings(tmp_path, lemonade_api_key=SecretStr("tok")))
+
+    assert backend.health() == {"status": "ok"}
+    assert backend.system_info() == {"os": "whatever"}
+
+    assert calls[0].full_url.endswith("/v1/health")
+    assert calls[1].full_url.endswith("/v1/system-info")
+    assert all(c.headers["Authorization"] == "Bearer tok" for c in calls)
+
+
+# --- transport protection ---
+
+
+def test_plain_http_remote_host_is_rejected(tmp_path):
+    """Plaintext HTTP to a remote host would expose audio and credentials."""
+    with pytest.raises(LemonadeConfigurationError) as excinfo:
+        LemonadeBackend(lemon_settings(tmp_path, lemonade_url="http://remote-host:8000"))
+    assert "https" in str(excinfo.value)
+
+
+def test_https_remote_host_is_accepted(tmp_path):
+    backend = LemonadeBackend(lemon_settings(tmp_path, lemonade_url="https://remote-host:8000"))
+    assert backend._base_url == "https://remote-host:8000"
+    assert backend._bypass_proxies is False
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://127.0.0.1:13305",
+        "http://localhost:13305",
+        "http://127.7.0.1:13305",
+        "http://[::1]:13305",
+        "http://LOCALHOST:13305",
+    ],
+)
+def test_loopback_http_is_accepted_and_bypasses_proxies(tmp_path, url):
+    backend = LemonadeBackend(lemon_settings(tmp_path, lemonade_url=url))
+    assert backend._bypass_proxies is True
+
+
+def test_loopback_requests_bypass_proxy_configuration(tmp_path, monkeypatch):
+    """An inherited proxy must never see loopback traffic.
+
+    getproxies() raises if consulted: the no-proxy opener never asks for the
+    process-wide proxy configuration, so a transcription against 127.0.0.1 can
+    only succeed when the proxy layer is truly bypassed.
+    """
+    wav = tmp_path / "a.wav"
+    write_wav(wav, 0.5)
+
+    def no_proxies_here():
+        raise AssertionError("loopback request consulted the proxy configuration")
+
+    monkeypatch.setattr("urllib.request.getproxies", no_proxies_here)
+    calls = install_urlopen(monkeypatch, [verbose_json([seg(0.0, 0.4)])])
+
+    LemonadeBackend(lemon_settings(tmp_path)).transcribe(wav)
+
+    assert len(calls) == 1
+
+
+def test_remote_https_keeps_default_proxy_path(tmp_path, monkeypatch):
+    """Non-loopback HTTPS goes through urllib.request.urlopen (system proxies allowed)."""
+    wav = tmp_path / "a.wav"
+    write_wav(wav, 0.5)
+    calls = install_urlopen(monkeypatch, [verbose_json([seg(0.0, 0.4)])])
+    backend = LemonadeBackend(lemon_settings(tmp_path, lemonade_url="https://example.test"))
+
+    backend.transcribe(wav)
+
+    assert backend._bypass_proxies is False
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize(
+    "proxy_url",
+    ["https://proxy-secret@proxy.test:8443", "proxy-secret@proxy.test:8080"],
+)
+def test_https_and_schemeless_proxies_fail_closed_without_echo(proxy_url, monkeypatch):
+    """Unsupported proxy forms are rejected before connection or payload transmission."""
+    monkeypatch.setattr("urllib.request.proxy_bypass", lambda _host: False)
+    request = urllib.request.Request(
+        "https://origin.test/v1/audio/transcriptions",
+        data=b"private-wave-data",
+        headers={"Authorization": "Bearer origin-token"},
+    )
+
+    with pytest.raises(LemonadeConfigurationError) as exc_info:
+        lemon._SafeProxyHandler({}).proxy_open(request, proxy_url, "https")
+
+    message = str(exc_info.value)
+    assert "proxy-secret" not in message
+    assert request.host == "origin.test"
+    assert vars(request)["_tunnel_host"] is None
+
+
+def test_explicit_http_proxy_is_configured_as_a_connect_tunnel(monkeypatch):
+    monkeypatch.setattr("urllib.request.proxy_bypass", lambda _host: False)
+    request = urllib.request.Request("https://origin.test/v1/health")
+
+    result = lemon._SafeProxyHandler({}).proxy_open(
+        request, "http://proxy-user:proxy-pass@proxy.test:8080", "https"
+    )
+
+    assert result is None
+    assert request.host == "proxy.test:8080"
+    assert vars(request)["_tunnel_host"] == "origin.test"
+    assert request.headers["Proxy-authorization"].startswith("Basic ")
+
+
+def test_https_proxy_connect_keeps_origin_secrets_inside_tunnel(monkeypatch):
+    """The raw proxy sees CONNECT auth only; origin auth/audio follow origin TLS."""
+
+    class _ProxySocket:
+        def __init__(self):
+            self.sent = bytearray()
+            self.closed = False
+
+        def settimeout(self, _timeout):
+            pass
+
+        def sendall(self, data):
+            self.sent.extend(data)
+
+        def makefile(self, *args, **kwargs):
+            return io.BytesIO(b"HTTP/1.0 200 Connection established\r\n\r\n")
+
+        def close(self):
+            self.closed = True
+
+    class _OriginTLSSocket(_ProxySocket):
+        pass
+
+    class _TLSContext:
+        def __init__(self, tls_socket):
+            self.tls_socket = tls_socket
+            self.server_hostname = None
+            self.wrapped_socket = None
+
+        def wrap_socket(self, sock, *, server_hostname):
+            self.wrapped_socket = sock
+            self.server_hostname = server_hostname
+            return self.tls_socket
+
+    proxy_socket = _ProxySocket()
+    origin_socket = _OriginTLSSocket()
+    context = _TLSContext(origin_socket)
+    monkeypatch.setattr(lemon, "_create_deadline_connection", lambda *args: proxy_socket)
+
+    connection = lemon._DeadlineHTTPSConnection(
+        "proxy.test:8080", deadline=time.monotonic() + 5, context=context
+    )
+    connection.set_tunnel(
+        "origin.test",
+        443,
+        headers={"Proxy-Authorization": "Basic proxy-credential"},
+    )
+    connection.connect()
+    connection.request(
+        "POST",
+        "/v1/audio/transcriptions",
+        body=b"private-wave-data",
+        headers={"Authorization": "Bearer origin-token"},
+    )
+
+    proxy_bytes = bytes(proxy_socket.sent)
+    origin_bytes = bytes(origin_socket.sent)
+    assert b"CONNECT origin.test:443" in proxy_bytes
+    assert b"Proxy-Authorization: Basic proxy-credential" in proxy_bytes
+    assert b"origin-token" not in proxy_bytes
+    assert b"private-wave-data" not in proxy_bytes
+    assert context.server_hostname == "origin.test"
+    assert context.wrapped_socket is proxy_socket
+    assert b"Authorization: Bearer origin-token" in origin_bytes
+    assert b"private-wave-data" in origin_bytes
+
+
+# --- response size cap ---
+
+
+class _StreamingResponse:
+    """A response with no Content-Length that yields data in 1 KiB reads."""
+
+    def __init__(self, size: int) -> None:
+        self._remaining = size
+
+    def read(self, n: int = -1) -> bytes:
+        if self._remaining <= 0:
+            return b""
+        take = min(1024, self._remaining)
+        if n is not None and 0 < n < take:
+            take = n
+        self._remaining -= take
+        return b"x" * take
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+
+class _HugeLengthResponse:
+    """A response declaring a Content-Length far over the cap; reading it is a bug."""
+
+    def __init__(self) -> None:
+        self.headers = Message()
+        self.headers["Content-Length"] = "999999999"
+
+    def read(self, n: int = -1) -> bytes:  # pragma: no cover — must never be called
+        raise AssertionError("an over-limit Content-Length must not be read")
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+
+def test_oversized_content_length_is_refused_unread(tmp_path, monkeypatch):
+    wav = tmp_path / "a.wav"
+    write_wav(wav, 0.5)
+    monkeypatch.setattr(lemon, "_MAX_RESPONSE_BYTES", 1024)
+    install_urlopen(monkeypatch, [_HugeLengthResponse()])
+
+    with pytest.raises(LemonadeUnavailableError) as excinfo:
+        LemonadeBackend(lemon_settings(tmp_path)).transcribe(wav)
+
+    assert "response cap" in str(excinfo.value)
+
+
+def test_streamed_oversized_response_is_refused(tmp_path, monkeypatch):
+    wav = tmp_path / "a.wav"
+    write_wav(wav, 0.5)
+    monkeypatch.setattr(lemon, "_MAX_RESPONSE_BYTES", 1024)
+    install_urlopen(monkeypatch, [_StreamingResponse(5000)])
+
+    with pytest.raises(LemonadeUnavailableError):
+        LemonadeBackend(lemon_settings(tmp_path)).transcribe(wav)
+
+
+def test_streamed_response_reads_at_most_limit_plus_one(tmp_path, monkeypatch):
+    """The read is capped: a hostile endpoint cannot stream unbounded bytes in."""
+    wav = tmp_path / "a.wav"
+    write_wav(wav, 0.5)
+    limit = 1024
+    monkeypatch.setattr(lemon, "_MAX_RESPONSE_BYTES", limit)
+    response = _StreamingResponse(10_000_000)
+    install_urlopen(monkeypatch, [response])
+
+    with pytest.raises(LemonadeUnavailableError):
+        LemonadeBackend(lemon_settings(tmp_path)).transcribe(wav)
+
+    # Only ~limit+1 bytes were pulled, never the whole 10 MB.
+    assert response._remaining >= 10_000_000 - limit - 2048
+
+
+def test_error_body_over_the_cap_is_classified_by_status(tmp_path, monkeypatch):
+    """A giant HTTP error page is not buffered; the status alone still classifies."""
+    wav = tmp_path / "a.wav"
+    write_wav(wav, 0.5)
+    monkeypatch.setattr(lemon, "_MAX_RESPONSE_BYTES", 1024)
+    install_urlopen(monkeypatch, [http_error(500, {"message": "x" * 5000})])
+
+    with pytest.raises(LemonadeUnavailableError):
+        LemonadeBackend(lemon_settings(tmp_path)).transcribe(wav)
+
+
+def test_response_just_under_the_cap_parses(tmp_path, monkeypatch):
+    wav = tmp_path / "a.wav"
+    write_wav(wav, 0.5)
+    monkeypatch.setattr(lemon, "_MAX_RESPONSE_BYTES", 65536)
+    install_urlopen(monkeypatch, [verbose_json([seg(0.0, 0.4)])])
+
+    segments, _info = LemonadeBackend(lemon_settings(tmp_path)).transcribe(wav)
+
+    assert [s.text for s in segments] == ["hello"]
+
+
+# --- request memory bounds ---
+
+
+def test_byte_cap_covers_overlap_and_framing(tmp_path, monkeypatch):
+    """Every uploaded chunk stays inside the byte cap even with overlap."""
+    wav = tmp_path / "wide.wav"
+    with wave.open(str(wav), "wb") as wf:
+        wf.setnchannels(8)
+        wf.setsampwidth(3)
+        wf.setframerate(16000)
+        wf.writeframes(b"\x00" * (8 * 3 * 16000 * 5))  # 5 s, 24 bytes per frame
+
+    monkeypatch.setattr(lemon, "_MAX_CHUNK_BYTES", 200_000)
+    monkeypatch.setattr(lemon, "_REQUEST_OVERHEAD_BYTES", 1_000)
+    calls = install_urlopen(monkeypatch, [verbose_json([seg(0.0, 0.4)])])
+
+    LemonadeBackend(
+        lemon_settings(tmp_path, lemonade_chunk_seconds=300.0, lemonade_overlap_seconds=0.2)
+    ).transcribe(wav)
+
+    assert len(calls) > 1  # the byte cap binds, not the duration target
+    for request in calls:
+        body = request.data
+        start = body.index(b"audio/wav\r\n\r\n") + len(b"audio/wav\r\n\r\n")
+        end = body.rindex(b"\r\n--tapeback-")
+        assert end - start <= lemon._MAX_CHUNK_BYTES
+
+
+def test_forged_frame_count_is_treated_as_non_chunkable(tmp_path, monkeypatch):
+    """A RIFF header declaring more data than the file holds must not be trusted."""
+    wav = tmp_path / "forged.wav"
+    write_wav(wav, 0.1)
+    data = bytearray(wav.read_bytes())
+    data[40:44] = struct.pack("<I", 0xFFFFFFF0)  # data-chunk size field
+    wav.write_bytes(bytes(data))
+
+    calls = install_urlopen(monkeypatch, [verbose_json([seg(0.0, 0.4)])])
+
+    LemonadeBackend(lemon_settings(tmp_path)).transcribe(wav)
+
+    assert len(calls) == 1  # one whole-file request, not one per phantom frame
+
+
+def test_oversized_non_wav_input_is_refused_not_buffered(tmp_path, monkeypatch):
+    """A non-chunkable input over the single-request cap falls back instead of OOM."""
+    big = tmp_path / "raw.bin"
+    big.write_bytes(b"\x00" * 4096)
+    monkeypatch.setattr(lemon, "_MAX_CHUNK_BYTES", 1024)
+    monkeypatch.setattr(lemon, "_REQUEST_OVERHEAD_BYTES", 128)
+    calls = install_urlopen(monkeypatch, [verbose_json([seg(0.0, 0.4)])])
+
+    with pytest.raises(LemonadeCapabilityError) as excinfo:
+        LemonadeBackend(lemon_settings(tmp_path)).transcribe(big)
+
+    assert "single-request cap (896 bytes)" in str(excinfo.value)
+    assert calls == []
+
+
+def test_non_wav_input_respects_request_overhead_reservation(tmp_path, monkeypatch):
+    """Non-chunkable inputs reserve _REQUEST_OVERHEAD_BYTES from _MAX_CHUNK_BYTES."""
+    max_chunk = 2048
+    overhead = 512
+    max_payload = max_chunk - overhead
+
+    monkeypatch.setattr(lemon, "_MAX_CHUNK_BYTES", max_chunk)
+    monkeypatch.setattr(lemon, "_REQUEST_OVERHEAD_BYTES", overhead)
+
+    # Payload exactly at max_payload is accepted
+    fit = tmp_path / "fit.bin"
+    fit.write_bytes(b"\x00" * max_payload)
+    calls = install_urlopen(monkeypatch, [verbose_json([seg(0.0, 0.4)])])
+    segments, _info = LemonadeBackend(lemon_settings(tmp_path)).transcribe(fit)
+    assert len(segments) == 1
+    assert len(calls) == 1
+
+    # Payload 1 byte over max_payload is refused before upload
+    too_big = tmp_path / "too_big.bin"
+    too_big.write_bytes(b"\x00" * (max_payload + 1))
+    calls_too_big = install_urlopen(monkeypatch, [verbose_json([seg(0.0, 0.4)])])
+    with pytest.raises(LemonadeCapabilityError):
+        LemonadeBackend(lemon_settings(tmp_path)).transcribe(too_big)
+    assert calls_too_big == []
+
+
+def test_too_many_chunks_is_a_configuration_error(tmp_path, monkeypatch):
+    """A chunk plan past the request-count limit is refused before any upload."""
+    wav = tmp_path / "long.wav"
+    write_wav(wav, 5.0)  # 1 s chunks -> 5 chunks
+    monkeypatch.setattr(lemon, "_MAX_CHUNKS", 3)
+    calls = install_urlopen(monkeypatch, [verbose_json([seg(0.0, 0.4)])])
+
+    with pytest.raises(LemonadeConfigurationError) as excinfo:
+        LemonadeBackend(lemon_settings(tmp_path)).transcribe(wav)
+
+    assert "TAPEBACK_LEMONADE_CHUNK_SECONDS" in str(excinfo.value)
+    assert calls == []
+
+
+# --- hostile numeric values in responses ---
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        verbose_json([seg(True, 1.0)]),  # booleans are not timestamps
+        verbose_json([seg(0.0, True)]),
+        verbose_json([seg(float("nan"), 1.0)]),  # NaN poisons sorting/arithmetic
+        verbose_json([seg(0.0, float("inf"))]),
+        verbose_json([seg(-0.5, 1.0)]),  # negative
+        verbose_json([seg(1.0, 0.5)]),  # end before start
+        json.dumps({"text": "hi", "segments": ["not-a-segment"], "language": "english"}).encode(),
+    ],
+)
+def test_hostile_numeric_response_is_a_capability_error(tmp_path, monkeypatch, payload):
+    """Booleans, NaN/inf, negatives, reversed spans, and out-of-range probabilities
+    must all fall back — never escape as ValueError, never poison the transcript
+    or the resume cache."""
+    wav = tmp_path / "a.wav"
+    write_wav(wav, 0.5)
+    install_urlopen(monkeypatch, [payload])
+
+    with pytest.raises(LemonadeCapabilityError):
+        LemonadeBackend(lemon_settings(tmp_path)).transcribe(wav)
+
+
+def test_segment_past_the_sent_audio_is_rejected(tmp_path, monkeypatch):
+    """A hostile server must not write timestamps beyond the recording."""
+    wav = tmp_path / "long.wav"
+    write_wav(wav, 2.5)  # 1 s chunks; chunk 0's audio is 1.0 s long
+    install_urlopen(monkeypatch, [verbose_json([seg(0.0, 5.0)])])
+
+    with pytest.raises(LemonadeCapabilityError) as excinfo:
+        LemonadeBackend(lemon_settings(tmp_path)).transcribe(wav)
+
+    assert "past the audio" in str(excinfo.value)
+
+
+def test_segment_at_chunk_edge_is_accepted(tmp_path, monkeypatch):
+    """Timestamps up to the chunk's own audio length (plus boundary slack) are legal."""
+    wav = tmp_path / "long.wav"
+    write_wav(wav, 2.5)
+    install_urlopen(
+        monkeypatch,
+        [
+            verbose_json([seg(0.0, 0.99), seg(1.5, 1.6)]),
+            verbose_json([seg(0.5, 1.4)]),
+            verbose_json([seg(0.0, 0.9)]),
+        ],
+    )
+
+    segments, _info = LemonadeBackend(lemon_settings(tmp_path)).transcribe(wav)
+
+    assert segments  # nothing rejected; dedup may drop overlap duplicates
+    assert all(s.end <= 2.5 for s in segments)
+
+
+# --- ambiguous error classification ---
+
+
+def test_500_permission_denied_loading_model_is_a_model_error():
+    """'permission' must not turn a model-loading failure into an auth error."""
+    err = classify_http_failure(
+        500,
+        {"error": {"message": "permission denied loading model Whisper-Large-v3-Turbo"}},
+    )
+    assert isinstance(err, LemonadeModelError)
+
+
+def test_model_author_not_found_is_not_an_auth_error():
+    """The substring 'auth' inside 'author' must not disable fallback."""
+    err = classify_http_failure(500, {"error": {"message": "model author not found"}})
+    assert isinstance(err, LemonadeModelError)
+
+
+def test_404_model_mention_is_a_model_error():
+    err = classify_http_failure(404, {"error": {"message": "model missing on this server"}})
+    assert isinstance(err, LemonadeModelError)
+
+
+def test_bare_404_is_a_capability_error():
+    assert isinstance(classify_http_failure(404, {}), LemonadeCapabilityError)
+
+
+def test_408_request_timeout_is_fallback_eligible():
+    """A proxy/server 408 is a transient availability failure, not a local bug."""
+    err = classify_http_failure(408, {"error": {"message": "upstream request timeout"}})
+    assert isinstance(err, LemonadeInferenceTimeout)
+
+
+def test_408_with_auth_phrasing_is_still_an_auth_error():
+    """Token-aware auth classification outranks 408 status semantics."""
+    err = classify_http_failure(408, {"error": {"message": "unauthorized"}})
+    assert isinstance(err, LemonadeAuthenticationError)
+
+
+def test_408_from_transcription_is_an_inference_timeout(tmp_path, monkeypatch):
+    """A 408 from the transcription endpoint reaches the fallback hierarchy."""
+    wav = tmp_path / "a.wav"
+    write_wav(wav, 0.5)
+    install_urlopen(monkeypatch, [http_error(408, {"error": {"message": "request timeout"}})])
+
+    with pytest.raises(LemonadeInferenceTimeout):
+        LemonadeBackend(lemon_settings(tmp_path)).transcribe(wav)
+
+
+def test_message_auth_phrases_are_token_aware():
+    err = classify_http_failure(400, {"error": {"message": "unauthorized request shape"}})
+    assert isinstance(err, LemonadeAuthenticationError)
+
+
+def test_structured_auth_code_wins_over_model_wording():
+    err = classify_http_failure(
+        400, {"error": {"code": "invalid_api_key", "message": "model rejected the key"}}
+    )
+    assert isinstance(err, LemonadeAuthenticationError)
+
+
+# --- structural URL validation ---
+
+
+def test_url_with_userinfo_is_rejected(tmp_path):
+    """Credentials embedded in the URL would be displayed by status."""
+    with pytest.raises(LemonadeConfigurationError) as exc_info:
+        LemonadeBackend(
+            lemon_settings(tmp_path, lemonade_url="http://alice:s3cret@127.0.0.1:13305")
+        )
+    # The embedded username/password must not survive into the message (fixed
+    # guidance text may mention the concept, never the actual values).
+    assert "alice" not in str(exc_info.value)
+    assert "s3cret" not in str(exc_info.value)
+
+
+def test_url_with_query_or_fragment_is_rejected(tmp_path):
+    """A base query/fragment is kept while the transcription path is appended."""
+    for bad in ("http://127.0.0.1:13305/?x=1", "http://127.0.0.1:13305/#frag"):
+        with pytest.raises(LemonadeConfigurationError):
+            LemonadeBackend(lemon_settings(tmp_path, lemonade_url=bad))
+
+
+def test_url_is_normalized_structurally(tmp_path):
+    backend = LemonadeBackend(lemon_settings(tmp_path, lemonade_url="HTTP://LocalHost:13305/"))
+    assert backend.base_url == "http://localhost:13305"
+
+
+def test_url_default_port_is_dropped(tmp_path):
+    https_backend = LemonadeBackend(
+        lemon_settings(tmp_path, lemonade_url="https://example.com:443")
+    )
+    assert https_backend.base_url == "https://example.com"
+    http_backend = LemonadeBackend(lemon_settings(tmp_path, lemonade_url="http://127.0.0.1:80"))
+    assert http_backend.base_url == "http://127.0.0.1"
+
+
+# --- opaque multipart filename ---
+
+
+def test_upload_uses_opaque_filename(tmp_path, monkeypatch):
+    """A crafted source filename must never reach the MIME part headers."""
+    wav = tmp_path / 'we"ird\nname.wav'
+    write_wav(wav, 0.5)
+    calls = install_urlopen(monkeypatch, [verbose_json([seg(0.0, 0.4)])])
+
+    LemonadeBackend(lemon_settings(tmp_path)).transcribe(wav)
+
+    body = calls[0].data
+    assert b'filename="audio.wav"' in body
+    assert b'we"ird' not in body
+
+
+def test_multipart_field_with_header_characters_is_rejected(tmp_path):
+    """Field values go into MIME headers; quotes and CRLF must never pass."""
+    with pytest.raises(LemonadeConfigurationError):
+        lemon._multipart_body([("model", 'bad"model')], "file", "audio.wav", "audio/wav", b"x")
+    with pytest.raises(LemonadeConfigurationError):
+        lemon._multipart_body([("model", "bad\r\nmodel")], "file", "audio.wav", "audio/wav", b"x")
+
+
+# --- diagnostics timeout ---
+
+
+def test_diagnostics_use_the_short_dedicated_timeout(tmp_path, monkeypatch):
+    """Health/system-info probes must never inherit the 600 s inference timeout."""
+    seen: list[float] = []
+
+    def fake_open(request, timeout, *, bypass_proxies):
+        seen.append(timeout)
+        return _FakeResponse(b"{}")
+
+    monkeypatch.setattr(lemon, "_open_url", fake_open)
+    backend = LemonadeBackend(
+        lemon_settings(
+            tmp_path,
+            lemonade_timeout_seconds=600.0,
+            lemonade_diagnostics_timeout_seconds=7.5,
+        )
+    )
+
+    backend.health()
+    backend.system_info()
+
+    # The open receives the remaining budget, which at open time is the full
+    # timeout up to clock precision.
+    assert seen == [pytest.approx(7.5), pytest.approx(7.5)]
+
+
+def test_transcription_still_uses_the_inference_timeout(tmp_path, monkeypatch):
+    seen: list[float] = []
+
+    def fake_open(request, timeout, *, bypass_proxies):
+        seen.append(timeout)
+        return _FakeResponse(verbose_json([seg(0.0, 0.4)]))
+
+    monkeypatch.setattr(lemon, "_open_url", fake_open)
+    wav = tmp_path / "a.wav"
+    write_wav(wav, 0.5)
+    backend = LemonadeBackend(lemon_settings(tmp_path, lemonade_timeout_seconds=600.0))
+
+    backend.transcribe(wav)
+
+    assert seen == [pytest.approx(600.0)]
+
+
+# --- total deadline enforcement ---
+
+
+def test_dns_resolution_is_bounded_by_total_deadline(monkeypatch):
+    release = threading.Event()
+    monkeypatch.setattr(lemon, "_DNS_RESOLVER_SLOTS", threading.BoundedSemaphore(2))
+    monkeypatch.setattr(lemon.socket, "getaddrinfo", lambda *args: release.wait(timeout=2))
+
+    started = time.monotonic()
+    try:
+        with pytest.raises(TimeoutError, match="deadline during DNS"):
+            lemon._resolve_with_deadline("stalled.test", 443, time.monotonic() + 0.08)
+    finally:
+        release.set()
+
+    assert time.monotonic() - started < 0.3
+
+
+def test_stalled_dns_workers_are_resource_bounded(monkeypatch):
+    release = threading.Event()
+    calls = 0
+    calls_lock = threading.Lock()
+    monkeypatch.setattr(lemon, "_DNS_RESOLVER_SLOTS", threading.BoundedSemaphore(2))
+
+    def stalled_getaddrinfo(*args):
+        nonlocal calls
+        with calls_lock:
+            calls += 1
+        release.wait(timeout=2)
+        return []
+
+    monkeypatch.setattr(lemon.socket, "getaddrinfo", stalled_getaddrinfo)
+    try:
+        for _ in range(3):
+            with pytest.raises(TimeoutError):
+                lemon._resolve_with_deadline("stalled.test", 443, time.monotonic() + 0.05)
+    finally:
+        release.set()
+
+    assert calls == 2
+
+
+def test_connection_retries_resolved_addresses_with_remaining_budget(monkeypatch):
+    addresses = [
+        (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("192.0.2.1", 443)),
+        (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("192.0.2.2", 443)),
+    ]
+    monkeypatch.setattr(lemon, "_resolve_with_deadline", lambda *args: addresses)
+
+    sockets = [MagicMock(), MagicMock()]
+    sockets[0].connect.side_effect = OSError("first address failed")
+    monkeypatch.setattr(lemon.socket, "socket", lambda *args: sockets.pop(0))
+
+    connected = lemon._create_deadline_connection(
+        ("origin.test", 443), time.monotonic() + 5, ("127.0.0.1", 0)
+    )
+
+    connected_mock = cast(Any, connected)
+    assert connected_mock.connect.call_args.args == (("192.0.2.2", 443),)
+    assert connected_mock.bind.call_args.args == (("127.0.0.1", 0),)
+
+
+class _FakeSocket:
+    def __init__(self) -> None:
+        self.timeouts: list[float] = []
+
+    def settimeout(self, value: float) -> None:
+        self.timeouts.append(value)
+
+
+class _FakeRaw:
+    """The BufferedReader.raw layer: _bound_socket_timeout reaches the socket here."""
+
+    def __init__(self, sock: _FakeSocket) -> None:
+        self._sock = sock
+
+
+class _FakeBufferedReader:
+    def __init__(self, sock: _FakeSocket) -> None:
+        self.raw = _FakeRaw(sock)
+
+
+class _SocketResponse:
+    """A response exposing the fp.fp.raw._sock path real urllib responses have."""
+
+    def __init__(self, sock: _FakeSocket) -> None:
+        self.fp = _FakeBufferedReader(sock)
+        self._sent = False
+
+    def read(self, n: int = -1) -> bytes:
+        if not self._sent:
+            self._sent = True
+            return verbose_json([seg(0.0, 0.4)])
+        return b""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+
+class _FakeClock:
+    now = 1000.0
+
+
+def test_socket_timeout_is_reset_to_the_remaining_budget(tmp_path, monkeypatch):
+    """Each blocking operation gets the remaining budget, never the full timeout.
+
+    Headers arrive 590 s into a 600 s budget: the open received the full 600,
+    but the first body read must be bounded by the ~10 s that are left, not by
+    another 600 s socket timeout on top.
+    """
+    monkeypatch.setattr(lemon.time, "monotonic", lambda: _FakeClock.now)
+    sock = _FakeSocket()
+    open_timeouts: list[float] = []
+
+    def fake_open(request, timeout, *, bypass_proxies):
+        open_timeouts.append(timeout)
+        _FakeClock.now += 590.0
+        return _SocketResponse(sock)
+
+    monkeypatch.setattr(lemon, "_open_url", fake_open)
+    wav = tmp_path / "a.wav"
+    write_wav(wav, 0.5)
+
+    LemonadeBackend(lemon_settings(tmp_path, lemonade_timeout_seconds=600.0)).transcribe(wav)
+
+    assert open_timeouts == [pytest.approx(600.0)]
+    assert sock.timeouts
+    assert all(t < 11.0 for t in sock.timeouts)
+
+
+def test_stalled_body_read_trips_the_total_deadline(tmp_path, monkeypatch):
+    """A body read stalling past the deadline raises the inference timeout.
+
+    Headers arrive with 10 s of budget left, the first read stalls for 100 s:
+    the between-reads deadline check must end the request rather than leave it
+    blocked for another full socket timeout.
+    """
+    monkeypatch.setattr(lemon.time, "monotonic", lambda: _FakeClock.now)
+
+    class _StallingResponse:
+        def read(self, n: int = -1) -> bytes:
+            _FakeClock.now += 100.0
+            return b"x" * 10
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    def fake_open(request, timeout, *, bypass_proxies):
+        _FakeClock.now += 590.0
+        return _StallingResponse()
+
+    monkeypatch.setattr(lemon, "_open_url", fake_open)
+    wav = tmp_path / "a.wav"
+    write_wav(wav, 0.5)
+
+    with pytest.raises(LemonadeInferenceTimeout):
+        LemonadeBackend(lemon_settings(tmp_path, lemonade_timeout_seconds=600.0)).transcribe(wav)
+
+
+# --- redirects are never followed ---
+
+
+@pytest.mark.parametrize("code", [301, 302, 303, 307, 308])
+def test_no_redirect_handler_refuses_every_30x(code):
+    """Returning None makes urllib surface the 30x as an HTTPError, un-followed."""
+    handler = lemon._NoRedirectHandler()
+    assert handler.redirect_request(None, None, code, "", {}, "http://attacker.example/") is None
+
+
+@pytest.mark.parametrize("opener_name", ["_DEFAULT_OPENER", "_NO_PROXY_OPENER"])
+def test_openers_install_the_no_redirect_handler(opener_name):
+    """Both HTTP paths must replace urllib's default redirect handler."""
+    opener = getattr(lemon, opener_name)
+    assert any(isinstance(handler, lemon._NoRedirectHandler) for handler in opener.handlers)
+
+
+def test_redirect_response_is_classified_without_echoing_the_target(tmp_path, monkeypatch):
+    """A 30x is a sanitized fallback-eligible error; the Location is never shown."""
+    headers = Message()
+    headers["Location"] = "http://attacker.example/steal"
+    error = urllib.error.HTTPError(
+        "https://example.test/v1/health", 302, "Found", headers, io.BytesIO(b"")
+    )
+    install_urlopen(monkeypatch, [error])
+    backend = LemonadeBackend(lemon_settings(tmp_path, lemonade_url="https://example.test"))
+
+    with pytest.raises(LemonadeUnavailableError) as exc_info:
+        backend.health()
+
+    message = str(exc_info.value)
+    assert "redirect" in message
+    assert "attacker.example" not in message
+
+
+def test_real_server_redirect_is_never_followed(tmp_path):
+    """End-to-end over real sockets: a 302 must not produce a second request.
+
+    This is the regression for the proven POST→GET + Authorization-leak probe:
+    urllib's default handler followed a 302, converted the POST to a GET, and
+    kept the bearer header on the server-chosen target.
+    """
+    victim_requests: list[tuple[str, str, str | None]] = []
+    redirector_requests: list[tuple[str, str | None]] = []
+
+    class _Victim(BaseHTTPRequestHandler):
+        def _respond(self) -> None:
+            victim_requests.append((self.command, self.path, self.headers.get("Authorization")))
+            self.send_response(200)
+            self.end_headers()
+
+        do_POST = _respond
+        do_GET = _respond
+
+        def log_message(self, format: str, *args: object) -> None:  # silence test output
+            pass
+
+    victim = HTTPServer(("127.0.0.1", 0), _Victim)
+
+    class _Redirector(BaseHTTPRequestHandler):
+        def _respond(self) -> None:
+            redirector_requests.append((self.command, self.headers.get("Authorization")))
+            self.send_response(302)
+            self.send_header("Location", f"http://127.0.0.1:{victim.server_port}/steal")
+            self.end_headers()
+
+        do_POST = _respond
+        do_GET = _respond
+
+        def log_message(self, format: str, *args: object) -> None:  # silence test output
+            pass
+
+    redirector = HTTPServer(("127.0.0.1", 0), _Redirector)
+    for server in (redirector, victim):
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+
+    try:
+        key = "sk-redirect-probe-token"
+        backend = LemonadeBackend(
+            lemon_settings(
+                tmp_path,
+                lemonade_url=f"http://127.0.0.1:{redirector.server_port}",
+                lemonade_api_key=SecretStr(key),
+            )
+        )
+        with pytest.raises(LemonadeUnavailableError) as exc_info:
+            backend.health()
+        assert "redirect" in str(exc_info.value)
+        assert key not in str(exc_info.value)
+    finally:
+        for server in (redirector, victim):
+            server.shutdown()
+            server.server_close()
+
+    # Exactly one request reached the configured endpoint — with method and
+    # credential intact — and the redirect target received nothing at all.
+    assert redirector_requests == [("GET", f"Bearer {key}")]
+    assert victim_requests == []
+
+
+# --- server-controlled error text is sanitized ---
+
+
+def test_classified_error_redacts_a_reflected_api_key():
+    """A server reflecting the received Authorization value must not repeat it."""
+    key = "sk-supersecret-lemonade-token"
+    payload = {
+        "error": {
+            "type": "upstream_error",
+            "code": "bad_gateway",
+            "message": f"request rejected with header: Bearer {key}",
+        }
+    }
+    exc = classify_http_failure(502, payload, secrets=(key,))
+    assert key not in str(exc)
+    assert "[redacted]" in str(exc)
+
+
+def test_send_redacts_a_reflected_api_key(tmp_path, monkeypatch):
+    """The backend wires the configured key into classification end to end."""
+    key = "sk-supersecret-lemonade-token"
+    payload = {"error": {"message": f"received Authorization: Bearer {key}"}}
+    install_urlopen(monkeypatch, [http_error(502, payload)])
+    backend = LemonadeBackend(
+        lemon_settings(
+            tmp_path,
+            lemonade_url="https://example.test",
+            lemonade_api_key=SecretStr(key),
+        )
+    )
+    wav = tmp_path / "a.wav"
+    write_wav(wav, 0.5)
+
+    with pytest.raises(LemonadeError) as exc_info:
+        backend.transcribe(wav)
+
+    assert key not in str(exc_info.value)
+    assert "[redacted]" in str(exc_info.value)
+
+
+def test_classified_error_strips_terminal_control_characters():
+    payload = {"error": {"message": "boom\x1b]0;pwned\x07 and more"}}
+    exc = classify_http_failure(500, payload)
+    assert "\x1b" not in str(exc)
+    assert "\x07" not in str(exc)
+
+
+def test_remote_detail_is_length_capped():
+    payload = {"error": {"message": "A" * 5000}}
+    exc = classify_http_failure(500, payload)
+    assert len(str(exc)) < 300
+
+
+def test_classification_is_unchanged_by_sanitization():
+    """Sanitization shapes the message, never the classification decision."""
+    payload_missing = {"error": {"message": "nope"}}
+    assert isinstance(classify_http_failure(404, payload_missing), LemonadeCapabilityError)
+    assert isinstance(
+        classify_http_failure(500, {"error": {"message": "permission denied loading model"}}),
+        LemonadeModelError,
+    )
+    assert isinstance(classify_http_failure(401, {}), LemonadeAuthenticationError)
+
+
+def test_utterance_tokens_unicode_and_cjk():
+    # Cyrillic
+    assert _utterance_tokens("Привет, мир!") == ["привет", "мир"]
+    # Chinese (CJK characters split individually)
+    assert _utterance_tokens("今天天气很好") == ["今", "天", "天", "气", "很", "好"]
+    # Japanese
+    assert _utterance_tokens("こんにちは世界") == ["こ", "ん", "に", "ち", "は", "世", "界"]
+    # Arabic
+    assert _utterance_tokens("مرحبا بالعالم") == ["مرحبا", "بالعالم"]
+    # Mixed Latin and Chinese
+    assert _utterance_tokens("iPhone 很好用") == ["iphone", "很", "好", "用"]
+    # Empty / punctuation only
+    assert _utterance_tokens("... --- ...") == []
+
+
+def test_unicode_overlap_deduplication_cyrillic_and_cjk(tmp_path, monkeypatch):
+    """Unicode transcripts (Cyrillic, CJK, etc.) must be deduplicated across chunk overlaps."""
+    wav = tmp_path / "long_unicode.wav"
+    write_wav(wav, 2.5)  # 1s chunks, 0.5s overlap -> 3 chunks
+
+    # Chunk 0: 0.0-1.0s (overlap: 0.5-1.0s). Chunk 1: 0.5-2.0s (overlap: 0.5-1.0s).
+    # In chunk 0, "Привет, мир!" spans 0.6..0.9s.
+    # In chunk 1, "Привет, мир!" spans 0.1..0.4s (chunk-relative -> file-relative 0.6..0.9s).
+    # This identical Cyrillic utterance in the overlap must be deduplicated!
+    responses = [
+        verbose_json([seg(0.0, 0.4, "Первая часть"), seg(0.6, 0.9, "Привет, мир!")]),
+        verbose_json([seg(0.1, 0.4, "Привет, мир!"), seg(0.6, 1.4, "Вторая часть")]),
+        verbose_json([seg(0.5, 0.8, "Третья часть")]),
+    ]
+    calls = install_urlopen(monkeypatch, responses)
+
+    segments, _info = LemonadeBackend(lemon_settings(tmp_path)).transcribe(wav)
+
+    assert len(calls) == 3
+    # "Привет, мир!" from chunk 1's overlap must be deduplicated, not duplicated!
+    assert [s.text for s in segments] == [
+        "Первая часть",
+        "Привет, мир!",
+        "Вторая часть",
+        "Третья часть",
+    ]
+
+
+def test_cjk_overlap_deduplication(tmp_path, monkeypatch):
+    """CJK transcripts with partial prefix in overlap are deduplicated cleanly."""
+    wav = tmp_path / "long_cjk.wav"
+    write_wav(wav, 2.5)
+
+    responses = [
+        verbose_json([seg(0.0, 0.4, "第一部分"), seg(0.6, 0.9, "今天天气很好")]),
+        verbose_json([seg(0.1, 0.4, "今天天气很好"), seg(0.6, 1.4, "第二部分")]),
+        verbose_json([seg(0.5, 0.8, "第三部分")]),
+    ]
+    calls = install_urlopen(monkeypatch, responses)
+
+    segments, _info = LemonadeBackend(lemon_settings(tmp_path)).transcribe(wav)
+
+    assert len(calls) == 3
+    assert [s.text for s in segments] == ["第一部分", "今天天气很好", "第二部分", "第三部分"]
+
+
+def test_real_socket_end_to_end_deadline_multi_phase_delay(tmp_path):
+    """A real socket delaying across multiple pre-response phases must trip the total deadline."""
+    # Loopback TCP server delaying before reading request and before sending headers
+    server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server_sock.bind(("127.0.0.1", 0))
+    server_sock.listen(1)
+    port = server_sock.getsockname()[1]
+
+    def handle_client():
+        try:
+            conn, _ = server_sock.accept()
+            # Delay phase 1: 0.15s before reading request
+            time.sleep(0.15)
+            with contextlib.suppress(Exception):
+                conn.recv(4096)
+            # Delay phase 2: 0.20s before sending response headers
+            time.sleep(0.20)
+            with contextlib.suppress(Exception):
+                conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}")
+                conn.close()
+        finally:
+            server_sock.close()
+
+    server_thread = threading.Thread(target=handle_client, daemon=True)
+    server_thread.start()
+
+    backend = LemonadeBackend(
+        lemon_settings(
+            tmp_path,
+            lemonade_url=f"http://127.0.0.1:{port}",
+            lemonade_timeout_seconds=0.20,
+            lemonade_diagnostics_timeout_seconds=0.20,
+        )
+    )
+
+    start_time = time.monotonic()
+    with pytest.raises(LemonadeInferenceTimeout):
+        backend.health()
+    elapsed = time.monotonic() - start_time
+
+    # The total delay of the server is 0.15 + 0.20 = 0.35s.
+    # The configured deadline was 0.20s. The client must abort near 0.20s, well before 0.35s.
+    assert elapsed < 0.32
+
+
+# --- Finding 1: Cumulative caps and Linear Dedup Tests ---
+
+
+def test_require_segments_rejects_excessive_segment_count():
+    """A response containing more than _MAX_RESPONSE_SEGMENTS segments is rejected."""
+    excessive = [seg(i * 0.1, i * 0.1 + 0.05, "word") for i in range(_MAX_RESPONSE_SEGMENTS + 1)]
+    with pytest.raises(LemonadeCapabilityError, match="too many segments"):
+        _require_segments({"segments": excessive})
+
+
+def test_require_segments_rejects_excessive_segment_text():
+    """A segment whose text exceeds _MAX_SEGMENT_TEXT_CHARS is rejected."""
+    long_text = "a" * (_MAX_SEGMENT_TEXT_CHARS + 1)
+    payload = {"segments": [{"start": 0.0, "end": 1.0, "text": long_text}]}
+    with pytest.raises(LemonadeCapabilityError, match="exceeding the text size limit"):
+        _require_segments(payload)
+
+
+def test_merge_state_cumulative_caps():
+    """_MergeState rejects cumulative segments and text exceeding total bounds."""
+    state = _MergeState(segments=[], pinned=None, probability=None)
+
+    # Cumulative segments
+    state.segments = [
+        Segment(start=0.0, end=1.0, text="hi") for _ in range(_MAX_CUMULATIVE_SEGMENTS)
+    ]
+    with pytest.raises(LemonadeCapabilityError, match="cumulative segment limit"):
+        state.absorb(
+            {"segments": [{"start": 0.0, "end": 1.0, "text": "extra"}], "language": "en"},
+            offset=0.0,
+            core_start=0.0,
+            index=0,
+        )
+
+    # Cumulative text chars
+    state3 = _MergeState(
+        segments=[], pinned=None, probability=None, total_text_chars=_MAX_CUMULATIVE_TEXT_CHARS
+    )
+    with pytest.raises(LemonadeCapabilityError, match="cumulative decoded text limit"):
+        state3.absorb(
+            {"segments": [{"start": 0.0, "end": 1.0, "text": "extra text"}], "language": "en"},
+            offset=0.0,
+            core_start=0.0,
+            index=0,
+        )
+
+
+def test_linear_dedup_scans_only_adjacent_overlap_window():
+    """Deduplication only checks segments ending in the adjacent overlap window."""
+    state = _MergeState(segments=[], pinned="en", probability=0.9)
+    # Chunk 0: 0.0 to 10.0s
+    state.segments = [
+        Segment(start=0.0, end=2.0, text="old segment early"),
+        Segment(start=2.0, end=4.0, text="old segment mid"),
+        Segment(start=8.5, end=9.8, text="boundary utterance"),
+    ]
+    # Chunk 1: offset=8.0, core_start=10.0 (overlap is 8.0-10.0s).
+    # Candidate in overlap matches "boundary utterance".
+    state.absorb(
+        {
+            "segments": [
+                {"start": 0.5, "end": 1.9, "text": "boundary utterance"},
+                {"start": 2.5, "end": 4.0, "text": "new segment"},
+            ]
+        },
+        offset=8.0,
+        core_start=10.0,
+        index=1,
+        chunk_duration=5.0,
+        core_end=13.0,
+        final_chunk=False,
+    )
+    # The duplicate in the overlap should be reconciled
+    assert len(state.segments) == 4
+    assert state.segments[2].text == "boundary utterance"
+    assert state.segments[3].text == "new segment"
+
+
+# --- Finding 2: Configuration & Error Hierarchy Tests ---
+
+
+def test_backend_rejects_non_ascii_bearer_token(tmp_path):
+    """A bearer token containing non-ASCII printable characters is rejected at config time."""
+    settings = Settings(
+        vault_path=tmp_path / "vault",
+        transcription_backend="lemonade",
+        lemonade_api_key=SecretStr("sk-token-🔑"),
+    )
+    with pytest.raises(LemonadeConfigurationError, match="ASCII bearer token"):
+        LemonadeBackend(settings)
+
+    settings_accent = Settings(
+        vault_path=tmp_path / "vault",
+        transcription_backend="lemonade",
+        lemonade_api_key=SecretStr("sk-token-é"),
+    )
+    with pytest.raises(LemonadeConfigurationError, match="ASCII bearer token"):
+        LemonadeBackend(settings_accent)
+
+
+def test_normalize_base_url_rejects_unsafe_path_characters():
+    """Base URLs with spaces, control characters, or non-ASCII characters in path are rejected."""
+    with pytest.raises(LemonadeConfigurationError, match="invalid characters"):
+        _normalize_base_url("http://127.0.0.1:13305/v1 /test")
+
+    with pytest.raises(LemonadeConfigurationError, match="invalid characters"):
+        _normalize_base_url("http://127.0.0.1:13305/v1\x00test")
+
+    with pytest.raises(LemonadeConfigurationError, match="invalid characters"):
+        _normalize_base_url("http://127.0.0.1:13305/v1/ümlaut")
+
+
+def test_send_translates_invalid_url_and_encoding_failures(tmp_path, monkeypatch):
+    """http.client.InvalidURL / UnicodeEncodeError mapped to LemonadeConfigurationError."""
+    backend = LemonadeBackend(lemon_settings(tmp_path))
+
+    def raise_invalid_url(*args, **kwargs):
+        raise http.client.InvalidURL("URL can't contain control characters")
+
+    monkeypatch.setattr(lemon, "_open_url", raise_invalid_url)
+    with pytest.raises(LemonadeConfigurationError, match="could not be built or encoded"):
+        backend.health()
+
+    def raise_encode_error(*args, **kwargs):
+        raise UnicodeEncodeError("latin-1", "bad", 0, 1, "reason")
+
+    monkeypatch.setattr(lemon, "_open_url", raise_encode_error)
+    with pytest.raises(LemonadeConfigurationError, match="could not be built or encoded"):
+        backend.health()
+
+
+def test_send_translates_http_exceptions_to_unavailable(tmp_path, monkeypatch):
+    """http.client.HTTPException (e.g. BadStatusLine) is mapped to LemonadeUnavailableError."""
+    backend = LemonadeBackend(lemon_settings(tmp_path))
+
+    def raise_bad_status(*args, **kwargs):
+        raise http.client.BadStatusLine("???")
+
+    monkeypatch.setattr(lemon, "_open_url", raise_bad_status)
+    with pytest.raises(LemonadeUnavailableError, match="Lemonade HTTP protocol failure"):
+        backend.health()
+
+
+def test_send_http_exceptions_redacts_api_key(tmp_path, monkeypatch):
+    """Reflected bearer token in http.client.HTTPException is redacted in
+    LemonadeUnavailableError.
+    """
+    backend = LemonadeBackend(
+        lemon_settings(tmp_path, lemonade_api_key=SecretStr("super-secret-token"))
+    )
+
+    def raise_bad_status(*args, **kwargs):
+        raise http.client.BadStatusLine("HTTP/1.1 500 Bad Header Bearer super-secret-token")
+
+    monkeypatch.setattr(lemon, "_open_url", raise_bad_status)
+    with pytest.raises(LemonadeUnavailableError) as exc_info:
+        backend.health()
+
+    assert "super-secret-token" not in str(exc_info.value)
+    assert "[redacted]" in str(exc_info.value)
+
+
+# --- Finding 3: Boundary Clipping Reconciliation Tests ---
+
+
+def test_clipping_reconciliation_previous_chunk_middle_and_final():
+    """Previous chunk segment clipped at core_start is preferred over by complete neighbor."""
+    # Scenario 1: Middle chunk (final_chunk=False)
+    # Chunk 0 was 0..10s. Segment was clipped right at 10.0s (core_start for chunk 1).
+    # Chunk 1 (offset=8.0s, core_start=10.0s, core_end=15.0s, final_chunk=False)
+    # Candidate in chunk 1 covers 8.5..10.8s (complete utterance).
+    state = _MergeState(
+        segments=[Segment(start=8.5, end=10.0, text="Hello world")],
+        pinned="en",
+        probability=0.9,
+    )
+    candidate_payload = {
+        "segments": [{"start": 0.5, "end": 2.8, "text": "Hello world today"}],
+    }
+    state.absorb(
+        candidate_payload,
+        offset=8.0,
+        core_start=10.0,
+        index=1,
+        chunk_duration=7.0,
+        core_end=15.0,
+        final_chunk=False,
+    )
+    # Existing segment was clipped at core_start (10.0), candidate was complete -> candidate wins
+    assert len(state.segments) == 1
+    assert state.segments[0].text == "Hello world today"
+    assert state.segments[0].end == 10.8
+
+    # Scenario 2: Final chunk (final_chunk=True)
+    # Even when chunk 1 is final_chunk=True, existing chunk 0 was non-final and was clipped at 10s.
+    state_final = _MergeState(
+        segments=[Segment(start=8.5, end=10.0, text="Hello world")],
+        pinned="en",
+        probability=0.9,
+    )
+    state_final.absorb(
+        candidate_payload,
+        offset=8.0,
+        core_start=10.0,
+        index=1,
+        chunk_duration=7.0,
+        core_end=15.0,
+        final_chunk=True,
+    )
+    # Candidate must still win because existing was clipped
+    assert len(state_final.segments) == 1
+    assert state_final.segments[0].text == "Hello world today"
+    assert state_final.segments[0].end == 10.8
+
+
+def test_clipping_reconciliation_candidate_clipped_non_final_vs_final():
+    """Candidate clipped at chunk audio end is rejected if existing is complete."""
+    # Existing in chunk 0 covers 8.5..11.0s (complete)
+    # Candidate in chunk 1 (duration 3.0s, offset 8.0s -> chunk audio ends at 11.0s)
+    # Candidate ends right at 11.0s (clipped at chunk end, non-final)
+    state = _MergeState(
+        segments=[Segment(start=8.5, end=11.0, text="Hello world complete")],
+        pinned="en",
+        probability=0.9,
+    )
+    candidate_payload = {
+        "segments": [{"start": 0.5, "end": 3.0, "text": "Hello world"}],
+    }
+    state.absorb(
+        candidate_payload,
+        offset=8.0,
+        core_start=10.0,
+        index=1,
+        chunk_duration=3.0,
+        core_end=11.0,
+        final_chunk=False,
+    )
+    # Candidate is clipped (candidate_clipped=True), existing is complete -> existing stays!
+    assert len(state.segments) == 1
+    assert state.segments[0].text == "Hello world complete"
+
+
+def test_absorb_and_transcribe_preserves_chronological_segment_order():
+    """Overlap absorption that appends an earlier segment maintains chronological sorting."""
+    state = _MergeState(
+        segments=[Segment(start=299.0, end=300.0, text="Bye")],
+        pinned="en",
+        probability=0.9,
+    )
+    # Chunk 1 (offset=298.0s) decodes an utterance in overlap [298.2, 298.8] that Chunk 0 missed,
+    # plus [299.0, 300.5] which replaces [299.0, 300.0].
+    candidate_payload = {
+        "segments": [
+            {"start": 0.2, "end": 0.8, "text": "thanks"},
+            {"start": 1.0, "end": 2.5, "text": "Bye everyone"},
+        ],
+    }
+    state.absorb(
+        candidate_payload,
+        offset=298.0,
+        core_start=300.0,
+        index=1,
+        chunk_duration=5.0,
+        core_end=303.0,
+        final_chunk=True,
+    )
+    assert len(state.segments) == 2
+    assert state.segments[0].start == 298.2
+    assert state.segments[0].text == "thanks"
+    assert state.segments[1].start == 299.0
+    assert state.segments[1].text == "Bye everyone"
+
+
+def test_absorb_purges_subsumed_multi_segment_fragments():
+    """Replacing a split boundary segment purges trailing split fragments."""
+    # Chunk 0 output: utterance was split across boundary into "thank" and "you"
+    state = _MergeState(
+        segments=[
+            Segment(start=9.5, end=9.7, text="thank"),
+            Segment(start=9.7, end=10.0, text="you"),
+        ],
+        pinned="en",
+        probability=0.9,
+    )
+    # Chunk 1 (offset=9.0s): full context decodes "thank you very much" [9.5s -> 10.5s]
+    candidate_payload = {
+        "segments": [
+            {"start": 0.5, "end": 1.5, "text": "thank you very much"},
+        ],
+    }
+    state.absorb(
+        candidate_payload,
+        offset=9.0,
+        core_start=10.0,
+        index=1,
+        chunk_duration=5.0,
+        core_end=14.0,
+        final_chunk=True,
+    )
+    assert len(state.segments) == 1
+    assert state.segments[0].start == 9.5
+    assert state.segments[0].end == 10.5
+    assert state.segments[0].text == "thank you very much"
+
+
+def test_deadline_socket_settimeout_none_handled():
+    """sock.settimeout(None) does not raise TypeError and bounds against deadline."""
+    mock_raw_sock = MagicMock()
+    now = time.monotonic()
+    sock = lemon._DeadlineSocket(mock_raw_sock, deadline=now + 10.0)
+    sock.settimeout(None)
+    mock_raw_sock.settimeout.assert_called_once()
+    timeout_arg = mock_raw_sock.settimeout.call_args[0][0]
+    assert 9.0 <= timeout_arg <= 10.0
+
+
+def test_transcribe_non_wav_derives_duration_from_segments(tmp_path, monkeypatch):
+    """Non-WAV audio with 0.0 header duration derives duration from transcribed segments."""
+    fake_audio = tmp_path / "raw_audio.bin"
+    fake_audio.write_bytes(b"not a wav file header at all")
+    install_urlopen(
+        monkeypatch,
+        [
+            verbose_json(
+                [
+                    {"start": 0.0, "end": 4.5, "text": "Testing audio."},
+                    {"start": 5.0, "end": 12.3, "text": "End of audio."},
+                ]
+            )
+        ],
+    )
+    backend = LemonadeBackend(lemon_settings(tmp_path))
+    segments, info = backend.transcribe(fake_audio)
+    assert len(segments) == 2
+    assert info["duration"] == 12.3
+
+
+def test_send_sanitizes_urlerror_and_oserror_secrets_and_control_chars(tmp_path, monkeypatch):
+    """URLError and OSError in _send must sanitize secrets and terminal escape characters."""
+    backend = LemonadeBackend(lemon_settings(tmp_path, lemonade_api_key="secret-key-12345"))
+
+    def mock_open_urlerror(*args, **kwargs):
+        raise urllib.error.URLError("Failed to connect: secret-key-12345\x1b[31mcolors\x07")
+
+    monkeypatch.setattr(lemon, "_open_url", mock_open_urlerror)
+    with pytest.raises(LemonadeUnavailableError) as exc_info:
+        backend._send(urllib.request.Request("http://localhost:8000/v1/audio/transcriptions"), 10.0)
+
+    msg = str(exc_info.value)
+    assert "secret-key-12345" not in msg
+    assert "[redacted]" in msg
+    assert "\x1b" not in msg
+    assert "\x07" not in msg
+
+    def mock_open_oserror(*args, **kwargs):
+        raise OSError("Connection refused: secret-key-12345\x1b[2J")
+
+    monkeypatch.setattr(lemon, "_open_url", mock_open_oserror)
+    with pytest.raises(LemonadeUnavailableError) as exc_info:
+        backend._send(urllib.request.Request("http://localhost:8000/v1/audio/transcriptions"), 10.0)
+
+    msg = str(exc_info.value)
+    assert "secret-key-12345" not in msg
+    assert "[redacted]" in msg
+    assert "\x1b" not in msg
+
+
+def test_purge_subsumed_preserves_distinct_short_words():
+    """_purge_subsumed does not delete distinct short words that are substrings."""
+    state = lemon._MergeState(
+        segments=[
+            Segment(start=9.8, end=10.2, text="in", speaker="Other"),
+            Segment(start=10.3, end=10.8, text="walking", speaker="Other"),
+        ],
+        pinned=None,
+        probability=1.0,
+    )
+    # "in" must NOT be purged by "walking", even though "in" is a substring of "walking"!
+    cand = Segment(start=9.8, end=10.8, text="walking", speaker="Other")
+    state._purge_subsumed(duplicate_index=1, candidate=cand, offset=9.0)
+
+    assert len(state.segments) == 2
+    assert state.segments[0].text == "in"
+    assert state.segments[1].text == "walking"
+
+
+def test_bound_socket_timeout_traverses_response_layers():
+    """_bound_socket_timeout traverses response wrapper layers to set timeout."""
+    mock_sock = MagicMock()
+    mock_sock.fileno = MagicMock()
+    mock_sock.settimeout = MagicMock()
+
+    class SocketIO:
+        _sock = mock_sock
+
+    class BufferedReader:
+        raw = SocketIO()
+
+    class HTTPResponse:
+        fp = BufferedReader()
+
+    class AddInfoUrl:
+        fp = HTTPResponse()
+
+    resp = AddInfoUrl()
+    deadline = time.monotonic() + 5.0
+    lemon._bound_socket_timeout(resp, deadline)
+    mock_sock.settimeout.assert_called_once()
+    timeout_arg = mock_sock.settimeout.call_args[0][0]
+    assert 4.0 <= timeout_arg <= 5.0
+
+
+def test_finite_number_overflow():
+    """_finite_number returns None on overflow instead of raising OverflowError."""
+    assert lemon._finite_number(10**400) is None
+    assert lemon._finite_number(-(10**400)) is None
+    assert lemon._finite_number(42) == 42.0

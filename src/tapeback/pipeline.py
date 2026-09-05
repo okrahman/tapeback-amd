@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import shutil
 import tempfile
 from collections.abc import Callable
@@ -27,6 +28,7 @@ from tapeback.channel import (
     classify_segment_by_channel,
     filter_silent_segments,
     identify_user_speaker,
+    is_channel_active,
     load_stereo_channels,
     split_on_silence,
 )
@@ -52,8 +54,17 @@ def _noop_status(msg: str) -> None:
 
 
 def _gpu_telemetry_enabled(settings: Settings) -> bool:
-    """GPU sampling is only meaningful for a run that actually asked for the GPU."""
-    return settings.gpu_telemetry and settings.device == "cuda"
+    """GPU sampling is only meaningful for a run that actually asked for the GPU.
+
+    TAPEBACK_DEVICE stays applicable to faster-whisper and diarization, but with the
+    Lemonade backend the transcription GPU is the server's business, not ours — there
+    is no local inference to sample and no accelerator tapeback should name.
+    """
+    return (
+        settings.gpu_telemetry
+        and settings.device == "cuda"
+        and settings.transcription_backend == "faster-whisper"
+    )
 
 
 def stop_and_process(
@@ -67,17 +78,22 @@ def stop_and_process(
 ) -> Path:
     """Stop recording and run the full dual-channel processing pipeline.
 
-    If a live_transcriber is active, stops it first to free GPU memory
-    before the full pipeline creates its own Whisper model.
+    Recording is finalized before live preview teardown, so a slow or failed
+    preview can never leave parecord running. If a live transcriber is active,
+    the pipeline then waits for its worker to exit and free GPU memory before
+    creating its own Whisper model.
 
     Returns path to the saved markdown file.
     """
-    if live_transcriber is not None:
-        on_status("Stopping live transcription...")
-        live_transcriber.stop()
-
     on_status("Stopping recording...")
     monitor_path, mic_path = recorder.stop()
+
+    if live_transcriber is not None:
+        on_status("Stopping live transcription...")
+        try:
+            live_transcriber.stop(on_status)
+        except Exception as exc:
+            on_status(f"Warning: Live transcription stopped with error: {exc}")
 
     session_name = monitor_path.parent.name
 
@@ -137,7 +153,16 @@ def process_file(
         name = audio_path.stem
     validate_session_name(name)
 
-    tmp_dir = Path(tempfile.mkdtemp(prefix="tapeback_"))
+    # Deterministic staging directory per input audio identity, so resume cache keys
+    # remain stable across separate process runs.
+    try:
+        stat = audio_path.stat()
+        ident = f"{audio_path.resolve()}:{stat.st_size}:{stat.st_mtime_ns}"
+    except OSError:
+        ident = str(audio_path.resolve())
+    staging_hash = hashlib.sha256(ident.encode()).hexdigest()[:16]
+    tmp_dir = Path(tempfile.gettempdir()) / "tapeback" / f"proc_{staging_hash}"
+    tmp_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
 
     try:
         with run_log(name, settings, on_status) as report:
@@ -204,6 +229,12 @@ def process_stereo_file(
     with stage_timer("load channels", on_status):
         mic_raw, monitor_raw, raw_sr = load_stereo_channels(stereo_path)
 
+    # Exact digital silence is the only pre-transcription activity rule. Keep this
+    # separate from the RMS-based post-transcription filters below so quiet speech is
+    # still sent to the backend.
+    mic_active = True if mic_raw is None else is_channel_active(mic_raw)
+    monitor_active = True if monitor_raw is None else is_channel_active(monitor_raw)
+
     on_status("Splitting channels...")
     with stage_timer("split", on_status):
         mic_16k, monitor_16k = split_channels_16k(stereo_path, output_dir)
@@ -211,7 +242,12 @@ def process_stereo_file(
     if settings.gate_mic_silence:
         # Silence the mic where the user only listens, so Whisper doesn't loop on it.
         with stage_timer("gate mic", on_status):
-            gate_wav_inactive(mic_16k, mic_raw, monitor_raw, raw_sr)
+            gated_mic_active = gate_wav_inactive(mic_16k, mic_raw, monitor_raw, raw_sr)
+            # Keep compatibility with callers that replace the old side-effect-only
+            # helper in tests or integrations; the production helper always returns
+            # a bool based on its post-gating PCM.
+            if gated_mic_active is not None:
+                mic_active = bool(gated_mic_active)
 
     on_status("Transcribing (this may take a few minutes)...")
     with stage_timer("load model", on_status):
@@ -220,7 +256,11 @@ def process_stereo_file(
     try:
         with sample_gpu(on_status, enabled=_gpu_telemetry_enabled(settings)):
             mic_segments, monitor_segments, info = transcriber.transcribe_stereo(
-                mic_16k, monitor_16k, on_status=on_status
+                mic_16k,
+                monitor_16k,
+                on_status=on_status,
+                mic_active=mic_active,
+                monitor_active=monitor_active,
             )
     finally:
         # Release VRAM even when the stage raised, so a failure here does not starve

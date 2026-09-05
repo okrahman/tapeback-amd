@@ -29,13 +29,13 @@ def check(owner: str, repo: str, sha: str, token: str | None) -> bool:
     """Return True if the SHA exists in the action repo, False if 404."""
     url = f"https://api.github.com/repos/{owner}/{repo}/commits/{sha}"
     # Hardcoded https://api.github.com host, no scheme injection possible from input.
-    req = urllib.request.Request(  # noqa: S310
+    req = urllib.request.Request(  # noqa: S310 - hardcoded https://api.github.com host
         url, headers={"Accept": "application/vnd.github+json"}
     )
     if token:
         req.add_header("Authorization", f"Bearer {token}")
     try:
-        with urllib.request.urlopen(req, timeout=10) as resp:  # noqa: S310
+        with urllib.request.urlopen(req, timeout=10) as resp:  # noqa: S310 - hardcoded https://api.github.com host
             return resp.status == HTTPStatus.OK
     except urllib.error.HTTPError as e:
         if e.code == HTTPStatus.NOT_FOUND:

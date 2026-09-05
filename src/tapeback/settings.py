@@ -1,7 +1,8 @@
+import math
 from pathlib import Path
 from typing import Literal
 
-from pydantic import Field, SecretStr, model_validator
+from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from tapeback.glossary import DEFAULT_HOTWORDS
@@ -142,6 +143,58 @@ class Settings(BaseSettings):
     # a machine that cools adequately.
     stage_pause_seconds: float = Field(default=0.0, ge=0.0)
 
+    # Transcription backend. "faster-whisper" is the built-in local model; "lemonade"
+    # sends WAV files to a Lemonade Server endpoint (whose lifecycle and hardware
+    # choice are externally managed — tapeback never selects or records the
+    # accelerator). On an eligible Lemonade failure the façade falls back to
+    # faster-whisper for that run; see _lemonade.py for the error hierarchy.
+    transcription_backend: Literal["faster-whisper", "lemonade"] = "lemonade"
+    # Lemonade Server base URL. Must be a syntactically valid http(s) URL with no
+    # embedded credentials, query string, or fragment; anything else is refused
+    # before a request is ever built (no fallback). The URL is normalized
+    # structurally (lowercased scheme/host, default port dropped) before display
+    # or use, so what status shows is what requests target.
+    lemonade_url: str = "http://127.0.0.1:13305"
+    # Model identifier as Lemonade Server knows it (e.g. "Whisper-Large-v3-Turbo").
+    lemonade_model: str = "Whisper-Large-v3-Turbo"
+    # Optional bearer token for a Lemonade Server that requires auth. SecretStr keeps
+    # it out of repr/logs; it is sent only in the Authorization header and never
+    # appears in cache fingerprints or error messages.
+    lemonade_api_key: SecretStr = SecretStr("")
+    # Per-request timeout in seconds. Enforced as a **total end-to-end deadline**:
+    # connect, upload, redirect classification, and every read of the response
+    # body share the same budget — a trickling peer cannot extend the request
+    # past this bound. Inference on a long chunk can legitimately take minutes,
+    # so this is generous by default; hitting it aborts the run and falls back to
+    # faster-whisper rather than resubmitting to Lemonade.
+    lemonade_timeout_seconds: float = Field(default=600.0, gt=0.0)
+    # Per-request timeout for the status command's health/system-info diagnostics.
+    # Same total-deadline semantics as the inference timeout, but deliberately
+    # short: these are tiny GETs against an endpoint that may be the very thing
+    # that is down or stalled, so `tapeback status` must never hang for minutes.
+    lemonade_diagnostics_timeout_seconds: float = Field(default=10.0, gt=0.0)
+
+    @field_validator(
+        "lemonade_timeout_seconds",
+        "lemonade_diagnostics_timeout_seconds",
+    )
+    @classmethod
+    def _finite_timeout(cls, value: float) -> float:
+        """Reject NaN and infinities — a non-finite timeout would never expire."""
+        if not math.isfinite(value):
+            raise ValueError(f"Timeout must be a finite positive number, got {value!r}")
+        return value
+
+    # Conservative internal chunk duration for long WAVs. Chosen to keep one request's
+    # audio bounded in memory and progress reportable — these are tapeback's own
+    # transport bounds, not statements about Lemonade Server limits. Finite bounds:
+    # a value past an hour has no transport purpose (the byte cap binds first), and
+    # the overlap cross-check below needs a strictly larger chunk.
+    lemonade_chunk_seconds: float = Field(default=300.0, gt=0.0, le=3600.0)
+    # Seconds of contextual overlap prepended to every chunk after the first, so a
+    # segment cut by a chunk boundary is still heard whole by one of the requests.
+    lemonade_overlap_seconds: float = Field(default=2.0, ge=0.0)
+
     # Audio
     monitor_source: str = "auto"
     mic_source: str = "auto"
@@ -196,6 +249,21 @@ class Settings(BaseSettings):
             raise ValueError(
                 f"live_min_chunk ({self.live_min_chunk}s) must be <= "
                 f"live_interval ({self.live_interval}s); otherwise cycles starve."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_lemonade_overlap(self) -> "Settings":
+        """Chunk overlap must stay strictly inside one chunk.
+
+        Overlap >= chunk would make every chunk request carry the whole previous
+        chunk again — duplicate audio in every upload and no forward progress.
+        """
+        if self.lemonade_overlap_seconds >= self.lemonade_chunk_seconds:
+            raise ValueError(
+                f"lemonade_overlap_seconds ({self.lemonade_overlap_seconds}s) must be "
+                f"smaller than lemonade_chunk_seconds ({self.lemonade_chunk_seconds}s); "
+                "overlap >= chunk would re-send each chunk in full."
             )
         return self
 

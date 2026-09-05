@@ -93,7 +93,7 @@ def test_gate_wav_inactive_silences_listening_region(tmp_path):
     mic_raw = np.concatenate([np.full(raw_sr, 5000.0), np.zeros(raw_sr)]).astype(np.float32)
     monitor_raw = np.concatenate([np.zeros(raw_sr), np.full(raw_sr, 5000.0)]).astype(np.float32)
 
-    gate_wav_inactive(mic_path, mic_raw, monitor_raw, raw_sr)
+    assert gate_wav_inactive(mic_path, mic_raw, monitor_raw, raw_sr) is True
 
     with wave.open(str(mic_path), "rb") as wf:
         out = np.frombuffer(wf.readframes(wf.getnframes()), dtype=np.int16)

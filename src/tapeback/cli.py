@@ -1,3 +1,4 @@
+import json
 import shutil
 import subprocess
 import time
@@ -8,7 +9,7 @@ import click
 
 from tapeback import const
 from tapeback.recorder import Recorder, detect_devices
-from tapeback.settings import get_settings
+from tapeback.settings import Settings, get_settings
 
 
 def _echo_status(msg: str) -> None:
@@ -243,7 +244,9 @@ def status() -> None:
     """Show current recording status and settings.
 
     Displays whether a recording is in progress, vault path,
-    Whisper model, device, and available audio sources.
+    transcription backend, model, device, and available audio sources.
+    With the Lemonade backend, optionally runs authenticated health and
+    system diagnostics — status only, never a transcription preflight.
     """
     settings = get_settings()
 
@@ -257,8 +260,12 @@ def status() -> None:
         click.echo("Not recording.")
 
     click.echo(f"\nVault: {settings.vault_path}")
-    click.echo(f"Whisper model: {settings.whisper_model}")
-    click.echo(f"Device: {settings.device}")
+    click.echo(f"Backend: {settings.transcription_backend}")
+    if settings.transcription_backend == "lemonade":
+        _lemonade_status(settings)
+    else:
+        click.echo(f"Whisper model: {settings.whisper_model}")
+        click.echo(f"Device: {settings.device}")
     click.echo(f"Language: {settings.language}")
 
     if shutil.which("pactl"):
@@ -271,6 +278,49 @@ def status() -> None:
         )
         if result.returncode == 0:
             click.echo(result.stdout)
+
+
+def _lemonade_status(settings: Settings) -> None:
+    """Lemonade section of `status`: endpoint, model, and optional diagnostics.
+
+    The backend is constructed here so the endpoint shown is the validated,
+    normalized URL — never the raw configured string, which could carry userinfo,
+    a query string, or a fragment the structural validation refused or rewrote.
+    A configuration error is reported as a line, never a crash: status must stay
+    usable for diagnosing exactly this. The raw configured value is never echoed,
+    not even in the failure branch — an invalid URL may carry embedded credentials,
+    and status output must never display raw userinfo.
+    """
+    from tapeback._lemonade import LemonadeBackend, LemonadeError
+
+    try:
+        backend = LemonadeBackend(settings)
+    except LemonadeError as exc:
+        click.echo(f"Lemonade endpoint: <configuration invalid> — {exc}", err=True)
+        return
+    click.echo(f"Lemonade endpoint: {backend.base_url}")
+    click.echo(f"Lemonade model: {settings.lemonade_model}")
+    _lemonade_diagnostics(backend)
+
+
+def _lemonade_diagnostics(backend) -> None:
+    """Best-effort health/system probe for the status command.
+
+    Diagnostics are optional: any failure is reported as a line, never raised, and
+    transcription never depends on these endpoints. They run on the short
+    diagnostics timeout, so a stalled endpoint cannot hang status for minutes.
+    Runs here — and only here — so a status check may contact the server, but a
+    transcription run may not preflight.
+    """
+    from tapeback._lemonade import LemonadeError
+
+    try:
+        click.echo(f"Health: {json.dumps(backend.health(), default=str)}")
+        click.echo(f"System info: {json.dumps(backend.system_info(), default=str)}")
+    except LemonadeError as exc:
+        click.echo(f"Lemonade diagnostics unavailable: {exc}", err=True)
+    except OSError as exc:
+        click.echo(f"Lemonade diagnostics unavailable: {exc}", err=True)
 
 
 @cli.command()

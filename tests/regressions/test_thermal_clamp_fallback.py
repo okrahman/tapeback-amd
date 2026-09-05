@@ -17,12 +17,12 @@ def _info():
 @pytest.fixture
 def clamped(monkeypatch):
     """Pretend the GPU is thermally clamped and never releases."""
-    monkeypatch.setattr("tapeback.transcriber.wait_for_clamp_release", lambda *_a, **_k: False)
+    monkeypatch.setattr("tapeback._fw_backend.wait_for_clamp_release", lambda *_a, **_k: False)
 
 
 @pytest.fixture
 def clear_gpu(monkeypatch):
-    monkeypatch.setattr("tapeback.transcriber.wait_for_clamp_release", lambda *_a, **_k: True)
+    monkeypatch.setattr("tapeback._fw_backend.wait_for_clamp_release", lambda *_a, **_k: True)
 
 
 def test_clamped_gpu_falls_back_to_cpu(settings, clamped, capsys):
@@ -37,7 +37,7 @@ def test_clamped_gpu_falls_back_to_cpu(settings, clamped, capsys):
         update={"device": "cuda", "thermal_clamp_check": True, "thermal_clamp_wait": 60.0}
     )
 
-    with patch("tapeback.transcriber.WhisperModel") as mock_model_cls:
+    with patch("tapeback._fw_backend.WhisperModel") as mock_model_cls:
         transcriber = Transcriber(s)
 
     assert transcriber.describe() == "Whisper: large-v3-turbo on cpu/int8"
@@ -50,7 +50,7 @@ def test_clear_gpu_is_used_normally(settings, clear_gpu):
         update={"device": "cuda", "thermal_clamp_check": True, "thermal_clamp_wait": 60.0}
     )
 
-    with patch("tapeback.transcriber.WhisperModel") as mock_model_cls:
+    with patch("tapeback._fw_backend.WhisperModel") as mock_model_cls:
         transcriber = Transcriber(s)
 
     assert transcriber.describe() == "Whisper: large-v3-turbo on cuda/int8_float16"
@@ -68,7 +68,7 @@ def test_fallback_can_be_declined(settings, clamped, capsys):
         }
     )
 
-    with patch("tapeback.transcriber.WhisperModel"):
+    with patch("tapeback._fw_backend.WhisperModel"):
         transcriber = Transcriber(s)
 
     assert transcriber.describe() == "Whisper: large-v3-turbo on cuda/int8_float16"
@@ -84,12 +84,12 @@ def test_the_gpu_is_reclaimed_once_the_clamp_clears(settings, monkeypatch):
     """
     clamped = iter([True, False])  # first stage clamped, second clear
     monkeypatch.setattr(
-        "tapeback.transcriber.wait_for_clamp_release", lambda *_a, **_k: not next(clamped)
+        "tapeback._fw_backend.wait_for_clamp_release", lambda *_a, **_k: not next(clamped)
     )
-    monkeypatch.setattr("tapeback.transcriber.get_free_vram_mib", lambda: 4096)
+    monkeypatch.setattr("tapeback._fw_backend.get_free_vram_mib", lambda: 4096)
     s = settings.model_copy(update={"device": "cuda", "thermal_clamp_check": True})
 
-    with patch("tapeback.transcriber.WhisperModel"):
+    with patch("tapeback._fw_backend.WhisperModel"):
         first = Transcriber(s).describe()
         second = Transcriber(s).describe()
 
@@ -106,15 +106,15 @@ def test_zero_wait_still_checks_the_clamp(settings, monkeypatch):
     """
     waits: list[float] = []
     monkeypatch.setattr(
-        "tapeback.transcriber.wait_for_clamp_release",
+        "tapeback._fw_backend.wait_for_clamp_release",
         lambda timeout, **_k: waits.append(timeout) or False,
     )
-    monkeypatch.setattr("tapeback.transcriber.get_free_vram_mib", lambda: 4096)
+    monkeypatch.setattr("tapeback._fw_backend.get_free_vram_mib", lambda: 4096)
     s = settings.model_copy(
         update={"device": "cuda", "thermal_clamp_check": True, "thermal_clamp_wait": 0.0}
     )
 
-    with patch("tapeback.transcriber.WhisperModel"):
+    with patch("tapeback._fw_backend.WhisperModel"):
         assert Transcriber(s).describe() == "Whisper: large-v3-turbo on cpu/int8"
 
     assert waits == [0.0]
@@ -124,12 +124,12 @@ def test_clamp_check_skipped_when_disabled(settings, monkeypatch):
     """thermal_clamp_check=false must not touch the GPU at all."""
     calls: list[object] = []
     monkeypatch.setattr(
-        "tapeback.transcriber.wait_for_clamp_release",
+        "tapeback._fw_backend.wait_for_clamp_release",
         lambda *a, **k: calls.append(a) or True,
     )
     s = settings.model_copy(update={"device": "cuda", "thermal_clamp_check": False})
 
-    with patch("tapeback.transcriber.WhisperModel"):
+    with patch("tapeback._fw_backend.WhisperModel"):
         Transcriber(s)
 
     assert calls == []
@@ -138,12 +138,12 @@ def test_clamp_check_skipped_when_disabled(settings, monkeypatch):
 def test_clamp_check_skipped_on_cpu(settings, monkeypatch):
     calls: list[object] = []
     monkeypatch.setattr(
-        "tapeback.transcriber.wait_for_clamp_release",
+        "tapeback._fw_backend.wait_for_clamp_release",
         lambda *a, **k: calls.append(a) or True,
     )
     s = settings.model_copy(update={"device": "cpu", "thermal_clamp_check": True})
 
-    with patch("tapeback.transcriber.WhisperModel"):
+    with patch("tapeback._fw_backend.WhisperModel"):
         Transcriber(s)
 
     assert calls == []
@@ -160,8 +160,8 @@ def test_stage_pause_runs_between_channels(settings, clear_gpu):
     slept: list[float] = []
     messages: list[str] = []
     with (
-        patch("tapeback.transcriber.WhisperModel") as mock_model_cls,
-        patch("tapeback.transcriber.time.sleep", slept.append),
+        patch("tapeback._fw_backend.WhisperModel") as mock_model_cls,
+        patch("tapeback._fw_backend.time.sleep", slept.append),
     ):
         instance = mock_model_cls.return_value
         instance.transcribe.side_effect = [
@@ -185,8 +185,8 @@ def test_no_pause_when_disabled(settings, clear_gpu):
 
     slept: list[float] = []
     with (
-        patch("tapeback.transcriber.WhisperModel") as mock_model_cls,
-        patch("tapeback.transcriber.time.sleep", slept.append),
+        patch("tapeback._fw_backend.WhisperModel") as mock_model_cls,
+        patch("tapeback._fw_backend.time.sleep", slept.append),
     ):
         instance = mock_model_cls.return_value
         instance.transcribe.side_effect = [

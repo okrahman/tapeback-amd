@@ -1,4 +1,6 @@
-"""PII masking for the one thing that leaves this machine — the LLM request.
+"""PII masking for the LLM request — with the default faster-whisper backend, the one
+thing that leaves this machine. (The Lemonade backend uploads the recording itself,
+which masking cannot touch; see _lemonade.py and the README's PII section.)
 
 Recording, Whisper and pyannote all run locally; `summarizer.summarize()` is the only
 place a transcript crosses to a third party, and its fallback chain can hand the same

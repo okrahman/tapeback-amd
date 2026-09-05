@@ -94,7 +94,7 @@ def vault_env(tmp_vault, monkeypatch):
 @pytest.fixture
 def settings(tmp_vault):
     """Settings with temporary vault."""
-    return Settings(vault_path=tmp_vault)
+    return Settings(vault_path=tmp_vault, transcription_backend="faster-whisper")
 
 
 @pytest.fixture
@@ -156,6 +156,7 @@ def e2e_settings(tmp_path):
     return Settings(
         vault_path=vault,
         hf_token=SecretStr(os.environ.get("TAPEBACK_HF_TOKEN", os.environ.get("HF_TOKEN", ""))),
+        transcription_backend="faster-whisper",
     )
 
 

@@ -30,7 +30,7 @@ def test_monitor_language_is_reused_for_the_mic_channel(settings):
     """
     s = settings.model_copy(update={"device": "cpu", "language": "auto"})
 
-    with patch("tapeback.transcriber.WhisperModel") as mock_model_cls:
+    with patch("tapeback._fw_backend.WhisperModel") as mock_model_cls:
         instance = mock_model_cls.return_value
         instance.transcribe.side_effect = [
             # Monitor: plenty of speech, confident Russian.
@@ -57,7 +57,7 @@ def test_explicit_language_is_still_honoured_for_both_channels(settings):
     """A configured language must not be overridden by detection."""
     s = settings.model_copy(update={"device": "cpu", "language": "de"})
 
-    with patch("tapeback.transcriber.WhisperModel") as mock_model_cls:
+    with patch("tapeback._fw_backend.WhisperModel") as mock_model_cls:
         instance = mock_model_cls.return_value
         instance.transcribe.side_effect = [
             (iter([_segment(0.0, 5.0, "text")]), _info("de", 0.9)),
@@ -75,7 +75,7 @@ def test_mic_still_transcribed_when_monitor_detects_nothing(settings):
     """An empty monitor channel must not pin the mic to a bogus language."""
     s = settings.model_copy(update={"device": "cpu", "language": "auto"})
 
-    with patch("tapeback.transcriber.WhisperModel") as mock_model_cls:
+    with patch("tapeback._fw_backend.WhisperModel") as mock_model_cls:
         instance = mock_model_cls.return_value
         instance.transcribe.side_effect = [
             (iter([]), _info("", 0.0)),

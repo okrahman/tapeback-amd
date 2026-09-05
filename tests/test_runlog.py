@@ -11,6 +11,7 @@ from tapeback._runlog import (
     RunLog,
     _prune_old_records,
     default_run_log_dir,
+    redact_text,
     run_log,
     write_run_log,
 )
@@ -45,7 +46,70 @@ def test_run_log_records_config_events_and_outcome(tmp_path):
     ]
     assert record["config"]["whisper_model"] == "large-v3-turbo"
     assert record["config"]["chunk_length"] == 30
+    assert record["config"]["transcription_backend"] == "lemonade"
+    assert record["config"]["lemonade_url"] == "http://127.0.0.1:13305"
+    assert record["config"]["lemonade_model"] == "Whisper-Large-v3-Turbo"
+    assert record["config"]["lemonade_chunk_seconds"] == 300.0
+    assert record["config"]["lemonade_overlap_seconds"] == 2.0
     assert record["finished_at"] is not None
+
+
+def test_run_log_records_lemonade_config(tmp_path):
+    settings = Settings(
+        vault_path=tmp_path / "vault",
+        run_log_dir=tmp_path / "runs",
+        transcription_backend="lemonade",
+        lemonade_url="http://localhost:8000",
+        lemonade_model="custom-whisper",
+        lemonade_chunk_seconds=120.0,
+        lemonade_overlap_seconds=3.0,
+        lemonade_api_key=SecretStr("sk-lemon-secret"),
+    )
+
+    with run_log("lemon-session", settings, lambda _m: None) as report:
+        report("Lemonade transcription started")
+
+    record = _read_only_record(tmp_path / "runs")
+    assert record["config"]["transcription_backend"] == "lemonade"
+    assert record["config"]["lemonade_url"] == "http://localhost:8000"
+    assert record["config"]["lemonade_model"] == "custom-whisper"
+    assert record["config"]["lemonade_chunk_seconds"] == 120.0
+    assert record["config"]["lemonade_overlap_seconds"] == 3.0
+    assert "lemonade_api_key" not in record["config"]
+    assert "sk-lemon-secret" not in json.dumps(record)
+
+
+@pytest.mark.parametrize(
+    ("configured_url", "expected_recorded", "forbidden"),
+    [
+        ("HTTPS://Example.COM:443/api", "https://example.com", "/api"),
+        ("http://[::1]:80/private-token", "http://[::1]", "private-token"),
+        ("https://alice:password@example.test", "[invalid/redacted]", "password"),
+        ("https://example.test?token=query-secret", "[invalid/redacted]", "query-secret"),
+        ("https://example.test#fragment-secret", "[invalid/redacted]", "fragment-secret"),
+        ("https://example.test:99999", "[invalid/redacted]", "99999"),
+        (" https://example.test", "[invalid/redacted]", "example.test"),
+        ("https://example.test/\x1bsecret", "[invalid/redacted]", "secret"),
+    ],
+)
+def test_run_log_records_only_a_safe_lemonade_origin(
+    tmp_path, configured_url, expected_recorded, forbidden
+):
+    """The raw URL never crosses the durable run-log boundary, even on fw runs."""
+    settings = Settings(
+        vault_path=tmp_path / "vault",
+        run_log_dir=tmp_path / "runs",
+        transcription_backend="faster-whisper",
+        lemonade_url=configured_url,
+    )
+
+    with run_log("safe-origin", settings, lambda _m: None):
+        pass
+
+    raw = next((tmp_path / "runs").glob("*.json")).read_text()
+    record = json.loads(raw)
+    assert record["config"]["lemonade_url"] == expected_recorded
+    assert forbidden not in raw
 
 
 def test_run_log_never_records_credentials(tmp_path):
@@ -188,3 +252,100 @@ def test_write_run_log_returns_none_when_directory_is_unwritable(tmp_path):
 
     record = RunLog(session="s", started_at="2026-08-05T00:00:00+00:00", config={})
     assert write_run_log(record, blocker) is None
+
+
+def test_run_log_redacts_reflected_api_key_from_events_and_error(tmp_path):
+    """A remote error can reflect the received Authorization header; the run
+    record is the final persistence boundary and must not hold the credential."""
+    settings = Settings(
+        vault_path=tmp_path / "vault",
+        run_log_dir=tmp_path / "runs",
+        lemonade_api_key=SecretStr("sk-lemonade-secret"),
+        hf_token=SecretStr("hf-supersecret"),
+        llm_api_key=SecretStr("sk-llm-secret"),
+    )
+
+    printed: list[str] = []
+    with pytest.raises(RuntimeError), run_log("session", settings, printed.append) as report:
+        report("Lemonade server failure (HTTP 502): Bearer sk-lemonade-secret")
+        raise RuntimeError("upstream said: Bearer sk-llm-secret with hf-supersecret")
+
+    record = _read_only_record(tmp_path / "runs")
+    raw = json.dumps(record)
+    assert "sk-lemonade-secret" not in raw
+    assert "sk-llm-secret" not in raw
+    assert "hf-supersecret" not in raw
+    assert record["events"] == ["Lemonade server failure (HTTP 502): Bearer [redacted]"]
+    assert "[redacted]" in record["error"]
+
+
+def test_run_log_strips_terminal_control_characters(tmp_path):
+    """ESC sequences must never survive into a file the user may cat."""
+    settings = Settings(vault_path=tmp_path / "vault", run_log_dir=tmp_path / "runs")
+
+    with pytest.raises(RuntimeError), run_log("session", settings, lambda _m: None) as report:
+        report("\x1b]0;evil\x07 status line")
+        raise RuntimeError("boom\x1b[31m")
+
+    record = _read_only_record(tmp_path / "runs")
+    assert "\x1b" not in json.dumps(record)
+    assert "\x07" not in json.dumps(record)
+    assert record["events"] == ["]0;evil status line"]
+
+
+def test_run_log_without_secrets_behaves_as_before(tmp_path):
+    """Empty redactions are a no-op — plain status lines are stored verbatim."""
+    settings = Settings(vault_path=tmp_path / "vault", run_log_dir=tmp_path / "runs")
+
+    with run_log("session", settings, lambda _m: None) as report:
+        report("Stage 'merge' took 1.0s")
+
+    record = _read_only_record(tmp_path / "runs")
+    assert record["events"] == ["Stage 'merge' took 1.0s"]
+
+
+def test_redact_text_overlapping_secrets_longest_first():
+    """Prefix and suffix overlapping secrets must be fully redacted without leaving fragments."""
+    # Prefix overlap: "sk-live" is a prefix of "sk-live-prod"
+    redactions = ("sk-live", "sk-live-prod")
+    text = "Authorization: Bearer sk-live-prod then sk-live"
+    assert redact_text(text, redactions) == "Authorization: Bearer [redacted] then [redacted]"
+
+    # Suffix overlap: "secret" is a suffix of "super-secret"
+    redactions = ("secret", "super-secret")
+    text = "got super-secret and secret"
+    assert redact_text(text, redactions) == "got [redacted] and [redacted]"
+
+    # Infix / substring overlap + duplicate entries
+    redactions = ("key", "my-key-prod", "key", "")
+    text = "tokens: my-key-prod, key"
+    assert redact_text(text, redactions) == "tokens: [redacted], [redacted]"
+
+
+def test_run_log_redacts_overlapping_secrets_in_events_and_error(tmp_path):
+    """Overlapping configured keys in Settings must not leave reconstructable
+    fragments in events or errors.
+    """
+    settings = Settings(
+        vault_path=tmp_path / "vault",
+        run_log_dir=tmp_path / "runs",
+        lemonade_api_key=SecretStr("sk-live"),
+        hf_token=SecretStr("sk-live-prod"),
+        llm_api_key=SecretStr("sk-live-prod-extended"),
+    )
+
+    with (
+        pytest.raises(RuntimeError),
+        run_log("session", settings, lambda _m: None) as report,
+    ):
+        report("Event with sk-live-prod-extended and sk-live-prod and sk-live")
+        raise RuntimeError("Failed on sk-live-prod-extended with sk-live prefix")
+
+    record = _read_only_record(tmp_path / "runs")
+    raw = json.dumps(record)
+
+    assert "sk-live" not in raw
+    assert "-prod" not in raw
+    assert "-extended" not in raw
+    assert record["events"] == ["Event with [redacted] and [redacted] and [redacted]"]
+    assert record["error"] == "RuntimeError: Failed on [redacted] with [redacted] prefix"

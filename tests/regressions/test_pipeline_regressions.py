@@ -27,7 +27,7 @@ def test_process_stereo_no_diarize_returns_no_raw_segments(tmp_path):
     """
     vault = tmp_path / "vault"
     vault.mkdir()
-    settings = Settings(vault_path=vault)
+    settings = Settings(vault_path=vault, transcription_backend="faster-whisper")
 
     stereo = tmp_path / "stereo.wav"
     create_stereo_wav_segments(stereo, 48000, [(1.0, 0.8, 0.003), (1.0, 0.003, 0.8)])
@@ -37,7 +37,7 @@ def test_process_stereo_no_diarize_returns_no_raw_segments(tmp_path):
 
     mock_model = mock_whisper_transcribe([(0.0, 1.0, "Speech.")])
 
-    with patch("tapeback.transcriber.WhisperModel", return_value=mock_model):
+    with patch("tapeback._fw_backend.WhisperModel", return_value=mock_model):
         _segments, _info, raw_segments = process_stereo_file(
             stereo, output_dir, settings, diarize=False
         )
@@ -116,7 +116,9 @@ def test_process_stereo_times_every_heavy_stage(tmp_path):
     """
     vault = tmp_path / "vault"
     vault.mkdir()
-    settings = Settings(vault_path=vault, gate_mic_silence=True)
+    settings = Settings(
+        vault_path=vault, gate_mic_silence=True, transcription_backend="faster-whisper"
+    )
 
     stereo = tmp_path / "stereo.wav"
     create_stereo_wav_segments(stereo, 48000, [(1.0, 0.8, 0.003), (1.0, 0.003, 0.8)])
@@ -127,7 +129,7 @@ def test_process_stereo_times_every_heavy_stage(tmp_path):
     mock_model = mock_whisper_transcribe([(0.0, 1.0, "Speech.")])
 
     messages: list[str] = []
-    with patch("tapeback.transcriber.WhisperModel", return_value=mock_model):
+    with patch("tapeback._fw_backend.WhisperModel", return_value=mock_model):
         process_stereo_file(stereo, output_dir, settings, diarize=False, on_status=messages.append)
 
     timed = {m.split("'")[1] for m in messages if m.startswith("Stage '")}
@@ -144,7 +146,12 @@ def test_process_stereo_reports_resolved_device(tmp_path):
     """
     vault = tmp_path / "vault"
     vault.mkdir()
-    settings = Settings(vault_path=vault, device="cpu", compute_type="int8")
+    settings = Settings(
+        vault_path=vault,
+        device="cpu",
+        compute_type="int8",
+        transcription_backend="faster-whisper",
+    )
 
     stereo = tmp_path / "stereo.wav"
     create_stereo_wav_segments(stereo, 48000, [(1.0, 0.8, 0.003)])
@@ -155,7 +162,7 @@ def test_process_stereo_reports_resolved_device(tmp_path):
     mock_model = mock_whisper_transcribe([(0.0, 1.0, "Speech.")])
 
     messages: list[str] = []
-    with patch("tapeback.transcriber.WhisperModel", return_value=mock_model):
+    with patch("tapeback._fw_backend.WhisperModel", return_value=mock_model):
         process_stereo_file(stereo, output_dir, settings, diarize=False, on_status=messages.append)
 
     assert any(m == "Whisper: large-v3-turbo on cpu/int8" for m in messages)
@@ -167,7 +174,9 @@ def test_process_stereo_diarize_without_hf_token_returns_no_raw_segments(tmp_pat
     so raw_segments must be None (no duplicate section)."""
     vault = tmp_path / "vault"
     vault.mkdir()
-    settings = Settings(vault_path=vault, hf_token=SecretStr(""))
+    settings = Settings(
+        vault_path=vault, hf_token=SecretStr(""), transcription_backend="faster-whisper"
+    )
 
     stereo = tmp_path / "stereo.wav"
     create_stereo_wav_segments(stereo, 48000, [(1.0, 0.8, 0.003), (1.0, 0.003, 0.8)])
@@ -177,7 +186,7 @@ def test_process_stereo_diarize_without_hf_token_returns_no_raw_segments(tmp_pat
 
     mock_model = mock_whisper_transcribe([(0.0, 1.0, "Speech.")])
 
-    with patch("tapeback.transcriber.WhisperModel", return_value=mock_model):
+    with patch("tapeback._fw_backend.WhisperModel", return_value=mock_model):
         _segments, _info, raw_segments = process_stereo_file(
             stereo, output_dir, settings, diarize=True
         )
@@ -200,7 +209,7 @@ def test_process_mono_no_diarize_returns_no_raw_segments(tmp_path):
 
     mock_model = mock_whisper_transcribe([(0.0, 1.0, "Speech.")])
 
-    with patch("tapeback.transcriber.WhisperModel", return_value=mock_model):
+    with patch("tapeback._fw_backend.WhisperModel", return_value=mock_model):
         _segments, _info, raw_segments = process_mono_file(
             mono, output_dir, settings, diarize=False
         )

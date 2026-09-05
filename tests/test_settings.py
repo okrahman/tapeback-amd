@@ -127,3 +127,22 @@ def test_live_min_chunk_gt_interval_allowed_when_live_disabled(tmp_vault):
     """The chunk/interval check only applies when live transcription is enabled."""
     s = Settings(vault_path=tmp_vault, live=False, live_interval=10, live_min_chunk=30.0)
     assert s.live is False
+
+
+def test_lemonade_overlap_must_be_smaller_than_chunk(tmp_vault):
+    """Cross-field rule: 0 <= overlap < chunk, or every chunk re-sends the last."""
+    with pytest.raises(ValidationError):
+        Settings(vault_path=tmp_vault, lemonade_chunk_seconds=2.0, lemonade_overlap_seconds=2.0)
+    with pytest.raises(ValidationError):
+        Settings(vault_path=tmp_vault, lemonade_chunk_seconds=2.0, lemonade_overlap_seconds=3.0)
+    s = Settings(vault_path=tmp_vault, lemonade_chunk_seconds=2.0, lemonade_overlap_seconds=1.9)
+    assert s.lemonade_overlap_seconds == 1.9
+
+
+def test_lemonade_chunk_seconds_finite_bounds(tmp_vault):
+    with pytest.raises(ValidationError):
+        Settings(vault_path=tmp_vault, lemonade_chunk_seconds=0.0)
+    with pytest.raises(ValidationError):
+        Settings(vault_path=tmp_vault, lemonade_chunk_seconds=3601.0)
+    s = Settings(vault_path=tmp_vault, lemonade_chunk_seconds=3600.0)
+    assert s.lemonade_chunk_seconds == 3600.0
