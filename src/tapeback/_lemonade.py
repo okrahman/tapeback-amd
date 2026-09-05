@@ -1597,8 +1597,21 @@ class LemonadeBackend:
         self._api_key = key
 
     def describe(self) -> str:
-        """One line: which model, on which server. Hardware stays the server's business."""
-        return f"Lemonade: {self._settings.lemonade_model} at {self._base_url}"
+        """One line: which model, on which server. Hardware stays the server's business.
+
+        A plaintext-HTTP loopback endpoint with no bearer token is called out in
+        the same line: this string is the one disclosure every transcription run
+        makes (pipeline and live mode both print it), so the user sees that any
+        local process which wins the port first can receive the audio.
+        """
+        warning = ""
+        parsed = urllib.parse.urlparse(self._base_url)
+        if parsed.scheme == "http" and _is_loopback_host(parsed.hostname) and not self._api_key:
+            warning = (
+                " (unauthenticated plaintext: any local listener on this "
+                "port could receive the audio)"
+            )
+        return f"Lemonade: {self._settings.lemonade_model} at {self._base_url}{warning}"
 
     @property
     def base_url(self) -> str:
