@@ -16,6 +16,7 @@ from tapeback.summarizer import (
     extract_transcript_from_markdown,
     format_summary_markdown,
     inject_summary_into_markdown,
+    masked_preview,
     maybe_summarize,
     summarize,
 )
@@ -450,3 +451,49 @@ def test_maybe_summarize_end_to_end(tmp_vault, monkeypatch):
         maybe_summarize(md_file, settings_with_key)
     assert "## Summary" not in md_file.read_text()
     assert "Hello there." in md_file.read_text()
+
+
+# --- masked_preview ---
+
+
+def test_masked_preview_disabled(tmp_vault):
+    """When mask_pii is False, transcript is returned unchanged and counts is empty."""
+    settings = Settings(vault_path=tmp_vault, mask_pii=False)
+    transcript = "Contact Alice at alice@example.com or call +1 555 123 4567."
+
+    masked, counts = masked_preview(transcript, settings)
+
+    assert masked == transcript
+    assert counts == {}
+
+
+def test_masked_preview_enabled_custom_terms(tmp_vault):
+    """When mask_pii is True and mask_terms is provided, custom terms are masked."""
+    settings = Settings(
+        vault_path=tmp_vault,
+        mask_pii=True,
+        mask_terms="AcmeCorp, Project X",
+    )
+    transcript = "Welcome to AcmeCorp! We are working on Project X with AcmeCorp."
+
+    masked, counts = masked_preview(transcript, settings)
+
+    assert "AcmeCorp" not in masked
+    assert "Project X" not in masked
+    assert "[TERM_1]" in masked
+    assert "[TERM_2]" in masked
+    assert counts == {"TERM": 2}
+
+
+def test_masked_preview_enabled_pii(tmp_vault):
+    """When mask_pii is True, built-in PII rules (email, phone) are masked."""
+    settings = Settings(vault_path=tmp_vault, mask_pii=True)
+    transcript = "Email john.doe@example.com or call +7 999 123 45 67."
+
+    masked, counts = masked_preview(transcript, settings)
+
+    assert "john.doe@example.com" not in masked
+    assert "+7 999 123 45 67" not in masked
+    assert "[EMAIL_1]" in masked
+    assert "[PHONE_1]" in masked
+    assert counts == {"EMAIL": 1, "PHONE": 1}
