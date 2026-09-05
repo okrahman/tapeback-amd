@@ -93,6 +93,27 @@ def test_format_markdown_preserves_pauses():
     assert result.count("[00:") == 2
 
 
+def test_format_markdown_normalizes_segment_boundary_whitespace():
+    segments = [
+        Segment(start=0.0, end=1.0, text="  I'm  still  ", speaker="You"),
+        Segment(start=1.0, end=2.0, text=" transcribing  Lemonade, ", speaker="You"),
+        Segment(start=2.0, end=3.0, text=" timer.  ", speaker="You"),
+    ]
+
+    result = format_markdown(
+        segments,
+        TranscriptMeta(
+            session_name="2026-03-17_14-30-00",
+            audio_rel_path="audio.wav",
+            duration_seconds=3.0,
+            language="en",
+        ),
+    )
+
+    assert "**You:** I'm  still transcribing  Lemonade, timer." in result
+    assert "**You:**  I'm" not in result
+
+
 def test_format_markdown_preserves_short_wordless_speech():
     result = format_markdown(
         [Segment(start=10.0, end=10.47, text="timer.")],

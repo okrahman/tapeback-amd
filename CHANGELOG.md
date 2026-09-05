@@ -22,6 +22,9 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - GPU telemetry and transcription isolation are disabled for the Lemonade backend (there is no local inference to sample or isolate); `TAPEBACK_DEVICE` still governs faster-whisper and diarization.
 
 ### Fixed
+- **Markdown transcript joins normalize decoder segment boundaries.** Leading and
+  trailing whitespace from adjacent segments now renders as one space, while raw
+  Lemonade segment text remains unchanged for merging and cached results.
 - **Lemonade BPE tokens are no longer exposed as words.** Lemonade segment text and
   timestamps are now authoritative, while its `words` array is ignored because it
   contains BPE tokens with unsuitable timestamps. Lemonade keeps segment-level RMS

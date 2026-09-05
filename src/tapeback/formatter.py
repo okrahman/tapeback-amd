@@ -94,6 +94,10 @@ def _merge_consecutive_speakers(
     if not segments:
         return []
 
+    def display_text(texts: list[str]) -> str:
+        """Join decoder segments with one boundary space for Markdown display."""
+        return " ".join(text for text in (text.strip() for text in texts) if text)
+
     merged: list[tuple[float, str | None, str]] = []
     current_start = segments[0].start
     current_end = segments[0].end
@@ -107,13 +111,13 @@ def _merge_consecutive_speakers(
             current_texts.append(seg.text)
             current_end = seg.end
         else:
-            merged.append((current_start, current_speaker, " ".join(current_texts)))
+            merged.append((current_start, current_speaker, display_text(current_texts)))
             current_start = seg.start
             current_end = seg.end
             current_speaker = seg.speaker
             current_texts = [seg.text]
 
-    merged.append((current_start, current_speaker, " ".join(current_texts)))
+    merged.append((current_start, current_speaker, display_text(current_texts)))
     return merged
 
 
