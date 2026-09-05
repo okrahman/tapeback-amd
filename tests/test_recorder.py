@@ -1,10 +1,48 @@
 import json
+import re
 import signal
 from unittest.mock import MagicMock, patch
 
-from tapeback.recorder import detect_devices
+import pytest
+
+from tapeback.recorder import detect_devices, validate_session_name
 from tapeback.settings import Settings
 from tests.fixtures import create_session_file
+
+
+@pytest.mark.parametrize(
+    "valid_name",
+    [
+        "session123",
+        "2026-04-02_12-00-00",
+        "my_session-name",
+        "ABC_def-123",
+    ],
+)
+def test_validate_session_name_valid(valid_name):
+    """Valid session names should pass without raising exceptions."""
+    validate_session_name(valid_name)
+
+
+@pytest.mark.parametrize(
+    "invalid_name",
+    [
+        "../session",
+        "session/1",
+        "session name",
+        "session!",
+        "session@name",
+        "",
+    ],
+)
+def test_validate_session_name_invalid(invalid_name):
+    """Invalid session names should raise ValueError with exact error message."""
+    expected_msg = (
+        f"Invalid session name: {invalid_name!r}. "
+        "Only alphanumerics, dashes, and underscores are allowed."
+    )
+    with pytest.raises(ValueError, match=re.escape(expected_msg)):
+        validate_session_name(invalid_name)
 
 
 def test_detect_devices_auto_dynamic(settings):
