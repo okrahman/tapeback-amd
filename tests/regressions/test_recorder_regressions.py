@@ -115,3 +115,53 @@ def test_start_refuses_symlinked_recording_path(recorder, settings, tmp_path, mo
         recorder.start(settings, session_name="symlink_session")
 
     assert sentinel.read_text() == "do not touch"
+
+
+def test_start_replaces_planted_fifo_at_recording_path(recorder, settings, tmp_path, monkeypatch):
+    """A planted FIFO must never become the microphone's write target.
+
+    Bug: refuse_symlink_target accepted every non-symlink inode. In the
+    permissive-directory scenario the 0700 repair targets, an attacker who
+    planted mic.wav as a FIFO and opened it before the chmod kept a live
+    descriptor that parecord would stream microphone audio into.
+    """
+    monkeypatch.setattr(recorder_mod.const, "TEMP_DIR", str(tmp_path / "tapeback"))
+    _patch_parecord(monkeypatch, tmp_path)
+    session_dir = tmp_path / "tapeback" / "fifo_session"
+    session_dir.mkdir(parents=True, mode=0o777)
+    os.chmod(session_dir, 0o777)  # noqa: S103 — deliberately permissive: reproduces the attack
+    os.mkfifo(session_dir / "mic.wav")
+
+    name = recorder.start(settings, session_name="fifo_session")
+
+    assert name == "fifo_session"
+    mic_path = session_dir / "mic.wav"
+    mic_stat = os.lstat(mic_path)
+    assert stat.S_ISREG(mic_stat.st_mode)
+    assert stat.S_IMODE(mic_stat.st_mode) == 0o600
+
+
+def test_start_replaces_attacker_readable_recording_file(recorder, settings, tmp_path, monkeypatch):
+    """A planted regular file must be replaced, not written into.
+
+    An attacker who created a permissive regular file at the predictable path
+    before the directory was secured holds an open descriptor on that inode;
+    recording data must go to a fresh inode the attacker cannot read.
+    """
+    monkeypatch.setattr(recorder_mod.const, "TEMP_DIR", str(tmp_path / "tapeback"))
+    _patch_parecord(monkeypatch, tmp_path)
+    session_dir = tmp_path / "tapeback" / "stale_session"
+    session_dir.mkdir(parents=True, mode=0o777)
+    os.chmod(session_dir, 0o777)  # noqa: S103 — deliberately permissive: reproduces the attack
+    mic_path = session_dir / "mic.wav"
+    mic_path.write_text("attacker-controlled")
+    os.chmod(mic_path, 0o666)  # noqa: S103
+    old_inode = os.lstat(mic_path).st_ino
+
+    recorder.start(settings, session_name="stale_session")
+
+    new_stat = os.lstat(mic_path)
+    assert stat.S_ISREG(new_stat.st_mode)
+    assert new_stat.st_ino != old_inode
+    assert stat.S_IMODE(new_stat.st_mode) == 0o600
+    assert mic_path.read_bytes() == b""

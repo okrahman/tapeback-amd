@@ -52,3 +52,37 @@ def refuse_symlink_target(path: Path, purpose: str) -> None:
     """
     if path.is_symlink():
         raise RuntimeError(f"Refusing to {purpose} through symlink: {path}")
+
+
+def require_fresh_regular_target(path: Path, purpose: str) -> None:
+    """Ensure `path` is a fresh, private regular file this process creates.
+
+    Callers write recording and staging output to predictable paths inside a
+    directory that `ensure_private_dir` has just secured. Refusing only
+    symlinks was not enough: the directory may have been permissive until a
+    moment ago, and an attacker who planted a FIFO — or who holds an open
+    descriptor on a planted regular file — from before the chmod keeps a live
+    handle that reads everything the writer produces afterwards. So:
+
+    - a symlink is refused outright (as before);
+    - a directory at the path is refused (it cannot be unlinked away);
+    - any other pre-existing inode (FIFO, socket, device, regular file) is
+      unlinked, redirecting every subsequent write to a fresh inode that the
+      attacker's stale descriptor cannot follow;
+    - the file is then pre-created with O_CREAT|O_EXCL and mode 0600, closing
+      the race between the check and the writer's open: the writer opens and
+      truncates a file only this user could have created inside a 0700
+      directory.
+    """
+    if path.is_symlink():
+        raise RuntimeError(f"Refusing to {purpose} through symlink: {path}")
+    try:
+        st = path.lstat()
+    except FileNotFoundError:
+        st = None
+    if st is not None:
+        if stat.S_ISDIR(st.st_mode):
+            raise RuntimeError(f"Refusing to {purpose}: a directory exists at {path}")
+        path.unlink()
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    os.close(fd)

@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import TypedDict
 
 from tapeback import const
-from tapeback._fs import ensure_private_dir, refuse_symlink_target
+from tapeback._fs import ensure_private_dir, require_fresh_regular_target
 from tapeback.settings import Settings
 
 
@@ -204,10 +204,11 @@ class Recorder:
         monitor_path = tmp_dir / const.FILE_MONITOR
         mic_path = tmp_dir / const.FILE_MIC
         # The WAV paths are predictable, so refuse to let parecord write through
-        # a planted symlink; inside a verified 0700 directory only we (or root)
-        # could have placed one.
-        refuse_symlink_target(monitor_path, "record the monitor channel")
-        refuse_symlink_target(mic_path, "record the mic channel")
+        # a planted symlink, FIFO, or attacker-held regular file; inside a
+        # verified 0700 directory each output is re-created as a fresh 0600
+        # regular file only we could have made.
+        require_fresh_regular_target(monitor_path, "record the monitor channel")
+        require_fresh_regular_target(mic_path, "record the mic channel")
 
         base_cmd = [
             "parecord",

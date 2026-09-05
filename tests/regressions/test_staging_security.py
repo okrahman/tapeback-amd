@@ -76,6 +76,41 @@ def test_staging_symlink_output_is_refused_and_victim_intact(process_env, monkey
     assert sentinel.read_text() == "do not touch"
 
 
+def test_staging_fifo_output_is_replaced_with_a_private_regular_file(process_env, monkeypatch):
+    """ffmpeg must never stream audio into a planted FIFO in the staging dir.
+
+    Bug: the staging guard refused only symlinks. In the permissive-directory
+    scenario, an attacker who planted mono_16k.wav as a FIFO (and opened it
+    before the 0700 repair) kept a live descriptor the converted audio would
+    stream into; a slow reader could also stall the run.
+    """
+    _tmp_path, settings, audio = process_env
+    stage = predicted_staging_dir(audio)
+    os.makedirs(stage, mode=0o777, exist_ok=True)
+    os.chmod(stage, 0o777)  # noqa: S103 — deliberately permissive: reproduces the attack
+    os.mkfifo(os.path.join(stage, "mono_16k.wav"))
+
+    monkeypatch.setattr(pipeline_mod, "load_transcriber", lambda s: mock_transcriber())
+
+    observed = []
+
+    def observing_transcribe(audio_path, **kwargs):
+        observed.append(os.lstat(audio_path))
+        return [Segment(start=0.0, end=0.5, text="speech")], {
+            "language": "en",
+            "duration": 0.5,
+        }
+
+    monkeypatch.setattr(
+        pipeline_mod, "load_transcriber", lambda s: mock_transcriber(observing_transcribe)
+    )
+
+    process_file(audio, settings, name="fifo_victim", diarize=False, do_summarize=False)
+
+    assert len(observed) == 1
+    assert stat_module.S_ISREG(observed[0].st_mode)
+
+
 def test_precreated_permissive_staging_dir_is_repaired_to_private(process_env, monkeypatch):
     """A pre-created 0777 staging dir must be repaired to 0700, not accepted."""
     _tmp_path, settings, audio = process_env
