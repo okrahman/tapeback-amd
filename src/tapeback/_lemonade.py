@@ -1531,6 +1531,36 @@ class _MergeState:
         self.segments.sort(key=lambda s: (s.start, s.end))
 
 
+_CONTENT_LENGTH_RE = re.compile(r"[0-9]{1,15}")
+
+
+def _parse_content_length(value: str) -> int:
+    """Parse a Content-Length header as bounded ASCII digits, or refuse it.
+
+    ``str.isdigit()`` is not a safety check: it accepts non-ASCII characters
+    (``"²"`` is "a digit" but ``int("²")`` raises ValueError) and a long
+    enough decimal string trips CPython's integer-string conversion limit
+    (``sys.set_int_max_str_digits``, default 4300 digits) — either way ``int()``
+    raised outside the error hierarchy, crashing transcribe/status instead of
+    classifying the response as unavailable. Only 1-15 ASCII digits are
+    accepted (far past any legitimate response size) and everything else is a
+    sanitized LemonadeUnavailableError.
+    """
+    text = value.strip()
+    if not _CONTENT_LENGTH_RE.fullmatch(text):
+        detail = _sanitize_remote_detail(text) or "unprintable"
+        raise LemonadeUnavailableError(
+            f"Lemonade declared a malformed Content-Length ({detail}); "
+            "refusing to read the response."
+        )
+    try:
+        return int(text)
+    except ValueError:  # pragma: no cover — bounded ASCII digits cannot raise
+        raise LemonadeUnavailableError(
+            "Lemonade declared an unparseable Content-Length; refusing to read the response."
+        ) from None
+
+
 class LemonadeBackend:
     """Transcription through a remote Lemonade Server over HTTP.
 
@@ -1828,16 +1858,14 @@ class LemonadeBackend:
                 headers = getattr(response, "headers", None)
                 if headers is not None:
                     content_length = headers.get("Content-Length")
-                    if (
-                        content_length
-                        and content_length.strip().isdigit()
-                        and int(content_length) > _MAX_RESPONSE_BYTES
-                    ):
-                        raise LemonadeUnavailableError(
-                            f"Lemonade declared a {int(content_length)}-byte response — "
-                            f"over the {_MAX_RESPONSE_BYTES}-byte response cap; "
-                            "refusing to read it."
-                        )
+                    if content_length:
+                        declared = _parse_content_length(content_length)
+                        if declared > _MAX_RESPONSE_BYTES:
+                            raise LemonadeUnavailableError(
+                                f"Lemonade declared a {declared}-byte response — "
+                                f"over the {_MAX_RESPONSE_BYTES}-byte response cap; "
+                                "refusing to read it."
+                            )
                 raw = _read_bounded(response, _MAX_RESPONSE_BYTES, deadline=deadline)
             if len(raw) > _MAX_RESPONSE_BYTES:
                 raise LemonadeUnavailableError(

@@ -846,6 +846,62 @@ def test_oversized_content_length_is_refused_unread(tmp_path, monkeypatch):
         LemonadeBackend(lemon_settings(tmp_path)).transcribe(wav)
 
     assert "response cap" in str(excinfo.value)
+class _HeaderedResponse:
+    """A response whose only notable feature is its Content-Length header."""
+
+    def __init__(self, content_length: str) -> None:
+        self.headers = Message()
+        self.headers["Content-Length"] = content_length
+
+    def read(self, n: int = -1) -> bytes:  # pragma: no cover — must never be called
+        raise AssertionError("a malformed Content-Length must not be read")
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+
+@pytest.mark.parametrize(
+    "header",
+    [
+        "9" * 5000,  # past CPython's int-str conversion limit: int() used to raise
+        "²",  # str.isdigit() is True, but int() rejects it
+        "١٢٣",  # non-ASCII decimal digits
+        "12abc",
+        "-5",
+        "1_000",
+    ],
+)
+def test_hostile_content_length_is_classified_as_unavailable(tmp_path, monkeypatch, header):
+    """A hostile Content-Length must land in the error hierarchy, never ValueError.
+
+    Bug: `content_length.strip().isdigit()` was treated as proof that `int()`
+    is safe. A decimal string longer than the integer-string conversion limit
+    (or non-ASCII "digits") made `int()` raise ValueError outside the
+    bounded unavailable/fallback behavior, crashing the run.
+    """
+    wav = tmp_path / "a.wav"
+    write_wav(wav, 0.5)
+    install_urlopen(monkeypatch, [_HeaderedResponse(header)])
+
+    with pytest.raises(LemonadeUnavailableError) as excinfo:
+        LemonadeBackend(lemon_settings(tmp_path)).transcribe(wav)
+
+    assert not isinstance(excinfo.value, ValueError)
+    assert "Content-Length" in str(excinfo.value)
+
+
+def test_normal_content_length_still_applies_the_cap(tmp_path, monkeypatch):
+    """A parsable, ASCII, over-cap Content-Length is still refused unread."""
+    wav = tmp_path / "a.wav"
+    write_wav(wav, 0.5)
+    monkeypatch.setattr(lemon, "_MAX_RESPONSE_BYTES", 1024)
+    install_urlopen(monkeypatch, [_HeaderedResponse("999999999999")])
+
+    with pytest.raises(LemonadeUnavailableError, match="response cap"):
+        LemonadeBackend(lemon_settings(tmp_path)).transcribe(wav)
 
 
 def test_streamed_oversized_response_is_refused(tmp_path, monkeypatch):
