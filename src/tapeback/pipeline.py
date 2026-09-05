@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
+import os
 import shutil
 import tempfile
 from collections.abc import Callable
@@ -13,6 +15,7 @@ if TYPE_CHECKING:
     from tapeback.live import LiveTranscriber
 
 from tapeback import const
+from tapeback._fs import ensure_private_dir
 from tapeback._gpu import free_gpu_memory, sample_gpu
 from tapeback._lazy import load_transcriber
 from tapeback._runlog import run_log
@@ -137,6 +140,29 @@ def stop_and_process(
     return md_path
 
 
+def _acquire_staging_lock(tmp_dir: Path) -> int:
+    """Lock the staging dir against concurrent jobs on the same source identity.
+
+    Two processes handling the same input would otherwise share the fixed
+    filenames inside the directory and delete it under each other. The lock is
+    advisory-but-exclusive across tapeback processes: a second job fails fast
+    with a clear message instead of corrupting the first one's artifacts. The
+    OS releases the flock if a process dies, so a crashed run never wedges the
+    directory. Returns the lock fd; the caller must close it (releasing the
+    lock).
+    """
+    lock_fd = os.open(tmp_dir / "proc.lock", os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(lock_fd)
+        raise RuntimeError(
+            "Another tapeback process is already working on this recording; "
+            "wait for it to finish and try again."
+        ) from None
+    return lock_fd
+
+
 def process_file(
     audio_path: Path,
     settings: Settings,
@@ -151,52 +177,61 @@ def process_file(
         name = audio_path.stem
     validate_session_name(name)
 
-    # Deterministic staging directory per input audio identity, so resume cache keys
-    # remain stable across separate process runs.
+    # Stable staging directory per input audio identity, so resume cache keys
+    # (which hash the converted files' paths) remain stable across runs. The
+    # predictability is an attacker-facing property, so the directory is
+    # verified (owner, real dir, 0700) rather than blindly accepted, and an
+    # inter-process lock keeps two jobs on the same source identity from
+    # interleaving writes into the shared fixed filenames.
     try:
         stat = audio_path.stat()
         ident = f"{audio_path.resolve()}:{stat.st_size}:{stat.st_mtime_ns}"
     except OSError:
         ident = str(audio_path.resolve())
     staging_hash = hashlib.sha256(ident.encode()).hexdigest()[:16]
-    tmp_dir = Path(tempfile.gettempdir()) / "tapeback" / f"proc_{staging_hash}"
-    tmp_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    staging_root = Path(tempfile.gettempdir()) / "tapeback"
+    ensure_private_dir(staging_root)
+    tmp_dir = staging_root / f"proc_{staging_hash}"
+    ensure_private_dir(tmp_dir)
+    lock_fd = _acquire_staging_lock(tmp_dir)
 
-    with run_log(name, settings, on_status) as report:
-        audio_dest = save_audio_to_vault(audio_path, settings, name)
-        report(f"Audio saved: {audio_dest}")
+    try:
+        with run_log(name, settings, on_status) as report:
+            audio_dest = save_audio_to_vault(audio_path, settings, name)
+            report(f"Audio saved: {audio_dest}")
 
-        if is_stereo(audio_path):
-            report("Stereo file detected, using dual-channel pipeline...")
-            segments, info, raw_segments = process_stereo_file(
-                audio_path, tmp_dir, settings, diarize=diarize, on_status=report
+            if is_stereo(audio_path):
+                report("Stereo file detected, using dual-channel pipeline...")
+                segments, info, raw_segments = process_stereo_file(
+                    audio_path, tmp_dir, settings, diarize=diarize, on_status=report
+                )
+            else:
+                segments, info, raw_segments = process_mono_file(
+                    audio_path, tmp_dir, settings, diarize=diarize, on_status=report
+                )
+
+            audio_rel_path = f"{settings.attachments_dir}/{name}.wav"
+
+            markdown = format_markdown(
+                segments=segments,
+                meta=TranscriptMeta(
+                    session_name=name,
+                    audio_rel_path=audio_rel_path,
+                    duration_seconds=float(info.get("duration", 0.0)),
+                    language=str(info.get("language", settings.language)),
+                    partial=bool(info.get("partial")),
+                ),
+                raw_segments=raw_segments,
             )
-        else:
-            segments, info, raw_segments = process_mono_file(
-                audio_path, tmp_dir, settings, diarize=diarize, on_status=report
-            )
 
-        audio_rel_path = f"{settings.attachments_dir}/{name}.wav"
+            md_path = save_markdown_to_vault(markdown, settings, name)
+            report(f"Saved: {md_path}")
 
-        markdown = format_markdown(
-            segments=segments,
-            meta=TranscriptMeta(
-                session_name=name,
-                audio_rel_path=audio_rel_path,
-                duration_seconds=float(info.get("duration", 0.0)),
-                language=str(info.get("language", settings.language)),
-                partial=bool(info.get("partial")),
-            ),
-            raw_segments=raw_segments,
-        )
-
-        md_path = save_markdown_to_vault(markdown, settings, name)
-        report(f"Saved: {md_path}")
-
-        if do_summarize:
-            _maybe_summarize(md_path, settings, report)
-
-    shutil.rmtree(tmp_dir, ignore_errors=True)
+            if do_summarize:
+                _maybe_summarize(md_path, settings, report)
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        os.close(lock_fd)
     return md_path
 
 

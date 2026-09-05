@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import TypedDict
 
 from tapeback import const
+from tapeback._fs import ensure_private_dir, refuse_symlink_target
 from tapeback.settings import Settings
 
 
@@ -196,12 +197,17 @@ class Recorder:
             validate_session_name(session_name)
 
         base_dir = Path(const.TEMP_DIR)
-        base_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        ensure_private_dir(base_dir)
         tmp_dir = base_dir / session_name
-        tmp_dir.mkdir(exist_ok=True, mode=0o700)
+        ensure_private_dir(tmp_dir)
 
         monitor_path = tmp_dir / const.FILE_MONITOR
         mic_path = tmp_dir / const.FILE_MIC
+        # The WAV paths are predictable, so refuse to let parecord write through
+        # a planted symlink; inside a verified 0700 directory only we (or root)
+        # could have placed one.
+        refuse_symlink_target(monitor_path, "record the monitor channel")
+        refuse_symlink_target(mic_path, "record the mic channel")
 
         base_cmd = [
             "parecord",

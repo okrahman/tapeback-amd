@@ -2,10 +2,12 @@
 
 import json
 import os
+import stat
 from unittest.mock import MagicMock, patch
 
 import pytest
 
+import tapeback.recorder as recorder_mod
 from tapeback.recorder import detect_devices
 from tests.fixtures import create_session_file
 
@@ -70,3 +72,46 @@ def test_parecord_not_found(recorder, settings):
         pytest.raises(RuntimeError, match="parecord not found"),
     ):
         recorder.start(settings)
+
+
+def _patch_parecord(monkeypatch, tmp_path):
+    """Stub device detection and parecord so start() never spawns anything."""
+    monkeypatch.setattr(recorder_mod.shutil, "which", lambda name: "/usr/bin/parecord")
+    monkeypatch.setattr(recorder_mod, "detect_devices", lambda settings: ("mon", "mic"))
+    proc = MagicMock()
+    proc.pid = 4242
+    monkeypatch.setattr(recorder_mod.subprocess, "Popen", lambda *a, **kw: proc)
+
+
+def test_start_repairs_permissive_session_dir(recorder, settings, tmp_path, monkeypatch):
+    """A pre-created 0777 session directory must be repaired to 0700, not accepted.
+
+    Bug: mkdir(mode=0o700, exist_ok=True) silently accepted a pre-existing
+    permissive directory, exposing the recording WAVs.
+    """
+    monkeypatch.setattr(recorder_mod.const, "TEMP_DIR", str(tmp_path / "tapeback"))
+    _patch_parecord(monkeypatch, tmp_path)
+    session_dir = tmp_path / "tapeback" / "repair_session"
+    session_dir.mkdir(parents=True, mode=0o777)
+    os.chmod(session_dir, 0o777)  # noqa: S103 — deliberately permissive: reproduces the attack
+
+    name = recorder.start(settings, session_name="repair_session")
+
+    assert name == "repair_session"
+    assert stat.S_IMODE(session_dir.stat().st_mode) == 0o700
+
+
+def test_start_refuses_symlinked_recording_path(recorder, settings, tmp_path, monkeypatch):
+    """parecord must not write through a planted symlink at the fixed WAV path."""
+    monkeypatch.setattr(recorder_mod.const, "TEMP_DIR", str(tmp_path / "tapeback"))
+    _patch_parecord(monkeypatch, tmp_path)
+    sentinel = tmp_path / "victim.txt"
+    sentinel.write_text("do not touch")
+    session_dir = tmp_path / "tapeback" / "symlink_session"
+    session_dir.mkdir(parents=True)
+    os.symlink(sentinel, session_dir / "mic.wav")
+
+    with pytest.raises(RuntimeError, match="symlink"):
+        recorder.start(settings, session_name="symlink_session")
+
+    assert sentinel.read_text() == "do not touch"

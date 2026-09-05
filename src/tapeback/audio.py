@@ -9,6 +9,7 @@ from pathlib import Path
 import numpy as np
 
 from tapeback import const
+from tapeback._fs import refuse_symlink_target
 from tapeback.channel import gate_inactive_regions, is_channel_active
 
 
@@ -71,6 +72,7 @@ def merge_channels(monitor_wav: Path, mic_wav: Path, output_dir: Path) -> Path:
 
     output_dir.mkdir(parents=True, exist_ok=True)
     stereo_path = output_dir / const.FILE_STEREO
+    refuse_symlink_target(stereo_path, "write the merged stereo file")
 
     # Merge to stereo (left=mic, right=monitor)
     merge_cmd = [
@@ -114,6 +116,8 @@ def split_channels_16k(stereo_wav: Path, output_dir: Path) -> tuple[Path, Path]:
     output_dir.mkdir(parents=True, exist_ok=True)
     mic_16k_path = output_dir / const.FILE_MIC_16K
     monitor_16k_path = output_dir / const.FILE_MONITOR_16K
+    refuse_symlink_target(mic_16k_path, "write the mic channel")
+    refuse_symlink_target(monitor_16k_path, "write the monitor channel")
 
     subprocess.run(
         [
@@ -164,6 +168,7 @@ def convert_to_mono16k(input_file: Path, output_dir: Path) -> Path:
 
     output_dir.mkdir(parents=True, exist_ok=True)
     output_path = output_dir / const.FILE_MONO_16K
+    refuse_symlink_target(output_path, "write the converted mono file")
 
     subprocess.run(
         [
