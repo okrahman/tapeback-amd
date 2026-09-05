@@ -2,7 +2,7 @@
 
 import wave
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
@@ -75,18 +75,20 @@ def test_transcribe_stereo_skips_both_silent_channels_with_real_durations(tmp_pa
     write_mono_wav(monitor, 28.672, 0)
     backend = fake_backend()
     transcriber = make_transcriber(tmp_path, backend)
-    transcriber._load_resume = MagicMock()
-    transcriber._store_resume = MagicMock()
-    transcriber._pace = MagicMock()
     statuses: list[str] = []
 
-    mic_segments, monitor_segments, info = transcriber.transcribe_stereo(
-        mic,
-        monitor,
-        on_status=statuses.append,
-        mic_active=False,
-        monitor_active=False,
-    )
+    with (
+        patch.object(transcriber, "_load_resume", MagicMock()) as load_resume,
+        patch.object(transcriber, "_store_resume", MagicMock()) as store_resume,
+        patch.object(transcriber, "_pace", MagicMock()) as pace,
+    ):
+        mic_segments, monitor_segments, info = transcriber.transcribe_stereo(
+            mic,
+            monitor,
+            on_status=statuses.append,
+            mic_active=False,
+            monitor_active=False,
+        )
 
     assert mic_segments == []
     assert monitor_segments == []
@@ -97,9 +99,9 @@ def test_transcribe_stereo_skips_both_silent_channels_with_real_durations(tmp_pa
         "Skipping mic transcription — channel is digitally silent.",
     ]
     backend.transcribe.assert_not_called()
-    transcriber._load_resume.assert_not_called()
-    transcriber._store_resume.assert_not_called()
-    transcriber._pace.assert_not_called()
+    load_resume.assert_not_called()
+    store_resume.assert_not_called()
+    pace.assert_not_called()
 
 
 @pytest.mark.parametrize(
@@ -115,19 +117,20 @@ def test_transcribe_stereo_only_calls_the_active_channel(
     write_mono_wav(monitor, 2.5, 1 if monitor_active else 0)
     backend = fake_backend()
     transcriber = make_transcriber(tmp_path, backend)
-    transcriber._load_resume = MagicMock(return_value=None)
-    transcriber._store_resume = MagicMock()
-
-    mic_segments, monitor_segments, _info = transcriber.transcribe_stereo(
-        mic, monitor, mic_active=mic_active, monitor_active=monitor_active
-    )
+    with (
+        patch.object(transcriber, "_load_resume", MagicMock(return_value=None)) as load_resume,
+        patch.object(transcriber, "_store_resume", MagicMock()) as store_resume,
+    ):
+        mic_segments, monitor_segments, _info = transcriber.transcribe_stereo(
+            mic, monitor, mic_active=mic_active, monitor_active=monitor_active
+        )
 
     assert backend.transcribe.call_count == 1
     assert backend.transcribe.call_args.kwargs["stage"] == stage
     assert len(mic_segments) == int(mic_active)
     assert len(monitor_segments) == int(monitor_active)
-    assert transcriber._load_resume.call_count == 1
-    assert transcriber._store_resume.call_count == 1
+    assert load_resume.call_count == 1
+    assert store_resume.call_count == 1
 
 
 def test_sole_active_channel_falls_back_without_transcribing_silent_sibling(tmp_path, monkeypatch):
