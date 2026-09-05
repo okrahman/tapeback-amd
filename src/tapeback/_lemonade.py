@@ -1354,7 +1354,15 @@ class _MergeState:
 
     @staticmethod
     def _same_utterance(left: Segment, right: Segment) -> bool:
-        """Whether overlap candidates say the same thing, allowing token prefixes."""
+        """Whether overlap candidates say the same thing, allowing end extensions.
+
+        The shorter token sequence must anchor at the START (prefix) or the END
+        (suffix) of the longer one: chunk overlap can truncate an utterance on
+        either side, and the later chunk may add leading or trailing context.
+        General mid-utterance containment is deliberately NOT accepted — two
+        genuinely distinct short phrases ("no thanks" vs "thank you") that
+        happen to fall in the same overlap window must both survive.
+        """
         left_tokens = _utterance_tokens(left.text)
         right_tokens = _utterance_tokens(right.text)
         if not left_tokens or not right_tokens:
@@ -1364,7 +1372,8 @@ class _MergeState:
             if len(left_tokens) <= len(right_tokens)
             else (right_tokens, left_tokens)
         )
-        return short == long[: len(short)]
+        span = len(short)
+        return short == long[:span] or short == long[len(long) - span :]
 
     @staticmethod
     def _prefer(

@@ -1608,6 +1608,84 @@ def test_cjk_overlap_deduplication(tmp_path, monkeypatch):
     assert [s.text for s in segments] == ["第一部分", "今天天气很好", "第二部分", "第三部分"]
 
 
+def test_overlap_dedup_with_leading_context_extension(tmp_path, monkeypatch):
+    """A later chunk adding LEADING context must still deduplicate the utterance.
+
+    Bug: _same_utterance only accepted token-prefix matches, so an earlier
+    chunk ending "thank you" and a later chunk's overlap returning
+    "no thank you" for the same span both survived the merge.
+    """
+    wav = tmp_path / "lead_ext.wav"
+    write_wav(wav, 1.5)  # chunk 0: 0.0-1.0 (core 0.0-0.5), chunk 1: 0.5-1.5 (overlap 0.5-1.0)
+
+    responses = [
+        verbose_json([seg(0.4, 0.95, "thank you")]),
+        verbose_json([seg(0.0, 0.45, "no thank you")]),
+    ]
+    calls = install_urlopen(monkeypatch, responses)
+
+    segments, _info = LemonadeBackend(lemon_settings(tmp_path)).transcribe(wav)
+
+    assert len(calls) == 2
+    assert [s.text for s in segments] == ["no thank you"]
+
+
+def test_overlap_dedup_with_trailing_context_extension(tmp_path, monkeypatch):
+    """A later chunk adding TRAILING context must deduplicate and keep the longer text."""
+    wav = tmp_path / "trail_ext.wav"
+    write_wav(wav, 1.5)
+
+    responses = [
+        verbose_json([seg(0.4, 0.95, "meeting starts")]),
+        verbose_json([seg(0.0, 0.49, "meeting starts now")]),
+    ]
+    calls = install_urlopen(monkeypatch, responses)
+
+    segments, _info = LemonadeBackend(lemon_settings(tmp_path)).transcribe(wav)
+
+    assert len(calls) == 2
+    assert [s.text for s in segments] == ["meeting starts now"]
+
+
+def test_overlap_dedup_punctuation_only_difference(tmp_path, monkeypatch):
+    """Punctuation-only differences must not block dedup; the longer text is kept."""
+    wav = tmp_path / "punct.wav"
+    write_wav(wav, 1.5)
+
+    responses = [
+        verbose_json([seg(0.4, 0.99, "Hello, world!")]),
+        verbose_json([seg(0.0, 0.49, "Hello world")]),
+    ]
+    calls = install_urlopen(monkeypatch, responses)
+
+    segments, _info = LemonadeBackend(lemon_settings(tmp_path)).transcribe(wav)
+
+    assert len(calls) == 2
+    # Equal ends make the length tie-break decisive: the more complete text wins.
+    assert [s.text for s in segments] == ["Hello, world!"]
+
+
+def test_overlap_distinct_short_phrases_are_not_merged(tmp_path, monkeypatch):
+    """End-anchored containment must not over-merge genuinely distinct phrases.
+
+    "no thanks" and "thank you" share no prefix or suffix, so both segments
+    must survive even though they occupy the same overlap window.
+    """
+    wav = tmp_path / "distinct.wav"
+    write_wav(wav, 1.5)
+
+    responses = [
+        verbose_json([seg(0.4, 0.99, "no thanks")]),
+        verbose_json([seg(0.0, 0.49, "thank you")]),
+    ]
+    calls = install_urlopen(monkeypatch, responses)
+
+    segments, _info = LemonadeBackend(lemon_settings(tmp_path)).transcribe(wav)
+
+    assert len(calls) == 2
+    assert [s.text for s in segments] == ["no thanks", "thank you"]
+
+
 def test_real_socket_end_to_end_deadline_multi_phase_delay(tmp_path):
     """A real socket delaying across multiple pre-response phases must trip the total deadline."""
     # Loopback TCP server delaying before reading request and before sending headers
