@@ -2139,9 +2139,15 @@ def test_deadline_socket_settimeout_none_handled():
 
 
 def test_transcribe_non_wav_derives_duration_from_segments(tmp_path, monkeypatch):
-    """Non-WAV audio with 0.0 header duration derives duration from transcribed segments."""
+    """Non-WAV audio with 0.0 header duration derives duration from transcribed segments.
+
+    The input is sized so it could plausibly contain 12.3 s of audio at the
+    slowest sane PCM rate (8000 bytes/second): the single-request duration
+    bound is derived from file size, so a too-small file claiming long audio
+    is treated as a hostile/broken response and rejected instead.
+    """
     fake_audio = tmp_path / "raw_audio.bin"
-    fake_audio.write_bytes(b"not a wav file header at all")
+    fake_audio.write_bytes(b"not a wav file header at all" * 5000)  # 145 kB → ~18 s bound
     install_urlopen(
         monkeypatch,
         [
@@ -2157,6 +2163,32 @@ def test_transcribe_non_wav_derives_duration_from_segments(tmp_path, monkeypatch
     segments, info = backend.transcribe(fake_audio)
     assert len(segments) == 2
     assert info["duration"] == 12.3
+
+
+def test_single_request_too_small_for_its_audio_is_fallback_eligible(tmp_path, monkeypatch):
+    """A 27-byte 'file' claiming 12.3 s of audio is rejected, not believed.
+
+    Regression for the unbounded single-request path: the response timestamps
+    are now validated against a file-size-derived duration bound, and the
+    rejection is a LemonadeCapabilityError — fallback-eligible, so the input
+    resolves through faster-whisper instead of pinning hostile metadata.
+    """
+    fake_audio = tmp_path / "raw_audio.bin"
+    fake_audio.write_bytes(b"not a wav file header at all")
+    install_urlopen(
+        monkeypatch,
+        [
+            verbose_json(
+                [
+                    {"start": 0.0, "end": 4.5, "text": "Testing audio."},
+                    {"start": 5.0, "end": 12.3, "text": "End of audio."},
+                ]
+            )
+        ],
+    )
+    backend = LemonadeBackend(lemon_settings(tmp_path))
+    with pytest.raises(LemonadeCapabilityError, match="ending past the audio"):
+        backend.transcribe(fake_audio)
 
 
 def test_send_sanitizes_urlerror_and_oserror_secrets_and_control_chars(tmp_path, monkeypatch):
@@ -2239,3 +2271,81 @@ def test_finite_number_overflow():
     assert lemon_validate._finite_number(10**400) is None
     assert lemon_validate._finite_number(-(10**400)) is None
     assert lemon_validate._finite_number(42) == 42.0
+
+
+# --- fingerprint language normalization and the single-request bound ---
+
+
+def test_fingerprint_normalizes_the_language(tmp_path):
+    """`english` and `en` produce identical output, so they are one cache identity."""
+    spelled = LemonadeBackend(lemon_settings(tmp_path, language="english"))
+    code = LemonadeBackend(lemon_settings(tmp_path, language="en"))
+    assert spelled.cache_fingerprint() == code.cache_fingerprint()
+
+
+def test_single_request_language_stays_auto_when_nothing_was_detected(tmp_path, monkeypatch):
+    """An auto run that decodes nothing reports no language — never an invented one."""
+    path = tmp_path / "not-a-wav.bin"
+    path.write_bytes(b"garbage bytes" * 4)
+    install_urlopen(monkeypatch, [json.dumps({"segments": [], "text": ""}).encode()])
+    backend = LemonadeBackend(lemon_settings(tmp_path))
+
+    segments, info = backend.transcribe(path)
+
+    assert segments == []
+    assert info["language"] == ""
+    assert info["partial"] is False
+
+
+def test_hostile_single_request_timestamps_are_bounded(tmp_path, monkeypatch):
+    """A non-chunkable input must not let a hostile server pin huge timestamps.
+
+    The chunked path bounds each response by its real chunk duration; the
+    single-request path used to pass no bound at all, so a server could return
+    `end: 1e9` and the value would flow into the note's metadata unchecked.
+    The bound makes the whole response a fallback-eligible rejection.
+    """
+    path = tmp_path / "not-a-wav.bin"
+    path.write_bytes(b"garbage bytes" * 4)  # small: bound = max(size/8000, 1) = 1 s
+    hostile = json.dumps(
+        {
+            "segments": [
+                {"start": 0.0, "end": 1e9, "text": "hostile"},
+            ],
+            "language": "en",
+        }
+    ).encode()
+    install_urlopen(monkeypatch, [hostile])
+    backend = LemonadeBackend(lemon_settings(tmp_path))
+
+    with pytest.raises(LemonadeCapabilityError, match="ending past the audio"):
+        backend.transcribe(path)
+
+
+def test_single_request_rejects_only_the_over_bound_response(tmp_path, monkeypatch):
+    """A segment within the size-derived bound is accepted; beyond it is not."""
+    small = tmp_path / "small.bin"
+    small.write_bytes(b"garbage bytes" * 4)  # bound = 1 s
+    install_urlopen(monkeypatch, [verbose_json([seg(0.0, 0.5, "fine")], language="en")])
+    backend = LemonadeBackend(lemon_settings(tmp_path))
+
+    segments, info = backend.transcribe(small)
+
+    assert [s.text for s in segments] == ["fine"]
+    assert segments[0].end == 0.5
+    assert info["duration"] == 0.5
+    assert info["language"] == "en"
+
+
+def test_benign_single_request_result_survives_the_bound(tmp_path, monkeypatch):
+    """A legitimate whole-file response is kept; only the bound rejects."""
+    path = tmp_path / "not-a-wav.bin"
+    path.write_bytes(b"garbage bytes" * 2000)  # 26 kB → bound = max(3.25, 1) = 3.25 s
+    install_urlopen(monkeypatch, [verbose_json([seg(0.0, 3.0, "real speech")], language="en")])
+    backend = LemonadeBackend(lemon_settings(tmp_path))
+
+    segments, info = backend.transcribe(path)
+
+    assert [s.text for s in segments] == ["real speech"]
+    assert info["duration"] == 3.0
+    assert info["language"] == "en"

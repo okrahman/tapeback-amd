@@ -8,7 +8,12 @@ from unittest.mock import MagicMock
 import pytest
 
 from tapeback._fw_backend import FasterWhisperBackend
-from tapeback._isolated import WorkerFailed, job_settings, transcribe_isolated
+from tapeback._isolated import (
+    WorkerFailed,
+    _worker_env,
+    job_settings,
+    transcribe_isolated,
+)
 from tapeback._worker import EVENT_INFO, EVENT_SEGMENT, EVENT_STATUS, emit
 from tapeback._worker import main as worker_main
 from tapeback.models import Segment
@@ -294,3 +299,21 @@ def test_runtime_device_fallback_changes_the_cache_identity(settings):
     backend._device, backend._compute_type = "cpu", "int8"
 
     assert backend.cache_fingerprint() != before
+
+
+def test_worker_env_strips_tapeback_vars_and_provider_secrets(monkeypatch):
+    """The worker gets its settings from the JSON job, never the ambient env."""
+    monkeypatch.setenv("TAPEBACK_DEVICE", "cuda")
+    monkeypatch.setenv("TAPEBACK_LEMONADE_API_KEY", "sk-tapeback")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-anthropic")
+    monkeypatch.setenv("HF_TOKEN", "hf-token")
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0")
+
+    env = _worker_env()
+
+    assert not any(key.startswith("TAPEBACK_") for key in env)
+    assert "ANTHROPIC_API_KEY" not in env and "HF_TOKEN" not in env
+    # Operational variables the worker legitimately needs are inherited.
+    assert env["PATH"] == "/usr/bin:/bin"
+    assert env["CUDA_VISIBLE_DEVICES"] == "0"

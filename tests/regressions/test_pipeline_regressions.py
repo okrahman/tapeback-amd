@@ -1,5 +1,6 @@
 """Regression tests for pipeline bugs."""
 
+import hashlib
 import shutil
 import tempfile
 from pathlib import Path
@@ -46,7 +47,13 @@ def test_process_stereo_no_diarize_returns_no_raw_segments(tmp_path):
 
 
 def test_process_file_cleans_up_temp_dir_on_exception(tmp_path):
-    """process_file must clean up temp directory even if processing fails."""
+    """process_file must clean up its staging directory even if processing fails.
+
+    Staging is the deterministic `proc_<hash>` directory under the tapeback
+    temp root (it replaced `tempfile.mkdtemp` when the staging paths became
+    security-verified), so the test derives the same path from the audio's
+    identity and asserts it is gone after the failure.
+    """
     vault = tmp_path / "vault"
     vault.mkdir()
     settings = Settings(vault_path=vault)
@@ -54,16 +61,11 @@ def test_process_file_cleans_up_temp_dir_on_exception(tmp_path):
     audio = tmp_path / "test.wav"
     create_mono_wav(audio, duration=1.0, sample_rate=48000, amplitude=0.5)
 
-    created_dirs: list[Path] = []
-    original_mkdtemp = tempfile.mkdtemp
-
-    def fake_mkdtemp(prefix="tapeback_"):
-        res = Path(original_mkdtemp(prefix=prefix))
-        created_dirs.append(res)
-        return str(res)
+    ident = f"{audio.resolve()}:{audio.stat().st_size}:{audio.stat().st_mtime_ns}"
+    staging_hash = hashlib.sha256(ident.encode()).hexdigest()[:16]
+    staging_dir = Path(tempfile.gettempdir()) / "tapeback" / f"proc_{staging_hash}"
 
     with (
-        patch("tempfile.mkdtemp", side_effect=fake_mkdtemp),
         patch(
             "tapeback.pipeline.process_mono_file",
             side_effect=RuntimeError("Pipeline processing error"),
@@ -72,8 +74,7 @@ def test_process_file_cleans_up_temp_dir_on_exception(tmp_path):
     ):
         process_file(audio, settings, diarize=False)
 
-    assert len(created_dirs) == 1
-    assert not created_dirs[0].exists()
+    assert not staging_dir.exists()
 
 
 @pytest.mark.skipif(not shutil.which("ffmpeg"), reason="ffmpeg required")

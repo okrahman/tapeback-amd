@@ -9,7 +9,6 @@ served the stale CPU-quality transcript. The fix recomputes the key at commit
 time. These tests pin that behavior.
 """
 
-from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -86,7 +85,6 @@ def test_isolated_cpu_result_is_not_cached_under_cuda_identity(
         second.transcribe(audio_file)
 
 
-
 def test_inprocess_cpu_fallback_result_is_not_cached_under_cuda_identity(
     settings, tmp_path, monkeypatch, audio_file
 ):
@@ -143,21 +141,21 @@ class _MidRunIdentityBackend:
     def cache_fingerprint(self) -> str:
         return self.fingerprint
 
-    def pace(self, on_status) -> None:  # noqa: ANN001 — matches StatusCallback
+    def pace(self, on_status) -> None:
         return None
 
-    def transcribe(self, audio_path, *, stage="transcribe", on_status=lambda _m: None, language_override=None):  # noqa: ANN001
+    def transcribe(
+        self, audio_path, *, stage="transcribe", on_status=lambda _m: None, language_override=None
+    ):
         self.fingerprint = "identity-after"
         return _segments(f"{stage} result"), {"language": "en", "duration": 1.0, "partial": False}
 
 
 def test_stereo_channels_are_cached_under_the_post_stage_identity(settings, tmp_path, audio_file):
-    s = settings.model_copy(
-        update={"resume_cache": True, "resume_cache_dir": tmp_path / "resume"}
-    )
+    s = settings.model_copy(update={"resume_cache": True, "resume_cache_dir": tmp_path / "resume"})
     transcriber = Transcriber(s)
     backend = _MidRunIdentityBackend()
-    transcriber._backend = backend  # noqa: SLF001 — the fixture is the point
+    transcriber._backend = backend  # the fake backend is the point of the test
 
     mic = tmp_path / "mic_16k.wav"
     mic.write_bytes(b"RIFFmic")
@@ -167,13 +165,10 @@ def test_stereo_channels_are_cached_under_the_post_stage_identity(settings, tmp_
     transcriber.transcribe_stereo(mic, monitor)
 
     directory = _resume.resume_dir(s)
-    stale = (
-        directory
-        / f"{transcriber._resume_key(mic, 'transcribe mic', 'identity-before', 'en').digest}.json"
-    )
-    fresh = (
-        directory
-        / f"{transcriber._resume_key(mic, 'transcribe mic', 'identity-after', 'en').digest}.json"
-    )
+    stale_key = transcriber._resume_key(mic, "transcribe mic", "identity-before", "en")
+    fresh_key = transcriber._resume_key(mic, "transcribe mic", "identity-after", "en")
+    assert stale_key is not None and fresh_key is not None
+    stale = directory / f"{stale_key.digest}.json"
+    fresh = directory / f"{fresh_key.digest}.json"
     assert not stale.exists(), "a mid-run identity change must not store under the frozen key"
     assert fresh.exists(), "the committed channel must carry the post-stage identity"

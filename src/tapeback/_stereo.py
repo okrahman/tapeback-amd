@@ -300,12 +300,15 @@ class _StereoTranscriber:
         # sibling was interrupted. Inactive channels never enter staged. The key is
         # RECOMPUTED at commit time so a fallback inside either transcribe() is
         # reflected in the stored identity — a CPU/int8 result must never be cached
-        # under a CUDA identity.
-        for audio, stage_name, lang_token, segs, channel_info in staged:
-            commit_key = self._resume_key(
-                audio, stage_name, self._backend.cache_fingerprint(), lang_token
-            )
-            self._store_resume(commit_key, segs, channel_info)
+        # under a CUDA identity. Skipped entirely when resume IO is disabled
+        # (use_resume=False): the recompute must not resurrect a key the caller
+        # asked never to exist.
+        if use_resume:
+            for audio, stage_name, lang_token, segs, channel_info in staged:
+                commit_key = self._resume_key(
+                    audio, stage_name, self._backend.cache_fingerprint(), lang_token
+                )
+                self._store_resume(commit_key, segs, channel_info)
         return mic_segments, monitor_segments, info
 
     def _fallback_stereo(
@@ -408,12 +411,14 @@ class _StereoTranscriber:
         )
         # Per-channel commit — same rule as transcribe_stereo: partial output is never
         # cached, but a complete same-backend sibling is. Keys are RECOMPUTED at commit
-        # time (see transcribe_stereo) so a late device resolution is reflected.
-        for audio, stage_name, lang_token, segs, channel_info in staged:
-            commit_key = self._resume_key(
-                audio, stage_name, self._backend.cache_fingerprint(), lang_token
-            )
-            self._store_resume(commit_key, segs, channel_info)
+        # time (see transcribe_stereo) so a late device resolution is reflected, and
+        # the whole commit is skipped when resume IO is disabled.
+        if use_resume:
+            for audio, stage_name, lang_token, segs, channel_info in staged:
+                commit_key = self._resume_key(
+                    audio, stage_name, self._backend.cache_fingerprint(), lang_token
+                )
+                self._store_resume(commit_key, segs, channel_info)
         return mic_segments, monitor_segments, info
 
     def _assemble_stereo(

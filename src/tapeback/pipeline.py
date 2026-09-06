@@ -127,7 +127,10 @@ def stop_and_process(
                     session_name=session_name,
                     audio_rel_path=audio_rel_path,
                     duration_seconds=float(info.get("duration", 0.0)),
-                    language=str(info.get("language", settings.language)),
+                    # `or` (not a default argument) so an empty language — what an
+                    # auto-detection run with zero segments reports — falls back to
+                    # the configured language instead of persisting an empty field.
+                    language=str(info.get("language") or settings.language),
                     partial=bool(info.get("partial")),
                 ),
                 raw_segments=raw_segments,
@@ -225,7 +228,9 @@ def process_file(
                     session_name=name,
                     audio_rel_path=audio_rel_path,
                     duration_seconds=float(info.get("duration", 0.0)),
-                    language=str(info.get("language", settings.language)),
+                    # Same `or` rule as the stereo path above: an empty language
+                    # must fall back to the configured language, never persist "".
+                    language=str(info.get("language") or settings.language),
                     partial=bool(info.get("partial")),
                 ),
                 raw_segments=raw_segments,

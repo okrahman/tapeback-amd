@@ -26,8 +26,7 @@ def test_resume_entry_is_private_and_atomic(tmp_path):
     directory = tmp_path / "resume"
     key = _resume.ResumeKey("0" * 32)
     assert (
-        _resume.store(key, directory, [Segment(start=0.0, end=1.0, text="secret")], {})
-        is not None
+        _resume.store(key, directory, [Segment(start=0.0, end=1.0, text="secret")], {}) is not None
     )
     _assert_private_file(directory / key.filename)
     # Re-storing replaces atomically — the entry is still complete JSON afterwards.

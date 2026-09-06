@@ -74,6 +74,12 @@ from tapeback._timing import ProgressReporter
 from tapeback.models import Segment
 from tapeback.settings import Settings
 
+# Conservative floor for WAV bytes-per-second, used only to derive a duration
+# UPPER BOUND for inputs whose header cannot be parsed: 8-bit 8 kHz mono PCM is
+# the slowest sane encoding (8000 bytes/second), so size / 8000 always
+# over-estimates the real duration. It needs to bound, not to be accurate.
+_MIN_WAV_BYTES_PER_SECOND = 8000
+
 __all__ = [
     "DEDUP_POLICY_VERSION",
     "LemonadeAuthenticationError",
@@ -190,8 +196,11 @@ class LemonadeBackend:
     def cache_fingerprint(self) -> str:
         """Identity of everything that changes this backend's transcription output.
 
-        Included: backend identity, normalized server URL, model, language, chunk
-        duration, overlap duration, and the dedup policy version. Deliberately
+        Included: backend identity, normalized server URL, model, NORMALIZED
+        language, chunk duration, overlap duration, and the dedup policy version.
+        Normalizing the language matters: `english` and `en` produce identical
+        output but would otherwise be two cache identities and over-invalidate.
+        Deliberately
         excluded: the API key (credentials never belong in a cache key), the timeout,
         diagnostics settings, and anything about the server's accelerator — tapeback
         does not know it and must not encode knowledge of it.
@@ -200,7 +209,7 @@ class LemonadeBackend:
             "lemonade",
             self._base_url,
             self._settings.lemonade_model,
-            self._settings.language,
+            normalize_language(self._settings.language),
             f"chunk_seconds={self._settings.lemonade_chunk_seconds!r}",
             f"overlap_seconds={self._settings.lemonade_overlap_seconds!r}",
             f"dedup_policy={DEDUP_POLICY_VERSION}",
@@ -273,7 +282,14 @@ class LemonadeBackend:
                 payload = self._request_transcription(
                     audio_path.read_bytes(), _UPLOAD_FILENAME, state.pinned
                 )
-                state.absorb(payload, 0.0, 0.0, 0)
+                # The header is unparseable, so the real duration is unknown. Derive
+                # a conservative upper bound from the file size and pass it as the
+                # chunk duration, so the validator rejects server-supplied segment
+                # timestamps beyond it (see `_require_segments`): a hostile or
+                # broken server must not be able to pin arbitrary values into the
+                # note. The chunked path is already bounded by its real durations.
+                duration_bound = max(audio_path.stat().st_size / _MIN_WAV_BYTES_PER_SECOND, 1.0)
+                state.absorb(payload, 0.0, 0.0, 0, chunk_duration=duration_bound)
         except KeyboardInterrupt:
             # Ctrl+C means keep what finished, mark the result partial, and stop —
             # never a fallback, never a cache write.
@@ -284,6 +300,8 @@ class LemonadeBackend:
             )
 
         if duration == 0.0 and state.segments:
+            # Clamped to the single-request bound (when one applied): accepted
+            # segments are already bounded, so this is belt-and-braces metadata.
             duration = max(s.end for s in state.segments)
 
         info: TranscriptionInfo = {

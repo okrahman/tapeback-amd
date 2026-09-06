@@ -12,6 +12,7 @@ back is for the process to end.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from collections.abc import Callable
@@ -31,6 +32,46 @@ from tapeback.settings import Settings
 
 # How long to wait for a worker to exit after we ask it to stop, before killing it.
 WORKER_SHUTDOWN_TIMEOUT_SEC = 10.0
+
+# Environment variables that must never reach the transcription worker. The JSON
+# job carries everything the worker needs, and the worker pins its own backend —
+# so ambient `TAPEBACK_*` variables could only contradict the job or leak
+# configuration into the child. Provider credentials are denied by name because
+# the worker cannot transcribe with them and must never be in a position to log,
+# dump, or forward them.
+_WORKER_DENIED_ENV_KEYS = frozenset(
+    {
+        "ANTHROPIC_API_KEY",
+        "OPENAI_API_KEY",
+        "GROQ_API_KEY",
+        "GEMINI_API_KEY",
+        "GOOGLE_API_KEY",
+        "OPENROUTER_API_KEY",
+        "DEEPSEEK_API_KEY",
+        "QWEN_API_KEY",
+        "HF_TOKEN",
+        "HUGGING_FACE_HUB_TOKEN",
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "AZURE_OPENAI_API_KEY",
+    }
+)
+
+
+def _worker_env() -> dict[str, str]:
+    """A scrubbed environment for the transcription worker.
+
+    Strips every `TAPEBACK_*` variable (the worker takes its settings from the
+    JSON job on stdin, and ambient values must never override or supplement
+    them) and every known provider credential. Operational variables the
+    worker legitimately needs — PATH, HOME, CUDA/NVIDIA driver variables,
+    XDG paths — are inherited unchanged.
+    """
+    return {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith("TAPEBACK_") and key not in _WORKER_DENIED_ENV_KEYS
+    }
 
 
 class WorkerFailed(RuntimeError):
@@ -122,6 +163,7 @@ def transcribe_isolated(  # noqa: PLR0912 — one flat ladder over the worker's 
         stdout=subprocess.PIPE,
         text=True,
         bufsize=1,
+        env=_worker_env(),
     )
     stdin, stdout = process.stdin, process.stdout
     if stdin is None or stdout is None:  # pragma: no cover — both were opened as PIPEs

@@ -108,6 +108,7 @@ def test_huge_unparseable_header_falls_back_to_44_loudly(settings, tmp_path, cap
     assert "unparseable" in err
     # The zero-filled body reads as (silent) PCM from the assumed offset; the
     # activity gate in _process_chunk is what keeps it out of the note.
+    assert pcm is not None
     assert pcm == b"\x00" * len(pcm)
 
 
