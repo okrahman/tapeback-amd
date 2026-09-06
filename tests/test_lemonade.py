@@ -21,11 +21,10 @@ import pytest
 from pydantic import SecretStr
 
 import tapeback._lemonade as lemon
+import tapeback._lemonade_audio as lemon_audio
+import tapeback._lemonade_transport as lemon_transport
+import tapeback._lemonade_validate as lemon_validate
 from tapeback._lemonade import (
-    _MAX_CUMULATIVE_SEGMENTS,
-    _MAX_CUMULATIVE_TEXT_CHARS,
-    _MAX_RESPONSE_SEGMENTS,
-    _MAX_SEGMENT_TEXT_CHARS,
     DEDUP_POLICY_VERSION,
     LemonadeAuthenticationError,
     LemonadeBackend,
@@ -35,12 +34,17 @@ from tapeback._lemonade import (
     LemonadeInferenceTimeout,
     LemonadeModelError,
     LemonadeUnavailableError,
-    _MergeState,
-    _normalize_base_url,
-    _require_segments,
-    _utterance_tokens,
-    classify_http_failure,
     normalize_language,
+)
+from tapeback._lemonade_audio import _MergeState
+from tapeback._lemonade_errors import _utterance_tokens, classify_http_failure
+from tapeback._lemonade_url import _normalize_base_url
+from tapeback._lemonade_validate import (
+    _MAX_CUMULATIVE_SEGMENTS,
+    _MAX_CUMULATIVE_TEXT_CHARS,
+    _MAX_RESPONSE_SEGMENTS,
+    _MAX_SEGMENT_TEXT_CHARS,
+    _require_segments,
 )
 from tapeback._resume import resume_key
 from tapeback.models import Segment
@@ -791,9 +795,9 @@ def test_https_proxy_connect_keeps_origin_secrets_inside_tunnel(monkeypatch):
     proxy_socket = _ProxySocket()
     origin_socket = _OriginTLSSocket()
     context = _TLSContext(origin_socket)
-    monkeypatch.setattr(lemon, "_create_deadline_connection", lambda *args: proxy_socket)
+    monkeypatch.setattr(lemon_transport, "_create_deadline_connection", lambda *args: proxy_socket)
 
-    connection = lemon._DeadlineHTTPSConnection(
+    connection = lemon_transport._DeadlineHTTPSConnection(
         "proxy.test:8080", deadline=time.monotonic() + 5, context=context
     )
     connection.set_tunnel(
@@ -873,6 +877,8 @@ def test_oversized_content_length_is_refused_unread(tmp_path, monkeypatch):
         LemonadeBackend(lemon_settings(tmp_path)).transcribe(wav)
 
     assert "response cap" in str(excinfo.value)
+
+
 class _HeaderedResponse:
     """A response whose only notable feature is its Content-Length header."""
 
@@ -991,8 +997,8 @@ def test_byte_cap_covers_overlap_and_framing(tmp_path, monkeypatch):
         wf.setframerate(16000)
         wf.writeframes(b"\x00" * (8 * 3 * 16000 * 5))  # 5 s, 24 bytes per frame
 
-    monkeypatch.setattr(lemon, "_MAX_CHUNK_BYTES", 200_000)
-    monkeypatch.setattr(lemon, "_REQUEST_OVERHEAD_BYTES", 1_000)
+    monkeypatch.setattr(lemon_audio, "_MAX_CHUNK_BYTES", 200_000)
+    monkeypatch.setattr(lemon_audio, "_REQUEST_OVERHEAD_BYTES", 1_000)
     calls = install_urlopen(monkeypatch, [verbose_json([seg(0.0, 0.4)])])
 
     LemonadeBackend(
@@ -1004,7 +1010,7 @@ def test_byte_cap_covers_overlap_and_framing(tmp_path, monkeypatch):
         body = request.data
         start = body.index(b"audio/wav\r\n\r\n") + len(b"audio/wav\r\n\r\n")
         end = body.rindex(b"\r\n--tapeback-")
-        assert end - start <= lemon._MAX_CHUNK_BYTES
+        assert end - start <= lemon_audio._MAX_CHUNK_BYTES
 
 
 def test_forged_frame_count_is_treated_as_non_chunkable(tmp_path, monkeypatch):
@@ -1026,8 +1032,8 @@ def test_oversized_non_wav_input_is_refused_not_buffered(tmp_path, monkeypatch):
     """A non-chunkable input over the single-request cap falls back instead of OOM."""
     big = tmp_path / "raw.bin"
     big.write_bytes(b"\x00" * 4096)
-    monkeypatch.setattr(lemon, "_MAX_CHUNK_BYTES", 1024)
-    monkeypatch.setattr(lemon, "_REQUEST_OVERHEAD_BYTES", 128)
+    monkeypatch.setattr(lemon_audio, "_MAX_CHUNK_BYTES", 1024)
+    monkeypatch.setattr(lemon_audio, "_REQUEST_OVERHEAD_BYTES", 128)
     calls = install_urlopen(monkeypatch, [verbose_json([seg(0.0, 0.4)])])
 
     with pytest.raises(LemonadeCapabilityError) as excinfo:
@@ -1043,8 +1049,8 @@ def test_non_wav_input_respects_request_overhead_reservation(tmp_path, monkeypat
     overhead = 512
     max_payload = max_chunk - overhead
 
-    monkeypatch.setattr(lemon, "_MAX_CHUNK_BYTES", max_chunk)
-    monkeypatch.setattr(lemon, "_REQUEST_OVERHEAD_BYTES", overhead)
+    monkeypatch.setattr(lemon_audio, "_MAX_CHUNK_BYTES", max_chunk)
+    monkeypatch.setattr(lemon_audio, "_REQUEST_OVERHEAD_BYTES", overhead)
 
     # Payload exactly at max_payload is accepted
     fit = tmp_path / "fit.bin"
@@ -1067,7 +1073,7 @@ def test_too_many_chunks_is_a_configuration_error(tmp_path, monkeypatch):
     """A chunk plan past the request-count limit is refused before any upload."""
     wav = tmp_path / "long.wav"
     write_wav(wav, 5.0)  # 1 s chunks -> 5 chunks
-    monkeypatch.setattr(lemon, "_MAX_CHUNKS", 3)
+    monkeypatch.setattr(lemon_audio, "_MAX_CHUNKS", 3)
     calls = install_urlopen(monkeypatch, [verbose_json([seg(0.0, 0.4)])])
 
     with pytest.raises(LemonadeConfigurationError) as excinfo:
@@ -1306,13 +1312,15 @@ def test_transcription_still_uses_the_inference_timeout(tmp_path, monkeypatch):
 
 def test_dns_resolution_is_bounded_by_total_deadline(monkeypatch):
     release = threading.Event()
-    monkeypatch.setattr(lemon, "_DNS_RESOLVER_SLOTS", threading.BoundedSemaphore(2))
-    monkeypatch.setattr(lemon.socket, "getaddrinfo", lambda *args: release.wait(timeout=2))
+    monkeypatch.setattr(lemon_transport, "_DNS_RESOLVER_SLOTS", threading.BoundedSemaphore(2))
+    monkeypatch.setattr(
+        lemon_transport.socket, "getaddrinfo", lambda *args: release.wait(timeout=2)
+    )
 
     started = time.monotonic()
     try:
         with pytest.raises(TimeoutError, match="deadline during DNS"):
-            lemon._resolve_with_deadline("stalled.test", 443, time.monotonic() + 0.08)
+            lemon_transport._resolve_with_deadline("stalled.test", 443, time.monotonic() + 0.08)
     finally:
         release.set()
 
@@ -1323,7 +1331,7 @@ def test_stalled_dns_workers_are_resource_bounded(monkeypatch):
     release = threading.Event()
     calls = 0
     calls_lock = threading.Lock()
-    monkeypatch.setattr(lemon, "_DNS_RESOLVER_SLOTS", threading.BoundedSemaphore(2))
+    monkeypatch.setattr(lemon_transport, "_DNS_RESOLVER_SLOTS", threading.BoundedSemaphore(2))
 
     def stalled_getaddrinfo(*args):
         nonlocal calls
@@ -1332,11 +1340,11 @@ def test_stalled_dns_workers_are_resource_bounded(monkeypatch):
         release.wait(timeout=2)
         return []
 
-    monkeypatch.setattr(lemon.socket, "getaddrinfo", stalled_getaddrinfo)
+    monkeypatch.setattr(lemon_transport.socket, "getaddrinfo", stalled_getaddrinfo)
     try:
         for _ in range(3):
             with pytest.raises(TimeoutError):
-                lemon._resolve_with_deadline("stalled.test", 443, time.monotonic() + 0.05)
+                lemon_transport._resolve_with_deadline("stalled.test", 443, time.monotonic() + 0.05)
     finally:
         release.set()
 
@@ -1348,13 +1356,13 @@ def test_connection_retries_resolved_addresses_with_remaining_budget(monkeypatch
         (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("192.0.2.1", 443)),
         (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("192.0.2.2", 443)),
     ]
-    monkeypatch.setattr(lemon, "_resolve_with_deadline", lambda *args: addresses)
+    monkeypatch.setattr(lemon_transport, "_resolve_with_deadline", lambda *args: addresses)
 
     sockets = [MagicMock(), MagicMock()]
     sockets[0].connect.side_effect = OSError("first address failed")
-    monkeypatch.setattr(lemon.socket, "socket", lambda *args: sockets.pop(0))
+    monkeypatch.setattr(lemon_transport.socket, "socket", lambda *args: sockets.pop(0))
 
-    connected = lemon._create_deadline_connection(
+    connected = lemon_transport._create_deadline_connection(
         ("origin.test", 443), time.monotonic() + 5, ("127.0.0.1", 0)
     )
 
@@ -1414,7 +1422,7 @@ def test_socket_timeout_is_reset_to_the_remaining_budget(tmp_path, monkeypatch):
     but the first body read must be bounded by the ~10 s that are left, not by
     another 600 s socket timeout on top.
     """
-    monkeypatch.setattr(lemon.time, "monotonic", lambda: _FakeClock.now)
+    monkeypatch.setattr(lemon_transport.time, "monotonic", lambda: _FakeClock.now)
     sock = _FakeSocket()
     open_timeouts: list[float] = []
 
@@ -1441,7 +1449,7 @@ def test_stalled_body_read_trips_the_total_deadline(tmp_path, monkeypatch):
     the between-reads deadline check must end the request rather than leave it
     blocked for another full socket timeout.
     """
-    monkeypatch.setattr(lemon.time, "monotonic", lambda: _FakeClock.now)
+    monkeypatch.setattr(lemon_transport.time, "monotonic", lambda: _FakeClock.now)
 
     class _StallingResponse:
         def read(self, n: int = -1) -> bytes:
@@ -2123,7 +2131,7 @@ def test_deadline_socket_settimeout_none_handled():
     """sock.settimeout(None) does not raise TypeError and bounds against deadline."""
     mock_raw_sock = MagicMock()
     now = time.monotonic()
-    sock = lemon._DeadlineSocket(mock_raw_sock, deadline=now + 10.0)
+    sock = lemon_transport._DeadlineSocket(mock_raw_sock, deadline=now + 10.0)
     sock.settimeout(None)
     mock_raw_sock.settimeout.assert_called_once()
     timeout_arg = mock_raw_sock.settimeout.call_args[0][0]
@@ -2220,7 +2228,7 @@ def test_bound_socket_timeout_traverses_response_layers():
 
     resp = AddInfoUrl()
     deadline = time.monotonic() + 5.0
-    lemon._bound_socket_timeout(resp, deadline)
+    lemon_transport._bound_socket_timeout(resp, deadline)
     mock_sock.settimeout.assert_called_once()
     timeout_arg = mock_sock.settimeout.call_args[0][0]
     assert 4.0 <= timeout_arg <= 5.0
@@ -2228,6 +2236,6 @@ def test_bound_socket_timeout_traverses_response_layers():
 
 def test_finite_number_overflow():
     """_finite_number returns None on overflow instead of raising OverflowError."""
-    assert lemon._finite_number(10**400) is None
-    assert lemon._finite_number(-(10**400)) is None
-    assert lemon._finite_number(42) == 42.0
+    assert lemon_validate._finite_number(10**400) is None
+    assert lemon_validate._finite_number(-(10**400)) is None
+    assert lemon_validate._finite_number(42) == 42.0
