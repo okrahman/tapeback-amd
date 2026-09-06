@@ -195,9 +195,7 @@ def test_stop_is_idempotent_when_another_process_stopped_the_session(
     assert recorder.stop() == (monitor_path, mic_path)
 
 
-def test_stop_and_process_stops_live_worker_even_when_recorder_stop_raises(
-    settings, monkeypatch
-):
+def test_stop_and_process_stops_live_worker_even_when_recorder_stop_raises(settings, monkeypatch):
     """Live-worker teardown must run in finally, whatever recorder.stop() does.
 
     Bug: recorder.stop() was called before live teardown without try/finally, so

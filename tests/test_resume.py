@@ -343,6 +343,69 @@ def test_load_handles_recursion_error(tmp_path, monkeypatch):
     assert _resume.load(key, tmp_path) is None
 
 
+_MALFORMED_PAYLOADS = [
+    # The shapes that motivated full schema validation: parseable JSON that the
+    # old key-presence-only loader accepted and later crashed on.
+    '{"segments": [], "info": []}',  # info is not an object
+    '{"segments": {}, "info": {}}',  # segments is not an array
+    '[{"segments": [], "info": {}}]',  # payload is not an object
+    '{"info": {}}',  # segments key missing
+    '{"segments": [{"end": 1.0, "text": "x"}], "info": {}}',  # segment start missing
+    '{"segments": [{"start": "0", "end": 1.0, "text": "x"}], "info": {}}',  # start not a number
+    '{"segments": [{"start": true, "end": 1.0, "text": "x"}], "info": {}}',  # bool is not a number
+    '{"segments": [{"start": NaN, "end": 1.0, "text": "x"}], "info": {}}',  # NaN start
+    '{"segments": [{"start": 0.0, "end": Infinity, "text": "x"}], "info": {}}',  # infinite end
+    '{"segments": [{"start": 2.0, "end": 1.0, "text": "x"}], "info": {}}',  # start after end
+    '{"segments": [{"start": 0.0, "end": 1.0, "text": 5}], "info": {}}',  # text not a string
+    '{"segments": [{"start": 0.0, "end": 1.0, "text": "x", "speaker": 3}], "info": {}}',
+    '{"segments": [{"start": 0.0, "end": 1.0, "text": "x", "words": "no"}], "info": {}}',
+    '{"segments": [{"start": 0.0, "end": 1.0, "text": "x", "words": [1]}], "info": {}}',
+    '{"segments": [{"start": 0.0, "end": 1.0, "text": "x", "words": [{"start": 1.0, "end": 0.5, "word": "w", "probability": 0.9}]}], "info": {}}',  # noqa: E501 — word start after end
+    '{"segments": [{"start": 0.0, "end": 1.0, "text": "x", "words": [{"start": 0.0, "end": 0.5, "word": "w", "probability": "hi"}]}], "info": {}}',  # noqa: E501 — word probability not a number
+]
+
+
+@pytest.mark.parametrize("payload", _MALFORMED_PAYLOADS)
+def test_malformed_but_valid_json_entry_is_a_cache_miss(cached_settings, audio, tmp_path, payload):
+    """A parseable but off-schema entry is a cache miss, never a crashed run.
+
+    load() promises "never raises on bad cache data". The old loader only relied
+    on KeyError/TypeError, so a syntactically valid entry like
+    {"segments": [], "info": []} loaded fine and later raised AttributeError in
+    transcribe_stereo() — wedging every rerun for that audio/key.
+    """
+    key = _resume.resume_key(audio, "test_fp", "test_stage")
+    assert key is not None
+    r_dir = _resume.resume_dir(cached_settings)
+    r_dir.mkdir(parents=True, exist_ok=True)
+    (r_dir / key.filename).write_text(payload)
+    assert _resume.load(key, r_dir) is None
+
+
+def test_partial_segment_word_round_trip_survives_validation(cached_settings, audio):
+    """The validator accepts exactly what store() writes — including speaker/words."""
+    key = _resume.resume_key(audio, "test_fp", "test_stage")
+    assert key is not None
+    r_dir = _resume.resume_dir(cached_settings)
+    segments = [
+        Segment(
+            start=0.5,
+            end=2.5,
+            text="hello",
+            speaker="SPEAKER_00",
+            words=[Word(start=0.5, end=1.0, word="hello", probability=0.9)],
+        ),
+        Segment(start=3.0, end=4.0, text="no words"),
+    ]
+    info = {"duration": 4.0, "language": "en", "partial": False}
+    assert _resume.store(key, r_dir, segments, info) is not None
+    loaded = _resume.load(key, r_dir)
+    assert loaded is not None
+    loaded_segments, loaded_info = loaded
+    assert loaded_segments == segments
+    assert loaded_info == info
+
+
 def test_complete_silent_channel_is_cached(cached_settings, audio):
     """A completely silent channel with empty segments is stored and reloaded from cache."""
     key = _resume.resume_key(audio, "test_fp", "test_stage")

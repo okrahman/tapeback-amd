@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -133,23 +134,69 @@ def _to_payload(segments: list[Segment], info: dict[str, Any]) -> dict[str, Any]
     }
 
 
-def _from_payload(payload: dict[str, Any]) -> tuple[list[Segment], dict[str, Any]]:
-    segments = [
-        Segment(
-            start=s["start"],
-            end=s["end"],
-            text=s["text"],
-            speaker=s.get("speaker"),
-            words=None
-            if s.get("words") is None
-            else [
-                Word(start=w["start"], end=w["end"], word=w["word"], probability=w["probability"])
-                for w in s["words"]
-            ],
-        )
-        for s in payload["segments"]
-    ]
-    return segments, payload["info"]
+def _number(value: Any, name: str) -> float:
+    """Validate a persisted timestamp/probability: finite, real, not a bool."""
+    if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value):
+        raise ValueError(f"resume {name} is not a finite number")
+    return value
+
+
+def _validated_word(word: Any) -> Word:
+    if not isinstance(word, dict):
+        raise ValueError("resume word is not a JSON object")
+    text = word["word"]
+    if not isinstance(text, str):
+        raise ValueError("resume word text is not a string")
+    start, end = _number(word["start"], "word start"), _number(word["end"], "word end")
+    if start > end:
+        raise ValueError("resume word start is after its end")
+    return Word(
+        start=start,
+        end=end,
+        word=text,
+        probability=_number(word["probability"], "word probability"),
+    )
+
+
+def _validated_segment(segment: Any) -> Segment:
+    if not isinstance(segment, dict):
+        raise ValueError("resume segment is not a JSON object")
+    start, end = _number(segment["start"], "segment start"), _number(segment["end"], "segment end")
+    if start > end:
+        raise ValueError("resume segment start is after its end")
+    text = segment["text"]
+    if not isinstance(text, str):
+        raise ValueError("resume segment text is not a string")
+    speaker = segment.get("speaker")
+    if speaker is not None and not isinstance(speaker, str):
+        raise ValueError("resume segment speaker is not a string")
+    words: list[Word] | None = None
+    raw_words = segment.get("words")
+    if raw_words is not None:
+        if not isinstance(raw_words, list):
+            raise ValueError("resume segment words are not a JSON array")
+        words = [_validated_word(word) for word in raw_words]
+    return Segment(start=start, end=end, text=text, words=words, speaker=speaker)
+
+
+def _from_payload(payload: Any) -> tuple[list[Segment], dict[str, Any]]:
+    """Rebuild (segments, info) from a stored payload, rejecting anything off-schema.
+
+    load() promises never to hand a caller data that can crash a run, so the full
+    persisted schema is checked here, not just key presence: a syntactically valid
+    but malformed entry — e.g. ``{"segments": [], "info": []}`` — must be a cache
+    miss, not an AttributeError three layers up in ``transcribe_stereo()``. Every
+    failure raises ValueError/KeyError/TypeError, which load() translates to None.
+    """
+    if not isinstance(payload, dict):
+        raise ValueError("resume payload is not a JSON object")
+    info = payload["info"]
+    if not isinstance(info, dict):
+        raise ValueError("resume info is not a JSON object")
+    raw_segments = payload["segments"]
+    if not isinstance(raw_segments, list):
+        raise ValueError("resume segments are not a JSON array")
+    return [_validated_segment(segment) for segment in raw_segments], info
 
 
 def load(key: ResumeKey, directory: Path) -> tuple[list[Segment], dict[str, Any]] | None:

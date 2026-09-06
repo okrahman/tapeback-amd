@@ -237,7 +237,9 @@ class Recorder:
 
         # Save session state
         self._state_dir.mkdir(parents=True, exist_ok=True)
-        session_data = {
+        # Annotated: the literal is inferred as dict[str, int | str], which ty
+        # correctly rejects against the SessionData contract below.
+        session_data: SessionData = {
             "pid_monitor": monitor_proc.pid,
             "pid_mic": mic_proc.pid,
             "session_name": session_name,
