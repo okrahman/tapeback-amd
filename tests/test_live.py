@@ -15,10 +15,7 @@ import pytest
 
 import tapeback.live as live_mod
 import tapeback.pipeline as pipeline_mod
-from tapeback._lemonade import (
-    LemonadeAuthenticationError,
-    LemonadeConfigurationError,
-)
+from tapeback._lemonade import LemonadeAuthenticationError, LemonadeConfigurationError
 from tapeback.live import (
     LiveTranscriber,
     adjust_timestamps,
@@ -1096,6 +1093,90 @@ def test_write_markdown_failure_does_not_corrupt_segments_or_offsets(tmp_path, m
     assert lt._mic_byte_offset > 0
 
 
+# --- partial results must never commit past the decoded prefix ---
+
+
+def test_live_partial_interval_commits_nothing(tmp_path, monkeypatch):
+    """A partial backend result withholds its prefix and keeps both cursors.
+
+    Regression: _process_chunk used to commit mic_new_offset/monitor_new_offset
+    unconditionally, so a partial result advanced the cursors past the undecoded
+    suffix and that audio was never retried — a permanent gap in the live note.
+    """
+    settings = Settings(
+        vault_path=tmp_path, live=True, transcription_backend="faster-whisper", live_min_chunk=0.1
+    )
+    header = (
+        b"RIFF\x24\x00\x00\x00WAVEfmt \x10\x00\x00\x00\x01\x00\x01\x00"
+        b"\x80>\x00\x00\x00}\x00\x00\x02\x00\x10\x00data\x00\x00\x00\x00"
+    )
+    pcm_data = b"\x01\x00" * 48000 * 2
+    mic_path = tmp_path / "mic.wav"
+    monitor_path = tmp_path / "monitor.wav"
+    mic_path.write_bytes(header + pcm_data)
+    monitor_path.write_bytes(header + pcm_data)
+
+    lt = LiveTranscriber(settings, "partial-test", mic_path, monitor_path)
+    mock_transcriber = MagicMock()
+    mock_transcriber._backend.cache_fingerprint.return_value = "fw-fp"
+    mock_transcriber.transcribe_stereo.return_value = (
+        [Segment(start=0.0, end=1.0, text="decoded prefix", speaker="You")],
+        [],
+        {"duration": 2.0, "language": "en", "partial": True},
+    )
+    monkeypatch.setattr(lt, "_ensure_transcriber", lambda: mock_transcriber)
+
+    lt._process_chunk()
+
+    # Nothing committed: segments withheld, cursors unchanged, fingerprint not
+    # latched — the next cycle re-reads and re-transcribes the whole interval.
+    assert lt._segments == []
+    assert lt._mic_byte_offset == 0
+    assert lt._monitor_byte_offset == 0
+    assert lt._active_backend_fingerprint is None
+
+    # A complete interval afterwards commits normally.
+    mock_transcriber.transcribe_stereo.return_value = (
+        [Segment(start=0.0, end=1.0, text="complete", speaker="You")],
+        [],
+        {"duration": 2.0, "language": "en", "partial": False},
+    )
+    lt._process_chunk()
+    assert [s.text for s in lt._segments] == ["complete"]
+    assert lt._mic_byte_offset > 0
+    assert lt._active_backend_fingerprint == "fw-fp"
+
+
+def test_live_single_channel_partial_interval_commits_nothing(tmp_path, monkeypatch):
+    """A partial single-channel result must also keep its cursor for retry."""
+    settings = Settings(
+        vault_path=tmp_path, live=True, transcription_backend="faster-whisper", live_min_chunk=0.1
+    )
+    header = (
+        b"RIFF\x24\x00\x00\x00WAVEfmt \x10\x00\x00\x00\x01\x00\x01\x00"
+        b"\x80>\x00\x00\x00}\x00\x00\x02\x00\x10\x00data\x00\x00\x00\x00"
+    )
+    pcm_data = b"\x01\x00" * 48000 * 2
+    mic_path = tmp_path / "mic.wav"
+    monitor_path = tmp_path / "monitor.wav"
+    mic_path.write_bytes(header + pcm_data)
+    monitor_path.write_bytes(header)  # no new monitor audio this interval
+
+    lt = LiveTranscriber(settings, "partial-single", mic_path, monitor_path)
+    mock_transcriber = MagicMock()
+    mock_transcriber._backend.cache_fingerprint.return_value = "fw-fp"
+    mock_transcriber.transcribe.return_value = (
+        [Segment(start=0.0, end=1.0, text="prefix")],
+        {"language": "en", "duration": 2.0, "partial": True},
+    )
+    monkeypatch.setattr(lt, "_ensure_transcriber", lambda: mock_transcriber)
+
+    lt._process_chunk()
+
+    assert lt._segments == []
+    assert lt._mic_byte_offset == 0
+
+
 def test_live_stop_processes_tail_audio_under_min_chunk(tmp_path, monkeypatch):
     """Stop cleans up tail audio even if less than live_min_chunk (e.g. 2s < 5s)."""
     settings = Settings(vault_path=tmp_path, live=True, live_min_chunk=5.0)
@@ -1254,4 +1335,93 @@ def test_live_fallback_notice_and_backend_switch_are_announced(
     err = capsys.readouterr().err
     assert "falling back to faster-whisper" in err
     assert "Live transcription backend switched:" in err
-    assert "Whisper: large-v3-turbo on cpu/int8" in err
+
+
+def test_transcribe_chunk_and_pair_report_partiality(tmp_path, monkeypatch):
+    """The chunk/pair helpers surface the backend's partial flag instead of dropping it."""
+    settings = Settings(vault_path=tmp_path, live=True, transcription_backend="faster-whisper")
+    lt = LiveTranscriber(settings, "partial-flags", tmp_path / "mic.wav", tmp_path / "monitor.wav")
+    mock_transcriber = MagicMock()
+    monkeypatch.setattr(lt, "_ensure_transcriber", lambda: mock_transcriber)
+
+    mock_transcriber.transcribe.return_value = (
+        [Segment(start=0.0, end=1.0, text="prefix")],
+        {"language": "en", "partial": True},
+    )
+    fake_pcm = b"\x01\x00" * 16000
+    _segments, chunk_partial = lt._transcribe_chunk(mock_transcriber, fake_pcm, 0, 0, is_mic=True)
+    assert chunk_partial is True
+
+    mock_transcriber.transcribe_stereo.return_value = ([], [], {"language": "en", "partial": True})
+    _mic, _monitor, pair_partial = lt._transcribe_pair(mock_transcriber, fake_pcm, fake_pcm, 0)
+    assert pair_partial is True
+
+    mock_transcriber.transcribe_stereo.return_value = ([], [], {"language": "en", "partial": False})
+    _mic, _monitor, complete_partial = lt._transcribe_pair(mock_transcriber, fake_pcm, fake_pcm, 0)
+    assert complete_partial is False
+
+
+def test_live_replays_full_session_when_faster_whisper_falls_back_to_cpu(
+    tmp_path, tmp_vault, monkeypatch
+):
+    """A CUDA→CPU runtime fallback changes the resolved backend identity, so the
+    anti-mixing repair must treat it like a backend switch and replay the session.
+
+    Regression: cache_fingerprint() encoded only the *requested* device/compute
+    settings, so a fallback that rewrote _device/_compute_type left the identity
+    untouched and the full-session replay never ran — a later CUDA interval could
+    reuse output actually produced by CPU/int8.
+    """
+    settings = Settings(
+        vault_path=tmp_vault,
+        transcription_backend="faster-whisper",
+        resume_cache_dir=tmp_path / "resume",
+        live_min_chunk=0.1,
+        live_interval=60,
+    )
+    mic_path = tmp_path / "mic.wav"
+    monitor_path = tmp_path / "monitor.wav"
+    create_mono_wav(mic_path, duration=0.5, sample_rate=48000)
+    create_mono_wav(monitor_path, duration=0.5, sample_rate=48000)
+
+    state = {"resolved": "cuda/float16"}
+    backend = MagicMock()
+
+    def fake_transcribe(_path, **_kwargs):
+        text = "cpu replay" if state["resolved"] == "cpu/int8" else "cuda interval"
+        return [Segment(start=0.0, end=1.0, text=text)], {
+            "language": "en",
+            "duration": 1.0,
+            "partial": False,
+        }
+
+    backend.transcribe.side_effect = fake_transcribe
+    backend.cache_fingerprint.side_effect = lambda: state["resolved"]
+
+    monkeypatch.setattr(Transcriber, "_new_fw_backend", lambda self: backend)
+    monkeypatch.setattr(live_mod, "load_transcriber", lambda s: Transcriber(s))
+
+    lt = LiveTranscriber(settings, "cpu-fallback-session", mic_path, monitor_path)
+
+    # Interval 1 executes on CUDA and commits under the CUDA identity.
+    lt._process_chunk()
+    assert lt._active_backend_fingerprint == "cuda/float16"
+    assert all(s.text == "cuda interval" for s in lt._segments)
+
+    # Simulate _fallback_to_cpu mid-session: the backend object is the same, only
+    # its resolved identity changed — exactly what the old fingerprint missed.
+    state["resolved"] = "cpu/int8"
+    with open(mic_path, "ab") as f:
+        f.write(b"\x01\x00" * 24000)
+    with open(monitor_path, "ab") as f:
+        f.write(b"\x01\x00" * 24000)
+
+    lt._process_chunk()
+
+    # The identity change must trigger the full-session anti-mixing replay.
+    assert lt._active_backend_fingerprint == "cpu/int8"
+    assert all(s.text == "cpu replay" for s in lt._segments)
+    assert not any(s.text == "cuda interval" for s in lt._segments)
+    md_content = lt.live_md_path.read_text()
+    assert "cpu replay" in md_content
+    assert "cuda interval" not in md_content

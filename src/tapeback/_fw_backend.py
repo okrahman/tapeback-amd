@@ -7,10 +7,9 @@ HTTP server, so this module is imported lazily, only when faster-whisper is need
 Owns everything CTranslate2-specific: device and compute-type resolution, CUDA→CPU
 fallback, model loading, out-of-process isolation, batched inference, and segment
 collection with KeyboardInterrupt→partial semantics. It performs no resume-cache
-IO of its own — that is the façade's job, keyed on `cache_fingerprint()`.
-"""
+IO of its own — that is the façade's job, keyed on `cache_fingerprint()`."""
 
-import locale
+import hashlib
 import os
 import sys
 import time
@@ -23,6 +22,7 @@ from huggingface_hub.errors import LocalEntryNotFoundError
 
 from tapeback import _resume
 from tapeback._backends import StatusCallback, TranscriptionInfo
+from tapeback._fw_compute import _batched_warning, _resolve_compute_type
 from tapeback._gpu import (
     free_gpu_memory,
     get_free_vram_mib,
@@ -42,49 +42,6 @@ from tapeback.settings import Settings
 # change the already-initialized C locale after Python startup.
 # See: https://github.com/PyAV-Org/PyAV — setup.py c_string_encoding directive.
 os.environ["LC_MESSAGES"] = "C"
-locale.setlocale(locale.LC_MESSAGES, "C")
-
-
-# Compute types ctranslate2 cannot run on CPU. Requesting one there raises
-# ValueError rather than degrading, so a device fallback has to translate it.
-_CUDA_ONLY_COMPUTE_TYPES = frozenset({"float16", "int8_float16", "bfloat16", "int8_bfloat16"})
-
-
-def _resolve_compute_type(compute_type: str, device: str) -> str:
-    """Resolve the compute type for the device we ended up on.
-
-    - auto + cuda → int8_float16
-    - auto + cpu  → int8
-    - an explicit CUDA-only type on CPU → int8, because ctranslate2 raises otherwise
-    - any other explicit value passes through.
-
-    The CPU translation matters because the device is now chosen at runtime: a card that
-    is thermally clamped or out of VRAM sends us to the CPU carrying whatever
-    TAPEBACK_COMPUTE_TYPE was set for the GPU. Without this, that combination died with
-    "Requested int8_float16 compute type, but the target device or backend do not
-    support efficient int8_float16 computation" — a crash instead of a fallback.
-
-    int8_float16 rather than float16 because it is faster *and* smaller, which is not
-    the usual trade-off. Measured on a GTX 1650 Ti with large-v3-turbo, same 90 s clip,
-    twice each: float16 3.90x real time and 2139 MiB, int8_float16 **14.16x and
-    1115 MiB**. Quality does not pay for it — decoding the same audio both ways gave
-    near-identical text with single-word differences in both directions, and across the
-    benchmark grid int8_float16 had the lower share of low-confidence words.
-
-    The likely reason is hardware: this is a Turing part without tensor cores, so fp16
-    gets no acceleration while int8 uses the integer datapath. That is a hypothesis;
-    the measurements are not. ctranslate2 falls back on its own if a device does not
-    support the requested type, so this stays safe on other GPUs.
-    """
-    if compute_type == "auto":
-        return "int8_float16" if device == "cuda" else "int8"
-    if device != "cuda" and compute_type in _CUDA_ONLY_COMPUTE_TYPES:
-        print(
-            f"Warning: compute type {compute_type} is GPU-only; using int8 on {device}.",
-            file=sys.stderr,
-        )
-        return "int8"
-    return compute_type
 
 
 def _noop_status(_message: str) -> None:
@@ -167,36 +124,6 @@ def _resolve_device(settings: Settings) -> str:
     return "cpu"
 
 
-# Parameters tapeback configures that BatchedInferencePipeline silently drops.
-# Verified against faster-whisper 1.2.1's own "Unused Arguments" docstring; the
-# temperature entry is separate because it is not ignored outright — only the
-# first value of the ladder is used, which disables the anti-hallucination retries.
-BATCHED_IGNORED_SETTINGS = (
-    "no_speech_threshold",
-    "condition_on_previous_text",
-    "hallucination_silence_threshold",
-)
-
-
-def _batched_warning(settings: Settings) -> str | None:
-    """Warn if batching would silently drop anti-hallucination settings.
-
-    Enabling batching quietly reverts several deliberate choices, and the run
-    otherwise looks identical — so the user must be told which ones, rather than
-    discovering it in a transcript full of repeats.
-    """
-    dropped = [name for name in BATCHED_IGNORED_SETTINGS if getattr(settings, name) is not None]
-    if len(settings.temperature) > 1:
-        dropped.append("temperature (only the first value is used)")
-    if not dropped:
-        return None
-    return (
-        f"Warning: TAPEBACK_BATCH_SIZE={settings.batch_size} enables batched inference, "
-        f"which ignores: {', '.join(dropped)}. "
-        "These are anti-hallucination settings; expect more repeats on quiet channels."
-    )
-
-
 class FasterWhisperBackend:
     """Transcription through faster-whisper, in-process or in an isolated worker."""
 
@@ -250,8 +177,36 @@ class FasterWhisperBackend:
         )
 
     def cache_fingerprint(self) -> str:
-        """Identity of the settings that change what faster-whisper produces."""
-        return _resume.settings_fingerprint(self._settings)
+        """Identity of the settings that change what faster-whisper produces.
+
+        The *resolved* device and compute type are part of the identity, not just
+        the requested settings: a CUDA→CPU fallback (at load time or mid-run)
+        changes what the model actually executes, and a CPU/int8 result must never
+        be served to — or cached under — a CUDA identity. Both fallback paths
+        mutate ``self._device``/``self._compute_type``, so the identity changes the
+        moment a fallback lands. The isolated child resolves its device out of
+        process; its identity is recorded when its result is accepted
+        (``_record_resolved_identity``), before the result can be cached.
+        """
+        settings_fp = _resume.settings_fingerprint(self._settings)
+        resolved = f"{self._device}/{self._compute_type}"
+        return hashlib.sha256(f"{settings_fp}\x00{resolved}".encode()).hexdigest()[:32]
+
+    def resolved_identity(self) -> dict[str, str]:
+        """Where this backend actually executes — reported by the isolated worker."""
+        return {"device": self._device, "compute_type": self._compute_type}
+
+    def _record_resolved_identity(self, info: TranscriptionInfo) -> None:
+        """Adopt the isolated worker's resolved device/compute type, if it reported one.
+
+        The child owns device resolution (thermal clamp, VRAM), so its answer is
+        authoritative. Recording it before the result is accepted keeps the cache
+        key and live-mode backend-switch detection truthful about where the work ran.
+        """
+        device, compute_type = info.get("device"), info.get("compute_type")
+        if isinstance(device, str) and isinstance(compute_type, str):
+            self._device = device
+            self._compute_type = compute_type
 
     def pace(self, on_status: StatusCallback) -> None:
         """Idle between stages so the chassis sheds heat instead of latching the clamp.
@@ -369,13 +324,20 @@ class FasterWhisperBackend:
         backend without this class knowing about the cache.
         """
         if self._isolated:
-            return transcribe_isolated(
+            segments, info = transcribe_isolated(
                 audio_path,
                 self._settings,
                 stage=stage,
                 on_status=on_status,
                 language_override=language_override,
             )
+            # The child resolves the real device and compute type out of process.
+            # Record its identity before the result is accepted or cached — the
+            # parent would otherwise store a CPU/int8 result under a CUDA identity.
+            self._record_resolved_identity(info)
+            return segments, {
+                key: value for key, value in info.items() if key not in ("device", "compute_type")
+            }
 
         # "auto" → None lets faster-whisper auto-detect language. An override wins over
         # "auto" but never over an explicitly configured language.

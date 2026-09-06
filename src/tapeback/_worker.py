@@ -49,6 +49,7 @@ EVENT_STATUS = "status"
 EVENT_SEGMENT = "segment"
 EVENT_INFO = "info"
 EVENT_ERROR = "error"
+EVENT_BACKEND = "backend"
 
 
 def emit(stream: Any, event: str, **payload: Any) -> None:
@@ -96,6 +97,11 @@ def run_job(job: dict[str, Any], stdout: Any) -> int:
     )
     for segment in segments:
         emit(stdout, EVENT_SEGMENT, data=_segment_payload(segment))
+    # After transcribe, not before: a mid-run CUDA→CPU fallback in the child must
+    # be reflected in the identity the parent records for this result.
+    identity = transcriber.resolved_identity()
+    if identity:
+        emit(stdout, EVENT_BACKEND, data=identity)
     emit(stdout, EVENT_INFO, data=info)
     return 0
 

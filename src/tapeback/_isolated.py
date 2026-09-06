@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any
 
 from tapeback._worker import (
+    EVENT_BACKEND,
     EVENT_ERROR,
     EVENT_INFO,
     EVENT_SEGMENT,
@@ -75,7 +76,18 @@ def _to_segment(data: dict[str, Any]) -> Segment:
     )
 
 
-def transcribe_isolated(
+def _with_identity(info: dict[str, Any], resolved: dict[str, Any]) -> dict[str, Any]:
+    """Attach the worker's resolved device/compute identity, if it reported one.
+
+    The parent's fingerprint must reflect where the work actually ran, so the
+    identity rides on the info dict; `FasterWhisperBackend` adopts it and strips
+    it again before the result reaches callers or the resume cache.
+    """
+    identity = {key: resolved[key] for key in ("device", "compute_type") if key in resolved}
+    return {**info, **identity} if identity else info
+
+
+def transcribe_isolated(  # noqa: PLR0912 — one flat ladder over the worker's event protocol
     audio_path: Path,
     settings: Settings,
     *,
@@ -101,6 +113,7 @@ def transcribe_isolated(
 
     segments: list[Segment] = []
     info: dict[str, Any] = {}
+    resolved: dict[str, Any] = {}
     error: str | None = None
 
     process = subprocess.Popen(
@@ -134,6 +147,8 @@ def transcribe_isolated(
                 on_status(event["message"])
             elif kind == EVENT_SEGMENT:
                 segments.append(_to_segment(event["data"]))
+            elif kind == EVENT_BACKEND:
+                resolved = event["data"]
             elif kind == EVENT_INFO:
                 info = event["data"]
             elif kind == EVENT_ERROR:
@@ -143,12 +158,12 @@ def transcribe_isolated(
         on_status(f"Interrupted — keeping the {len(segments)} segments the worker sent.")
         info = dict(info)
         info["partial"] = True
-        return segments, info
+        return segments, _with_identity(info, resolved)
     finally:
         _stop(process)
 
     if info:
-        return segments, info
+        return segments, _with_identity(info, resolved)
 
     # No info event means the worker never finished. Segments already received are
     # still worth keeping — this is the out-of-memory path the isolation exists for.
@@ -157,7 +172,9 @@ def transcribe_isolated(
             f"Worker stopped early ({error or f'exit code {process.returncode}'}) — "
             f"keeping the {len(segments)} segments it produced."
         )
-        return segments, {"partial": True, "language": "", "duration": 0.0}
+        return segments, _with_identity(
+            {"partial": True, "language": "", "duration": 0.0}, resolved
+        )
 
     raise WorkerFailed(error or f"transcription worker exited with code {process.returncode}")
 

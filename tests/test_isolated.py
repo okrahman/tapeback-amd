@@ -3,12 +3,15 @@
 import io
 import json
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 
+from tapeback._fw_backend import FasterWhisperBackend
 from tapeback._isolated import WorkerFailed, job_settings, transcribe_isolated
 from tapeback._worker import EVENT_INFO, EVENT_SEGMENT, EVENT_STATUS, emit
 from tapeback._worker import main as worker_main
+from tapeback.models import Segment
 
 
 class _FakeProcess:
@@ -180,3 +183,114 @@ def test_malformed_job_is_reported_as_an_error_event(monkeypatch, capsys):
     event = json.loads(capsys.readouterr().out.strip())
     assert event["type"] == "error"
     assert "invalid job" in event["message"]
+
+
+# --- resolved device identity across the process boundary ---
+
+
+def test_worker_resolved_identity_rides_on_info(settings, spawn):
+    """The child's resolved device/compute identity reaches the parent via info."""
+    spawn(
+        [
+            _line("backend", data={"device": "cpu", "compute_type": "int8"}),
+            _line(EVENT_INFO, data={"language": "ru", "duration": 9.0, "partial": False}),
+        ]
+    )
+
+    _segments, info = transcribe_isolated(
+        Path("/fake/audio.wav"), settings, on_status=lambda _m: None
+    )
+
+    assert info["device"] == "cpu"
+    assert info["compute_type"] == "int8"
+
+
+def test_worker_without_identity_leaves_info_untouched(settings, spawn):
+    """An older worker that never reports identity must not invent one."""
+    spawn([_line(EVENT_INFO, data={"language": "ru", "duration": 9.0, "partial": False})])
+
+    _segments, info = transcribe_isolated(
+        Path("/fake/audio.wav"), settings, on_status=lambda _m: None
+    )
+
+    assert "device" not in info
+    assert "compute_type" not in info
+
+
+def test_worker_run_job_emits_resolved_identity_event(monkeypatch, capsys, settings, tmp_path):
+    """run_job reports the child's resolved device/compute so the parent can adopt it."""
+    fake_transcriber = MagicMock()
+    fake_transcriber.transcribe.return_value = (
+        [],
+        {"language": "en", "duration": 1.0, "partial": False},
+    )
+    fake_transcriber.resolved_identity.return_value = {"device": "cpu", "compute_type": "int8"}
+    fake_transcriber.describe.return_value = "Whisper: tiny on cpu/int8"
+    monkeypatch.setattr(
+        "tapeback.transcriber.Transcriber", MagicMock(return_value=fake_transcriber)
+    )
+    audio = tmp_path / "audio.wav"
+    audio.write_bytes(b"audio")
+    monkeypatch.setattr(
+        "sys.stdin",
+        io.StringIO(
+            json.dumps(
+                {
+                    "settings": job_settings(settings),
+                    "audio_path": str(audio),
+                    "stage": "transcribe",
+                }
+            )
+        ),
+    )
+
+    assert worker_main() == 0
+
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines() if line]
+    assert {
+        "type": "backend",
+        "data": {"device": "cpu", "compute_type": "int8"},
+    } in events
+
+
+def test_parent_adopts_child_identity_before_result_is_accepted(monkeypatch, settings):
+    """The parent fingerprint must reflect the child's resolved device, not the request.
+
+    The child resolves the device itself (thermal clamp, VRAM) and may fall back to
+    CPU mid-run; recording its identity only at accept time is what keeps a CPU/int8
+    result out of a CUDA cache slot.
+    """
+    backend = FasterWhisperBackend(settings.model_copy(update={"isolate_transcription": True}))
+    before = backend.cache_fingerprint()
+
+    def fake_isolated(*_args, **_kwargs):
+        return [Segment(start=0.0, end=1.0, text="child work")], {
+            "language": "en",
+            "duration": 1.0,
+            "partial": False,
+            "device": "cpu",
+            "compute_type": "int8",
+        }
+
+    monkeypatch.setattr("tapeback._fw_backend.transcribe_isolated", fake_isolated)
+    _segments, info = backend.transcribe(Path("/fake/audio.wav"))
+
+    # The identity keys are adopted, then stripped from the caller-facing result.
+    assert info == {"language": "en", "duration": 1.0, "partial": False}
+    assert backend.resolved_identity() == {"device": "cpu", "compute_type": "int8"}
+    assert backend.cache_fingerprint() != before
+
+
+def test_runtime_device_fallback_changes_the_cache_identity(settings):
+    """What _fallback_to_cpu mutates must be part of cache_fingerprint's answer."""
+    backend = FasterWhisperBackend(
+        settings.model_copy(
+            update={"isolate_transcription": True, "device": "cuda", "compute_type": "float16"}
+        )
+    )
+    before = backend.cache_fingerprint()
+
+    # Exactly the mutation _load_model/_fallback_to_cpu perform on a CUDA failure.
+    backend._device, backend._compute_type = "cpu", "int8"
+
+    assert backend.cache_fingerprint() != before

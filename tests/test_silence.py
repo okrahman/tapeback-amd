@@ -9,7 +9,7 @@ import pytest
 
 import tapeback.live as live_mod
 import tapeback.pipeline as pipeline_mod
-from tapeback._lemonade import LemonadeUnavailableError
+from tapeback._lemonade_errors import LemonadeUnavailableError
 from tapeback.channel import is_channel_active
 from tapeback.live import LiveTranscriber
 from tapeback.models import Segment
@@ -267,8 +267,9 @@ def test_live_single_silent_chunk_never_writes_or_calls_backend(tmp_path, monkey
     writer = MagicMock()
     monkeypatch.setattr(lt, "_write_chunk_wav", writer)
 
-    result = lt._transcribe_chunk(transcriber, b"\x00\x00" * 4800, 0, 0, is_mic=True)
+    result, partial = lt._transcribe_chunk(transcriber, b"\x00\x00" * 4800, 0, 0, is_mic=True)
 
     assert result == []
+    assert partial is False
     writer.assert_not_called()
     transcriber.transcribe.assert_not_called()
