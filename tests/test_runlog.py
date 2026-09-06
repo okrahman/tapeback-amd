@@ -46,7 +46,7 @@ def test_run_log_records_config_events_and_outcome(tmp_path):
     ]
     assert record["config"]["whisper_model"] == "large-v3-turbo"
     assert record["config"]["chunk_length"] == 30
-    assert record["config"]["transcription_backend"] == "faster-whisper"
+    assert record["config"]["transcription_backend"] == "lemonade"
     assert record["config"]["lemonade_url"] == "http://127.0.0.1:13305"
     assert record["config"]["lemonade_model"] == "Whisper-Large-v3-Turbo"
     assert record["config"]["lemonade_chunk_seconds"] == 300.0

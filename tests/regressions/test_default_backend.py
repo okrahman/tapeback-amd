@@ -1,11 +1,12 @@
 """Regression tests pinning the intended default transcription backend.
 
-The faster-whisper backend is the *intended* default: transcription is fully
-local, and raw audio only leaves the machine when the user explicitly opts in
-with `TAPEBACK_TRANSCRIPTION_BACKEND=lemonade`. These tests pin that default so
-it cannot silently flip in either direction, pin that Lemonade remains reachable
-via explicit opt-in, and pin the runtime disclosure that makes the outbound-audio
-path visible whenever it is taken.
+The Lemonade backend is the *intended* default: transcription runs through the
+user-configured Lemonade Server, and raw recording audio leaves the machine by
+design. The faster-whisper backend is the explicit local opt-out
+(`TAPEBACK_TRANSCRIPTION_BACKEND=faster-whisper`). These tests pin that default
+so it cannot silently flip in either direction, pin that faster-whisper remains
+reachable via explicit opt-out, and pin the runtime disclosure that makes the
+outbound-audio path visible whenever it is taken.
 """
 
 from unittest.mock import MagicMock
@@ -20,35 +21,36 @@ from tapeback.settings import Settings
 from tapeback.transcriber import Transcriber
 
 
-def test_default_backend_is_faster_whisper() -> None:
-    """Unmodified Settings must select the local faster-whisper backend.
+def test_default_backend_is_lemonade() -> None:
+    """Unmodified Settings must select the Lemonade backend.
 
     The autouse `isolate_settings_sources` fixture strips `.env` and every
-    `TAPEBACK_*` variable, so this exercises the true field default. A default
-    that ships audio off the machine would send recordings to whatever process
-    wins the configured port — local disclosure by default is not acceptable.
+    `TAPEBACK_*` variable, so this exercises the true field default. Shipping
+    audio to the user-configured Lemonade Server by default is intended —
+    including on a local multi-user host — so the per-run disclosure line
+    (pinned below) must keep the outbound path visible on every run.
     """
-    assert Settings().transcription_backend == "faster-whisper"
+    assert Settings().transcription_backend == "lemonade"
 
 
-def test_default_transcriber_builds_faster_whisper_backend(tmp_path) -> None:
-    """A Transcriber built from unmodified settings must dispatch to faster-whisper.
+def test_default_transcriber_builds_lemonade_backend(tmp_path) -> None:
+    """A Transcriber built from unmodified settings must dispatch to Lemonade.
 
     Safe without a network: neither backend's constructor performs a model
     load, a preflight, or a request.
     """
     transcriber = Transcriber(Settings(vault_path=tmp_path / "vault"))
-    assert isinstance(transcriber._backend, FasterWhisperBackend)
+    assert isinstance(transcriber._backend, LemonadeBackend)
 
 
-def test_explicit_lemonade_opt_in_still_builds_lemonade_backend(tmp_path) -> None:
-    """Opting in must still select Lemonade — the default flip is not a removal."""
+def test_explicit_faster_whisper_opt_out_still_builds_faster_whisper_backend(tmp_path) -> None:
+    """Opting out must still select faster-whisper — the default flip is not a removal."""
     settings = Settings(
         vault_path=tmp_path / "vault",
-        transcription_backend="lemonade",
+        transcription_backend="faster-whisper",
     )
     transcriber = Transcriber(settings)
-    assert isinstance(transcriber._backend, LemonadeBackend)
+    assert isinstance(transcriber._backend, FasterWhisperBackend)
 
 
 def test_lemonade_discloses_unauthenticated_plaintext_local_endpoint(tmp_path) -> None:

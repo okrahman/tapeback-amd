@@ -20,10 +20,12 @@ def _echo_status(msg: str) -> None:
 @click.group()
 @click.version_option(_pkg_version("tapeback"), prog_name="tapeback")
 def cli() -> None:
-    """tapeback — local meeting recorder for Obsidian.
+    """tapeback — meeting recorder for Obsidian.
 
     Records system audio + microphone via PipeWire/PulseAudio,
-    transcribes locally with Whisper, identifies speakers with pyannote,
+    transcribes through a Lemonade Server by default (opt out to
+    TAPEBACK_TRANSCRIPTION_BACKEND=faster-whisper for fully local
+    transcription), identifies speakers with pyannote,
     saves Markdown notes to your Obsidian vault.
 
     Works with any video call platform (Meet, Zoom, Teams, Telegram, Discord).

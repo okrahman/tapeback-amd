@@ -6,7 +6,7 @@ Set Height 500
 Set Theme "Catppuccin Mocha"
 Set TypingSpeed 50ms
 
-Type "# tapeback — record and transcribe meetings locally"
+Type "# tapeback — record and transcribe meetings"
 Enter
 Sleep 1s
 
