@@ -9,6 +9,7 @@ symlinks explicitly.
 """
 
 import json
+import os
 import stat
 
 from tapeback import _resume, _runlog
@@ -62,6 +63,31 @@ def test_run_record_is_private(tmp_path):
     path = _runlog.write_run_log(record, tmp_path / "runs")
     assert path is not None
     _assert_private_file(path)
+
+
+def test_write_private_text_survives_a_leftover_tmp_from_a_recycled_pid(tmp_path):
+    """A crash-leftover tmp file must not make the next write silently fail.
+
+    Regression: the tmp name was keyed only on the pid (.<name>.tmp.<pid>), so a
+    previous crash leaving that file behind made a later run with the same
+    recycled pid hit the O_EXCL open failure — an error callers like
+    _resume.store and write_run_log swallow, silently skipping a cache entry or
+    run record. The tmp name now carries a uuid4 fragment, so the leftover is
+    ignored (and cleaned up on the next write only if it collides, never
+    blocking) and the write lands.
+    """
+    directory = tmp_path / "resume"
+    directory.mkdir()
+    target = directory / "entry.json"
+    leftover = directory / f".{target.name}.tmp.{os.getpid()}"
+    leftover.write_text("stale leftover from a previous crash")
+
+    write_private_text(target, "fresh content")
+
+    assert target.read_text() == "fresh content"
+    # The write goes to its own uniquely named tmp file; the stale leftover is
+    # never followed, overwritten, or removed by this write.
+    assert leftover.read_text() == "stale leftover from a previous crash"
 
 
 def test_write_private_text_repairs_a_permissive_directory(tmp_path):

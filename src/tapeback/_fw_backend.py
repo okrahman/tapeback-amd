@@ -339,10 +339,12 @@ class FasterWhisperBackend:
                 key: value for key, value in info.items() if key not in ("device", "compute_type")
             }
 
-        # "auto" → None lets faster-whisper auto-detect language. An override wins over
+        # "auto" (or empty — an env var can set TAPEBACK_LANGUAGE="") → None lets
+        # faster-whisper auto-detect language, exactly what the Lemonade backend
+        # and the facade's resume identity do with "". An override wins over
         # "auto" but never over an explicitly configured language.
         configured = self._settings.language
-        language = configured if configured != "auto" else language_override or None
+        language = configured if configured and configured != "auto" else language_override or None
 
         segments: list[Segment] = []
         try:

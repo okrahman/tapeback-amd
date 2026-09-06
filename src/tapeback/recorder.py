@@ -278,7 +278,7 @@ class Recorder:
                 return Path(session["monitor_path"]), Path(session["mic_path"])
             raise RuntimeError("No recording in progress.")
 
-        session: SessionData = json.loads(self._session_file.read_text())
+        session = self._load_session_file()
         pids = [session["pid_monitor"], session["pid_mic"]]
 
         # Send SIGTERM to both
@@ -293,14 +293,28 @@ class Recorder:
 
         return Path(session["monitor_path"]), Path(session["mic_path"])
 
+    def _load_session_file(self) -> SessionData:
+        """Read session.json with the same symlink refusal the write path enforces.
+
+        The write side refuses a planted symlink before ever touching the path;
+        the read side must not follow one either. Refusal raises RuntimeError —
+        tampering with the state file must surface loudly, never be followed.
+        """
+        refuse_symlink_target(self._session_file, "read the session state")
+        return json.loads(self._session_file.read_text())
+
     def is_recording(self) -> bool:
         """Check if recording is active (session.json exists and processes are alive)."""
         if not self._session_file.exists():
             return False
 
         try:
-            session: SessionData = json.loads(self._session_file.read_text())
-        except (json.JSONDecodeError, KeyError):
+            session: SessionData = self._load_session_file()
+        except (json.JSONDecodeError, KeyError, OSError):
+            # Corrupt or unreadable-but-regular state is treated as "not
+            # recording" — a status check must stay usable. A planted symlink
+            # is refused loudly by _load_session_file instead of being caught
+            # here: OSError never sees it.
             return False
 
         for key in ("pid_monitor", "pid_mic"):
@@ -317,5 +331,5 @@ class Recorder:
         """Return session info dict if recording, else None."""
         if not self.is_recording():
             return None
-        data: SessionData = json.loads(self._session_file.read_text())
+        data: SessionData = self._load_session_file()
         return data

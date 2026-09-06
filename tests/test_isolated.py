@@ -317,3 +317,37 @@ def test_worker_env_strips_tapeback_vars_and_provider_secrets(monkeypatch):
     # Operational variables the worker legitimately needs are inherited.
     assert env["PATH"] == "/usr/bin:/bin"
     assert env["CUDA_VISIBLE_DEVICES"] == "0"
+
+
+def test_worker_env_denies_every_production_provider_credential(monkeypatch):
+    """Every env var the production provider mapping reads is denied to the worker.
+
+    Regression: the deny-list was a hand-copied set that contained QWEN_API_KEY —
+    a name the production mapping never uses — while the qwen provider actually
+    reads DASHSCOPE_API_KEY. A user running the qwen summarizer had their
+    DashScope key present in the spawned transcription child for the whole
+    session. The list is now derived from the production mapping; this test
+    plants every mapped credential by name (hardcoded, per the test rules) plus
+    the non-summarizer credentials, and asserts none survive the scrub.
+    """
+    planted = {
+        "ANTHROPIC_API_KEY": "sk-anthropic",
+        "OPENAI_API_KEY": "sk-openai",
+        "GROQ_API_KEY": "gsk-groq",
+        "GEMINI_API_KEY": "sk-gemini",
+        "OPENROUTER_API_KEY": "sk-openrouter",
+        "DEEPSEEK_API_KEY": "sk-deepseek",
+        "DASHSCOPE_API_KEY": "sk-dashscope",
+        "HF_TOKEN": "hf-token",
+        "HUGGING_FACE_HUB_TOKEN": "hf-hub-token",
+        "AWS_ACCESS_KEY_ID": "AKIA-example",
+        "AWS_SECRET_ACCESS_KEY": "aws-secret",
+        "AZURE_OPENAI_API_KEY": "sk-azure",
+    }
+    for key, value in planted.items():
+        monkeypatch.setenv(key, value)
+
+    env = _worker_env()
+
+    for key in planted:
+        assert key not in env

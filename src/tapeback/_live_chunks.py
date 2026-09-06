@@ -176,7 +176,12 @@ class _ChunkTranscriber:
                 on_status=self._report_status,
             )
             partial = bool(_info.get("partial"))
-            if not is_mic and _info.get("language"):
+            if _info.get("language"):
+                # Latch the detected/pinned language from either channel. A
+                # mic-only session (the monitor never produces PCM) otherwise
+                # re-auto-detects every interval and the live note can flip
+                # language mid-session. When an override was applied,
+                # info["language"] repeats it and this is a no-op.
                 self._last_detected_language = str(_info["language"])
         finally:
             chunk_path.unlink(missing_ok=True)

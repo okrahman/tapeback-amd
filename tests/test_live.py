@@ -980,6 +980,34 @@ def test_live_transcriber_reuses_detected_language_for_single_mic_chunk(tmp_path
     assert mock_transcriber.transcribe.call_args[1]["language_override"] == "fr"
 
 
+def test_live_transcriber_latches_language_detected_from_mic_only_chunks(tmp_path):
+    """A mic-only session must latch the detected language like a pair session.
+
+    Regression: _transcribe_chunk updated _last_detected_language only for the
+    monitor channel (`not is_mic`). When the monitor channel never produces PCM,
+    every mic interval passed language_override=None and auto-detected
+    independently, so the live note could flip language mid-session.
+    """
+    settings = Settings(vault_path=tmp_path, live=True, transcription_backend="lemonade")
+    mic_path = tmp_path / "mic.wav"
+    monitor_path = tmp_path / "monitor.wav"
+
+    lt = LiveTranscriber(settings, "lang-latch", mic_path, monitor_path)
+    assert lt._last_detected_language is None
+
+    mock_transcriber = MagicMock()
+    mock_transcriber.transcribe.return_value = ([], {"language": "ru"})
+
+    fake_pcm = b"\x01\x00" * 16000
+    lt._transcribe_chunk(mock_transcriber, fake_pcm, 0, 0, is_mic=True)
+    assert lt._last_detected_language == "ru"
+
+    lt._transcribe_chunk(mock_transcriber, fake_pcm, 0, 0, is_mic=True)
+    assert mock_transcriber.transcribe.call_count == 2
+    # The second interval reuses the language the first interval detected.
+    assert mock_transcriber.transcribe.call_args[1]["language_override"] == "ru"
+
+
 def test_stop_and_process_survives_live_transcriber_fatal_error(tmp_path, monkeypatch):
     """pipeline.stop_and_process does not crash when live_transcriber.stop() raises fatal error."""
     settings = Settings(vault_path=tmp_path, live=True)

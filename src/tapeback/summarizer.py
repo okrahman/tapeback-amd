@@ -55,15 +55,8 @@ Rules:
 _RETRY_PROMPT = "Respond with valid JSON only. No other text."
 
 
-_PROVIDER_ENV_VARS: dict[str, str] = {
-    "anthropic": "ANTHROPIC_API_KEY",
-    "openai": "OPENAI_API_KEY",
-    "groq": "GROQ_API_KEY",
-    "gemini": "GEMINI_API_KEY",
-    "openrouter": "OPENROUTER_API_KEY",
-    "deepseek": "DEEPSEEK_API_KEY",
-    "qwen": "DASHSCOPE_API_KEY",
-}
+# Provider → env var mapping lives in const.PROVIDER_ENV_VARS (single source of
+# truth shared with the worker's credential deny-list and the test env isolation).
 
 _OPENAI_COMPATIBLE_BASE_URLS: dict[str, str] = {
     "groq": const.API_BASE_GROQ,
@@ -95,7 +88,7 @@ def _resolve_api_key_for_provider(provider: str, settings: Settings) -> str:
         if key:
             return key
 
-    env_var = _PROVIDER_ENV_VARS.get(provider, "")
+    env_var = const.PROVIDER_ENV_VARS.get(provider, "")
     return os.environ.get(env_var, "") if env_var else ""
 
 
@@ -105,7 +98,7 @@ def _resolve_api_key(settings: Settings) -> str:
     if key:
         return key
 
-    env_var = _PROVIDER_ENV_VARS.get(settings.llm_provider, "")
+    env_var = const.PROVIDER_ENV_VARS.get(settings.llm_provider, "")
     raise RuntimeError(
         f"No API key for {settings.llm_provider}. "
         f"Set TAPEBACK_LLM_API_KEY or {env_var} environment variable."

@@ -10,11 +10,11 @@ from unittest.mock import MagicMock, patch
 import pytest
 from pydantic import SecretStr
 
+from tapeback import const
 from tapeback.cli import cli
 from tapeback.models import Segment
 from tapeback.pipeline import _maybe_diarize_segments, process_stereo_file, stop_and_process
 from tapeback.settings import Settings
-from tapeback.summarizer import _PROVIDER_ENV_VARS
 from tests.fixtures import (
     SAMPLE_TRANSCRIPT_MD,
     VALID_LLM_RESPONSE_MINIMAL,
@@ -414,7 +414,7 @@ def test_summarize_command_rewrites_file(runner, tmp_path, monkeypatch, vault_en
 def test_summarize_command_no_api_key(runner, tmp_path, monkeypatch, vault_env):
     """No API key → error, file unchanged."""
     monkeypatch.delenv("TAPEBACK_LLM_API_KEY", raising=False)
-    for env_var in _PROVIDER_ENV_VARS.values():
+    for env_var in const.PROVIDER_ENV_VARS.values():
         monkeypatch.delenv(env_var, raising=False)
 
     md_file = tmp_path / "transcript.md"

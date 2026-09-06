@@ -317,6 +317,12 @@ def _lemonade_diagnostics(backend) -> None:
     """
     from tapeback._lemonade import LemonadeError
 
+    # The payloads are already redacted at the source: LemonadeBackend._get_json
+    # routes every diagnostic response through _redact_diagnostic with the
+    # configured API key as the secret before returning it, so a server that
+    # reflects the received Authorization value anywhere in the JSON tree cannot
+    # have it echoed here. json.dumps(default=str) additionally escapes control
+    # characters, neutralizing terminal escapes.
     try:
         click.echo(f"Health: {json.dumps(backend.health(), default=str)}")
         click.echo(f"System info: {json.dumps(backend.system_info(), default=str)}")

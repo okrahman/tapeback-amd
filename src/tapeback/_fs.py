@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import os
 import stat
+import uuid
 from pathlib import Path
 
 _PRIVATE_DIR_MODE = 0o700
@@ -104,11 +105,17 @@ def write_private_text(path: Path, text: str) -> None:
       entry or the new one, never a half-written one).
     """
     ensure_private_dir(path.parent)
-    tmp = path.with_name(f".{path.name}.tmp.{os.getpid()}")
+    # A uuid4 fragment on top of the pid: a previous crash can leave
+    # .<name>.tmp.<pid> behind, and pid reuse would then hit the O_EXCL open
+    # failure on a pid-only name — a failure callers (resume cache, run log)
+    # swallow, silently skipping the write. A unique name cannot collide.
+    tmp = path.with_name(f".{path.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}")
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
         os.replace(tmp, path)
     except BaseException:
         tmp.unlink(missing_ok=True)

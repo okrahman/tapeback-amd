@@ -48,6 +48,51 @@ def test_stop_without_start_raises(recorder):
         recorder.stop()
 
 
+def test_stop_refuses_a_planted_session_symlink(recorder, session_file, tmp_path):
+    """stop() must refuse to read session.json through a planted symlink.
+
+    Bug: the read side of session.json followed planted symlinks even though the
+    write side refuses them (os.replace never follows, refuse_symlink_target is
+    called before the write). A symlink followed on read could crash stop() with
+    an unrelated OSError mid-teardown — or worse, read from an attacker-chosen
+    target.
+    """
+    victim = tmp_path / "victim.json"
+    victim.write_text("{}")
+    session_file.unlink(missing_ok=True)
+    session_file.symlink_to(victim)
+
+    with pytest.raises(RuntimeError, match="Refusing"):
+        recorder.stop()
+
+    assert victim.read_text() == "{}"
+
+
+def test_is_recording_refuses_a_planted_session_symlink(recorder, session_file, tmp_path):
+    """is_recording() must refuse a planted session.json symlink, not follow it."""
+    victim = tmp_path / "victim.json"
+    victim.write_text("{}")
+    session_file.unlink(missing_ok=True)
+    session_file.symlink_to(victim)
+
+    with pytest.raises(RuntimeError, match="Refusing"):
+        recorder.is_recording()
+
+    assert victim.read_text() == "{}"
+
+
+def test_is_recording_treats_unreadable_session_file_as_not_recording(recorder, session_file):
+    """An unreadable-but-regular session file is 'not recording', not a crash.
+
+    Same contract as the existing corrupt-JSON handling: is_recording() returns
+    False so a status command stays usable.
+    """
+    session_file.write_text("{}")
+    session_file.chmod(0o000)
+
+    assert recorder.is_recording() is False
+
+
 def test_start_while_recording_raises(recorder, settings, session_file):
     """start() while already recording should raise RuntimeError.
 

@@ -92,3 +92,23 @@ API_BASE_GEMINI = "https://generativelanguage.googleapis.com/v1beta/openai/"
 API_BASE_OPENROUTER = "https://openrouter.ai/api/v1"
 API_BASE_DEEPSEEK = "https://api.deepseek.com"
 API_BASE_QWEN = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
+# API base URLs for LLM providers
+API_BASE_GROQ = "https://api.groq.com/openai/v1"
+API_BASE_GEMINI = "https://generativelanguage.googleapis.com/v1beta/openai/"
+API_BASE_OPENROUTER = "https://openrouter.ai/api/v1"
+API_BASE_DEEPSEEK = "https://api.deepseek.com"
+API_BASE_QWEN = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
+
+# The env var each summarizer provider reads its API key from. Single source of
+# truth: the summarizer resolves keys with it, the test suite isolates the env
+# with it, and the transcription worker's credential deny-list is derived from
+# it — so a new provider is covered everywhere the moment it is added here.
+PROVIDER_ENV_VARS: dict[str, str] = {
+    "anthropic": "ANTHROPIC_API_KEY",
+    "openai": "OPENAI_API_KEY",
+    "groq": "GROQ_API_KEY",
+    "gemini": "GEMINI_API_KEY",
+    "openrouter": "OPENROUTER_API_KEY",
+    "deepseek": "DEEPSEEK_API_KEY",
+    "qwen": "DASHSCOPE_API_KEY",
+}

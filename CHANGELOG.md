@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- **The transcription worker's environment no longer inherits the qwen provider credential.** The spawned worker's credential deny-list was a hand-copied set that contained `QWEN_API_KEY` — a name the production provider mapping never uses — while the qwen summarizer provider actually reads `DASHSCOPE_API_KEY`. A user running the qwen summarizer had their DashScope key present in the transcription child for the whole session, violating the worker's own "must never be in a position to log, dump, or forward them" invariant. The deny-list is now derived from the production mapping (`const.PROVIDER_ENV_VARS`, single source of truth shared with the summarizer and the test-suite env isolation), so a new provider is denied the moment it is added; the transcription-side and cloud credentials (`HF_TOKEN`, `HUGGING_FACE_HUB_TOKEN`, AWS, Azure) remain denied explicitly.
+- **`TAPEBACK_LANGUAGE=""` now behaves identically on both backends.** The faster-whisper backend pinned `language=""` (its `configured != "auto"` check treated the empty string as an explicit language) while the resume-identity normalization and the Lemonade backend both treat `""` as unset — a `""` run could decode pinned on faster-whisper but be stored and served under a `lang=auto` cache identity. `""` is now normalized to unset everywhere; a regression test pins faster-whisper to `language=None`.
+- **Read-side `session.json` access refuses planted symlinks, matching the write side.** `stop()`, `is_recording()`, and `get_session_info()` followed a planted `session.json` symlink on read even though the write path refuses one — worst case an unrelated `OSError` crash in `stop()` mid-teardown. All three reads now go through a helper that reuses `refuse_symlink_target` (tampering surfaces as a loud `RuntimeError`, never followed); `is_recording()` additionally treats an unreadable-but-regular state file as "not recording" so a status command stays usable.
+- **`write_private_text` temp names can no longer collide on a recycled pid.** The temp file was keyed only on the pid (`.name.tmp.<pid>`), so a previous crash leaving that file behind made a later run with the same recycled pid hit the `O_EXCL` open failure — an error the resume-cache and run-log callers swallow, silently skipping a cache entry or run record. The temp name now carries a `uuid4()` fragment and is fsynced before the atomic `os.replace`, so a power loss cannot leave an empty target.
+- **The live note no longer flips language mid-session on mic-only sessions.** The single-channel live path latched the detected language only from the monitor channel, so when the monitor never produced PCM, every mic interval auto-detected independently and the live preview could flip languages between intervals. The detected language is now latched from either channel (a pinned override repeats itself, so pair-session behavior is unchanged); the post-run transcript was never affected.
+
+### Security
+- Terminal echo of `tapeback status` Lemonade health/system-info payloads was audited and is confirmed redacted at the source: `LemonadeBackend._get_json` routes every diagnostic response through `_redact_diagnostic` with the configured API key as the secret before it is returned, so a server reflecting the received `Authorization` value anywhere in the JSON tree cannot have it echoed. Documented at the echo site; no code change required.
+
 ## [0.10.0] — 2026-09-06
 
 ### Added

@@ -19,6 +19,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+from tapeback import const
 from tapeback._worker import (
     EVENT_BACKEND,
     EVENT_ERROR,
@@ -38,24 +39,21 @@ WORKER_SHUTDOWN_TIMEOUT_SEC = 10.0
 # so ambient `TAPEBACK_*` variables could only contradict the job or leak
 # configuration into the child. Provider credentials are denied by name because
 # the worker cannot transcribe with them and must never be in a position to log,
-# dump, or forward them.
-_WORKER_DENIED_ENV_KEYS = frozenset(
-    {
-        "ANTHROPIC_API_KEY",
-        "OPENAI_API_KEY",
-        "GROQ_API_KEY",
-        "GEMINI_API_KEY",
-        "GOOGLE_API_KEY",
-        "OPENROUTER_API_KEY",
-        "DEEPSEEK_API_KEY",
-        "QWEN_API_KEY",
-        "HF_TOKEN",
-        "HUGGING_FACE_HUB_TOKEN",
-        "AWS_ACCESS_KEY_ID",
-        "AWS_SECRET_ACCESS_KEY",
-        "AZURE_OPENAI_API_KEY",
-    }
-)
+# dump, or forward them. The provider names are derived from the production
+# mapping (const.PROVIDER_ENV_VARS) rather than duplicated here — a new provider
+# must be denied the moment it is added, not the next time someone remembers.
+# The remaining names are credentials the worker has no summarizer mapping for
+# (transcription-side and cloud credentials) and are kept denied explicitly.
+_WORKER_DENIED_ENV_KEYS = frozenset(const.PROVIDER_ENV_VARS.values()) | {
+    "HF_TOKEN",
+    "HUGGING_FACE_HUB_TOKEN",
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AZURE_OPENAI_API_KEY",
+    # Alternative names for mapped providers, kept denied defensively.
+    "GOOGLE_API_KEY",
+    "QWEN_API_KEY",
+}
 
 
 def _worker_env() -> dict[str, str]:
