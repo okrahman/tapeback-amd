@@ -282,6 +282,16 @@ class LiveTranscriber(_ChunkTranscriber):
             # lose that audio forever, so commit nothing: segments, cursors and the
             # backend fingerprint all stay as they were, and the next cycle retries
             # the whole interval — including any backend-switch repair it triggers.
+            if is_final:
+                # There is no next cycle after the final pass, so say what happened
+                # instead of dropping the interval silently. Only the live preview's
+                # tail is affected: the post-recording pipeline transcribes the
+                # whole file.
+                self._report_status(
+                    "The final live interval was only partially decoded — its "
+                    "undecoded tail is absent from the live note. The full "
+                    "transcript produced after recording is not affected."
+                )
             return
         if (
             self._active_backend_fingerprint is not None

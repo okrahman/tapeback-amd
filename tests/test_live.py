@@ -132,16 +132,16 @@ def test_find_data_offset_extended_wav(tmp_path):
 
 
 def test_find_data_offset_nonexistent_file(tmp_path):
-    """Non-existent file falls back to 44."""
+    """Non-existent file: no offset yet — callers retry, they do not guess."""
     offset = find_data_offset(tmp_path / "nope.wav")
-    assert offset == 44
+    assert offset is None
 
 
 def test_find_data_offset_not_riff(tmp_path):
-    """Non-RIFF file falls back to 44."""
+    """Non-RIFF file: no offset — the 44-byte guess is the caller's decision now."""
     bad = tmp_path / "bad.wav"
     bad.write_bytes(b"NOT_RIFF_DATA" * 10)
-    assert find_data_offset(bad) == 44
+    assert find_data_offset(bad) is None
 
 
 # --- resample_48k_to_16k ---

@@ -16,37 +16,42 @@ from tapeback.models import Segment, Word
 DEDUP_TOLERANCE_SEC = 0.5
 
 
-def find_data_offset(path: Path) -> int:
-    """Find the byte offset where PCM data starts in a WAV file.
+def find_data_offset(path: Path) -> int | None:
+    """Find the byte offset where PCM data starts in a growing WAV file.
 
     Scans RIFF chunks to locate the 'data' chunk. Returns the byte position
     immediately after the data chunk header (i.e. where raw PCM bytes begin).
 
-    Falls back to the standard 44-byte offset if parsing fails.
+    Returns None when the header cannot be parsed *yet*: parecord flushes its
+    header incrementally, so an early poll can observe a truncated RIFF walk.
+    Callers must treat None as "retry next cycle", never as a permanent answer.
+    The old unconditional 44-byte fallback was latched on first read, which
+    misaligned every later offset and timestamp for the whole session whenever
+    the real data chunk was not at 44.
     """
     try:
         with open(path, "rb") as f:
             riff = f.read(4)
             if riff != b"RIFF":
-                return const.WAV_HEADER_FALLBACK
+                return None
             f.read(4)  # file size (unreliable for growing files)
             wave_id = f.read(4)
             if wave_id != b"WAVE":
-                return const.WAV_HEADER_FALLBACK
+                return None
             # Scan sub-chunks until we find "data"
             while True:
                 chunk_id = f.read(const.WAV_CHUNK_HEADER_BYTES)
                 if len(chunk_id) < const.WAV_CHUNK_HEADER_BYTES:
-                    return const.WAV_HEADER_FALLBACK
+                    return None
                 chunk_size_bytes = f.read(const.WAV_CHUNK_HEADER_BYTES)
                 if len(chunk_size_bytes) < const.WAV_CHUNK_HEADER_BYTES:
-                    return const.WAV_HEADER_FALLBACK
+                    return None
                 if chunk_id == b"data":
                     return f.tell()
                 (chunk_size,) = struct.unpack("<I", chunk_size_bytes)
                 f.seek(chunk_size, 1)
     except OSError:
-        return const.WAV_HEADER_FALLBACK
+        return None
 
 
 def resample_48k_to_16k(pcm_bytes: bytes) -> np.ndarray:

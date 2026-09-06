@@ -30,6 +30,13 @@ if TYPE_CHECKING:
 # A live chunk is raw s16le PCM: two bytes per sample.
 BYTES_PER_SAMPLE = 2
 
+# Give up waiting for a parseable header once the file exceeds this size: a
+# recording this large with a still-unparseable header is a genuinely weird
+# writer, and a live preview at the standard 44-byte offset (announced as an
+# assumption) beats no preview at all. Below this size an unparseable header is
+# treated as "not flushed yet" and retried next cycle.
+HEADER_PARSE_FALLBACK_BYTES = 1 << 20
+
 
 class _ChunkTranscriber:
     """Chunk/interval transcription machinery mixed into `LiveTranscriber`.
@@ -46,6 +53,32 @@ class _ChunkTranscriber:
     _mic_byte_offset: int
     _monitor_byte_offset: int
     _report_status: Callable[[str], None]
+
+    def _resolve_data_offset(self, wav_path: Path, *, is_mic: bool) -> int | None:
+        """The channel's data offset, or None while the header is still unreadable.
+
+        None means "retry next cycle". Only once the file has grown past
+        `HEADER_PARSE_FALLBACK_BYTES` with no parseable header do we assume the
+        standard 44-byte offset — loudly, because it is then a guess about a
+        genuinely unusual writer, not a race with a header that is about to be
+        flushed.
+        """
+        offset = find_data_offset(wav_path)
+        if offset is not None:
+            return offset
+        try:
+            size = wav_path.stat().st_size
+        except OSError:
+            return None
+        if size < HEADER_PARSE_FALLBACK_BYTES:
+            return None
+        channel = "mic" if is_mic else "monitor"
+        self._report_status(
+            f"Live {channel} WAV header is still unparseable at {size} bytes — "
+            f"assuming the standard {const.WAV_HEADER_FALLBACK}-byte PCM offset. "
+            "Live timestamps may drift if the real data chunk is not at that offset."
+        )
+        return const.WAV_HEADER_FALLBACK
 
     def _read_new_pcm(
         self,
@@ -64,15 +97,20 @@ class _ChunkTranscriber:
         if not wav_path.exists():
             return None, byte_offset
 
-        # Parse data offset lazily (once per file)
+        # Parse the data offset lazily — and never latch a guess: a truncated
+        # header on an early poll returns None and is retried next cycle, so a
+        # first-read race with the recorder's header flush cannot misalign every
+        # later offset for the session.
         if is_mic:
             if self._mic_data_offset is None:
-                self._mic_data_offset = find_data_offset(wav_path)
+                self._mic_data_offset = self._resolve_data_offset(wav_path, is_mic=True)
             data_offset = self._mic_data_offset
         else:
             if self._monitor_data_offset is None:
-                self._monitor_data_offset = find_data_offset(wav_path)
+                self._monitor_data_offset = self._resolve_data_offset(wav_path, is_mic=False)
             data_offset = self._monitor_data_offset
+        if data_offset is None:
+            return None, byte_offset
 
         file_size = wav_path.stat().st_size
         available_pcm = file_size - data_offset
@@ -278,12 +316,14 @@ class _ChunkTranscriber:
             return None
         if is_mic:
             if self._mic_data_offset is None:
-                self._mic_data_offset = find_data_offset(wav_path)
+                self._mic_data_offset = self._resolve_data_offset(wav_path, is_mic=True)
             data_offset = self._mic_data_offset
         else:
             if self._monitor_data_offset is None:
-                self._monitor_data_offset = find_data_offset(wav_path)
+                self._monitor_data_offset = self._resolve_data_offset(wav_path, is_mic=False)
             data_offset = self._monitor_data_offset
+        if data_offset is None:
+            return None
         with open(wav_path, "rb") as f:
             f.seek(data_offset + start_byte)
             pcm_bytes = f.read(length_bytes)
