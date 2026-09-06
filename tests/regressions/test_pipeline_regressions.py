@@ -1,12 +1,14 @@
 """Regression tests for pipeline bugs."""
 
 import shutil
-from unittest.mock import patch
+import tempfile
+from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 import pytest
 from pydantic import SecretStr
 
-from tapeback.pipeline import process_mono_file, process_stereo_file
+from tapeback.pipeline import process_file, process_mono_file, process_stereo_file, stop_and_process
 from tapeback.settings import Settings
 from tests.fixtures import (
     create_mono_wav,
@@ -41,6 +43,66 @@ def test_process_stereo_no_diarize_returns_no_raw_segments(tmp_path):
         )
 
     assert raw_segments is None
+
+
+def test_process_file_cleans_up_temp_dir_on_exception(tmp_path):
+    """process_file must clean up temp directory even if processing fails."""
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    settings = Settings(vault_path=vault)
+
+    audio = tmp_path / "test.wav"
+    create_mono_wav(audio, duration=1.0, sample_rate=48000, amplitude=0.5)
+
+    created_dirs: list[Path] = []
+    original_mkdtemp = tempfile.mkdtemp
+
+    def fake_mkdtemp(prefix="tapeback_"):
+        res = Path(original_mkdtemp(prefix=prefix))
+        created_dirs.append(res)
+        return str(res)
+
+    with (
+        patch("tempfile.mkdtemp", side_effect=fake_mkdtemp),
+        patch(
+            "tapeback.pipeline.process_mono_file",
+            side_effect=RuntimeError("Pipeline processing error"),
+        ),
+        pytest.raises(RuntimeError, match="Pipeline processing error"),
+    ):
+        process_file(audio, settings, diarize=False)
+
+    assert len(created_dirs) == 1
+    assert not created_dirs[0].exists()
+
+
+@pytest.mark.skipif(not shutil.which("ffmpeg"), reason="ffmpeg required")
+def test_stop_and_process_cleans_up_session_dir_on_exception(tmp_path):
+    """stop_and_process must clean up session directory even if processing fails."""
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    settings = Settings(vault_path=vault)
+
+    session_dir = tmp_path / "session_123"
+    session_dir.mkdir()
+    monitor_wav = session_dir / "monitor.wav"
+    mic_wav = session_dir / "mic.wav"
+    create_mono_wav(monitor_wav, duration=1.0)
+    create_mono_wav(mic_wav, duration=1.0)
+
+    mock_recorder = MagicMock()
+    mock_recorder.stop.return_value = (monitor_wav, mic_wav)
+
+    with (
+        patch(
+            "tapeback.pipeline.process_stereo_file",
+            side_effect=RuntimeError("Pipeline processing error"),
+        ),
+        pytest.raises(RuntimeError, match="Pipeline processing error"),
+    ):
+        stop_and_process(mock_recorder, settings, diarize=False)
+
+    assert not session_dir.exists()
 
 
 @pytest.mark.skipif(not shutil.which("ffmpeg"), reason="ffmpeg required")

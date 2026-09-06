@@ -120,6 +120,8 @@ def merge_similar_speakers(
         for sp in speakers
     }
 
+    norms: dict[str, float] = {sp: float(np.linalg.norm(profiles[sp])) for sp in speakers}
+
     merge_map: dict[str, str] = {s: s for s in speakers}
 
     for i, sp_a in enumerate(speakers):
@@ -127,8 +129,8 @@ def merge_similar_speakers(
             if merge_map[sp_a] == merge_map[sp_b]:
                 continue
 
-            norm_a = float(np.linalg.norm(profiles[sp_a]))
-            norm_b = float(np.linalg.norm(profiles[sp_b]))
+            norm_a = norms[sp_a]
+            norm_b = norms[sp_b]
             if norm_a < const.CHANNEL_EPSILON or norm_b < const.CHANNEL_EPSILON:
                 continue
 
