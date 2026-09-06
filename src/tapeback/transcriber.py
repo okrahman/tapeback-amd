@@ -146,7 +146,17 @@ class Transcriber(_StereoTranscriber):
                 audio_path, stage, on_status, language_override, exc, use_resume=use_resume
             )
 
-        self._store_resume(key, segments, info)
+        if key is not None:
+            # Recompute the identity at commit time. A device/compute fallback that
+            # landed inside transcribe() — `_record_resolved_identity` on the isolated
+            # path, `_fallback_to_cpu` in-process — changes the resolved identity after
+            # this key was frozen; storing under the stale key would cache a CPU/int8
+            # result under a CUDA identity. The lookup key above stays as computed:
+            # it is the best-known identity before the work, not after.
+            commit_key = self._resume_key(
+                audio_path, stage, self._backend.cache_fingerprint(), language_token
+            )
+            self._store_resume(commit_key, segments, info)
         return segments, info
 
     def _effective_language(self, language_override: str | None) -> str:
@@ -213,5 +223,15 @@ class Transcriber(_StereoTranscriber):
             on_status=on_status,
             language_override=language_override,
         )
-        self._store_resume(key, segments, info)
+        if key is not None:
+            # Recompute at commit time: the isolated child or the in-process ladder
+            # may have resolved a different device during this very call (see
+            # transcribe()); the frozen pre-call key would then be a lie.
+            commit_key = self._resume_key(
+                audio_path,
+                stage,
+                fw.cache_fingerprint(),
+                self._effective_language(language_override),
+            )
+            self._store_resume(commit_key, segments, info)
         return segments, info

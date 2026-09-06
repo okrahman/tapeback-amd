@@ -184,7 +184,11 @@ class _StereoTranscriber:
             if monitor_active
             else self._empty_channel_result(monitor_16k)
         )
-        staged: list[tuple[_resume.ResumeKey | None, list[Segment], TranscriptionInfo]] = []
+        # Staged entries carry what the commit loop needs to RECOMPUTE the resume
+        # key at commit time (see the loop below): a fallback landing inside either
+        # channel's transcribe() changes the resolved identity, and the key frozen
+        # before the call must never become the stored identity.
+        staged: list[tuple[Path, str, str, list[Segment], TranscriptionInfo]] = []
 
         if monitor_result is None:
             try:
@@ -213,7 +217,19 @@ class _StereoTranscriber:
                     use_resume=use_resume,
                 )
             else:
-                staged.append((monitor_key, *monitor_result))
+                staged.append(
+                    (
+                        monitor_16k,
+                        "transcribe monitor",
+                        self._effective_language(None),
+                        *monitor_result,
+                    )
+                )
+
+        # Refresh the identity after the monitor stage: a device/compute fallback
+        # that landed during monitor transcription changes what the backend resolves
+        # to now, and the mic key below must not reuse the pre-stage fingerprint.
+        fingerprint = self._backend.cache_fingerprint()
 
         mic_partial = False
         mic_result: tuple[list[Segment], TranscriptionInfo] | None = None
@@ -267,16 +283,29 @@ class _StereoTranscriber:
                         use_resume=use_resume,
                     )
                 else:
-                    staged.append((mic_key, *mic_result))
+                    staged.append(
+                        (
+                            mic_16k,
+                            "transcribe mic",
+                            self._effective_language(mic_language),
+                            *mic_result,
+                        )
+                    )
 
         mic_segments, monitor_segments, info = self._assemble_stereo(
             mic_result, monitor_result, mic_partial
         )
 
         # Per-channel commit: a complete same-backend channel is cached even when its
-        # sibling was interrupted. Inactive channels never enter staged.
-        for key, segs, channel_info in staged:
-            self._store_resume(key, segs, channel_info)
+        # sibling was interrupted. Inactive channels never enter staged. The key is
+        # RECOMPUTED at commit time so a fallback inside either transcribe() is
+        # reflected in the stored identity — a CPU/int8 result must never be cached
+        # under a CUDA identity.
+        for audio, stage_name, lang_token, segs, channel_info in staged:
+            commit_key = self._resume_key(
+                audio, stage_name, self._backend.cache_fingerprint(), lang_token
+            )
+            self._store_resume(commit_key, segs, channel_info)
         return mic_segments, monitor_segments, info
 
     def _fallback_stereo(
@@ -314,7 +343,7 @@ class _StereoTranscriber:
             if use_resume
             else None
         )
-        staged: list[tuple[_resume.ResumeKey | None, list[Segment], TranscriptionInfo]] = []
+        staged: list[tuple[Path, str, str, list[Segment], TranscriptionInfo]] = []
 
         monitor_result = self._load_resume(monitor_key, "transcribe monitor", on_status)
         if monitor_result is None:
@@ -322,7 +351,14 @@ class _StereoTranscriber:
                 monitor_result = fw.transcribe(
                     monitor_16k, stage="transcribe monitor", on_status=on_status
                 )
-            staged.append((monitor_key, *monitor_result))
+            staged.append(
+                (
+                    monitor_16k,
+                    "transcribe monitor",
+                    self._effective_language(None),
+                    *monitor_result,
+                )
+            )
 
         mic_partial = False
         mic_result: tuple[list[Segment], TranscriptionInfo] | None = None
@@ -331,6 +367,10 @@ class _StereoTranscriber:
             # monitor was interrupted inside this interval.
             on_status("Skipping the mic channel — transcription was interrupted.")
             mic_partial = True
+        # Refresh the identity after the monitor stage (see transcribe_stereo): the
+        # isolated child may have resolved a different device during monitor work,
+        # and the mic key must not reuse the pre-stage fingerprint.
+        fw_fingerprint = fw.cache_fingerprint()
         if mic_result is None and not mic_partial:
             detected = monitor_result[1].get("language")
             mic_language = str(detected) if detected else None
@@ -354,15 +394,26 @@ class _StereoTranscriber:
                         on_status=on_status,
                         language_override=mic_language,
                     )
-                staged.append((mic_key, *mic_result))
+                staged.append(
+                    (
+                        mic_16k,
+                        "transcribe mic",
+                        self._effective_language(mic_language),
+                        *mic_result,
+                    )
+                )
 
         mic_segments, monitor_segments, info = self._assemble_stereo(
             mic_result, monitor_result, mic_partial
         )
         # Per-channel commit — same rule as transcribe_stereo: partial output is never
-        # cached, but a complete same-backend sibling is.
-        for key, segs, channel_info in staged:
-            self._store_resume(key, segs, channel_info)
+        # cached, but a complete same-backend sibling is. Keys are RECOMPUTED at commit
+        # time (see transcribe_stereo) so a late device resolution is reflected.
+        for audio, stage_name, lang_token, segs, channel_info in staged:
+            commit_key = self._resume_key(
+                audio, stage_name, self._backend.cache_fingerprint(), lang_token
+            )
+            self._store_resume(commit_key, segs, channel_info)
         return mic_segments, monitor_segments, info
 
     def _assemble_stereo(
