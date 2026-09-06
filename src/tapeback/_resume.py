@@ -78,13 +78,22 @@ def settings_fingerprint(settings: Settings) -> str:
 
     Kept beside the resume store so its meaning stays obvious: this is exactly the
     set of settings that change what faster-whisper produces, and a cached channel
-    is only reusable when every one of them matches. Adding a knob that affects
-    faster-whisper output means adding it here.
+    is only reusable when every one of them matches. That includes the settings
+    that decide *where* the requested device/compute type actually executes —
+    `min_free_vram_mib` and the thermal-clamp controls participate in device
+    resolution in `_fw_backend._resolve_device`, so a threshold- or clamp-only
+    change must invalidate the cache too. Adding a knob that affects
+    faster-whisper output (directly or through device resolution) means adding
+    it here.
     """
     output_affecting_settings = (
         "whisper_model",
         "device",
         "compute_type",
+        "min_free_vram_mib",
+        "thermal_clamp_check",
+        "thermal_clamp_wait",
+        "thermal_clamp_cpu_fallback",
         "language",
         "beam_size",
         "temperature",

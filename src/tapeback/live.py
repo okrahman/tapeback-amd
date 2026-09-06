@@ -112,7 +112,18 @@ def adjust_timestamps(segments: list[Segment], offset_seconds: float) -> list[Se
 
 
 def _same_utterance(left: Segment, right: Segment) -> bool:
-    """Whether overlap candidates say the same thing, allowing token prefixes or suffixes."""
+    """Whether overlap candidates say the same thing, allowing token prefixes or suffixes.
+
+    Containment is only trusted as evidence of the same utterance when it is
+    stronger than arbitrary suffix containment. Chunk overlap truncation — the
+    case this exists for — leaves the shorter side a substantial fraction of the
+    longer one, keeping its start (the earlier chunk cut the tail) or its end
+    (the later chunk adds leading context). A one-token fragment therefore only
+    matches as a PREFIX: a quick one-word reply ("you") that merely echoes the
+    last word of a previous sentence is a distinct utterance, not a truncated
+    copy of it — and in the inverse ordering a long distinct sentence must not
+    replace a short segment just because it happens to end with the same word.
+    """
     left_tokens = _utterance_tokens(left.text)
     right_tokens = _utterance_tokens(right.text)
     if not left_tokens or not right_tokens:
@@ -122,6 +133,10 @@ def _same_utterance(left: Segment, right: Segment) -> bool:
         if len(left_tokens) <= len(right_tokens)
         else (right_tokens, left_tokens)
     )
+    if len(short) == 1:
+        return long[:1] == short
+    if len(short) * 2 < len(long):
+        return False
     return long[: len(short)] == short or long[-len(short) :] == short
 
 
@@ -152,13 +167,22 @@ def deduplicate_overlap(
             kept.append(seg)
             continue
 
-        # Check if this segment duplicates an existing one of the same speaker
+        # Check if this segment duplicates an existing one of the same speaker.
+        # Besides the start-time tolerance, the candidate's time span must
+        # actually overlap the existing segment's: a distinct quick reply that
+        # starts right AFTER a finished sentence is new speech, not the same
+        # utterance re-decoded in the overlap window.
         best_match_idx: int | None = None
         best_diff = DEDUP_TOLERANCE_SEC
         for i, es in enumerate(existing):
             if es.speaker == seg.speaker:
                 diff = abs(seg.start - es.start)
-                if diff < best_diff and _same_utterance(es, seg):
+                if (
+                    diff < best_diff
+                    and seg.start < es.end
+                    and seg.end > es.start
+                    and _same_utterance(es, seg)
+                ):
                     best_diff = diff
                     best_match_idx = i
 
@@ -271,6 +295,17 @@ class LiveTranscriber:
             # same way once, when the backend is actually loaded.
             print(f"Live transcription backend: {self._transcriber.describe()}", file=sys.stderr)
         return self._transcriber
+
+    def _report_status(self, message: str) -> None:
+        """Status sink passed to every facade call the worker makes.
+
+        The facade reports backend transitions through it — above all the
+        fallback notice ("Lemonade transcription failed ... falling back to
+        faster-whisper"). Without a real sink those notices go to the default
+        no-op and a mid-session backend change happens in silence, exactly when
+        performance, resource use, and privacy expectations change.
+        """
+        print(message, file=sys.stderr)
 
     def _transcription_loop(self) -> None:
         """Main loop: wait for interval, then process a chunk."""
@@ -412,6 +447,14 @@ class LiveTranscriber:
             # from offset 0 with the new backend so the transcript is never mixed.
             # Committed audio, not emitted segments, is the state boundary: a prior
             # decoder may have returned silence for audio the fallback can recognize.
+            # Re-announce the backend first: the disclosure printed at startup
+            # described the backend that just failed, and the user must see the
+            # transition (which model, which device, audio local or not) before
+            # the re-transcription runs on it.
+            print(
+                f"Live transcription backend switched: {transcriber.describe()}",
+                file=sys.stderr,
+            )
             updated_segments = self._retranscribe_full(
                 transcriber, mic_new_offset, monitor_new_offset
             )
@@ -517,6 +560,7 @@ class LiveTranscriber:
                 chunk_path,
                 language_override=language_override,
                 use_resume=False,
+                on_status=self._report_status,
             )
             if not is_mic and _info.get("language"):
                 self._last_detected_language = str(_info["language"])
@@ -584,6 +628,7 @@ class LiveTranscriber:
                 skip_mic_on_monitor_partial=False,
                 mic_active=mic_active,
                 monitor_active=monitor_active,
+                on_status=self._report_status,
             )
             if _info.get("language"):
                 self._last_detected_language = str(_info["language"])
@@ -694,6 +739,7 @@ class LiveTranscriber:
                 skip_mic_on_monitor_partial=False,
                 mic_active=mic_active,
                 monitor_active=monitor_active,
+                on_status=self._report_status,
             )
         finally:
             if mic_active:
@@ -738,7 +784,9 @@ class LiveTranscriber:
         chunk_path = self._mic_path.parent / f"chunk_{suffix}.wav"
         self._write_chunk_wav(samples_16k, chunk_path)
         try:
-            segments, _info = transcriber.transcribe(chunk_path, use_resume=False)
+            segments, _info = transcriber.transcribe(
+                chunk_path, use_resume=False, on_status=self._report_status
+            )
         finally:
             chunk_path.unlink(missing_ok=True)
         speaker = const.SPEAKER_YOU if is_mic else const.SPEAKER_OTHER

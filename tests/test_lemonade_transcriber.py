@@ -23,7 +23,7 @@ from tapeback._lemonade import (
 from tapeback.models import Segment
 from tapeback.pipeline import _gpu_telemetry_enabled
 from tapeback.settings import Settings
-from tapeback.transcriber import Transcriber
+from tapeback.transcriber import Transcriber, _LatchedFallbackBackend
 
 # --- helpers ---
 
@@ -719,3 +719,61 @@ def test_fallback_latch_is_installed_before_local_backend_construction(tmp_path,
     # Exactly 1 Lemonade call was ever made; the retry tried FW, never Lemonade.
     assert len(lemonade_calls) == 1
     assert fw_attempts == 2
+
+
+def test_recovered_fallback_result_is_never_cached_under_fallback_latched(tmp_path, monkeypatch):
+    """After a failed fallback construction, recovery must not use the placeholder identity.
+
+    Regression: with the _LatchedFallbackBackend placeholder still installed, the
+    outer call keyed the resume entry on its constant "fallback-latched"
+    fingerprint — which ignores model/device/compute settings — and stored the
+    recovered faster-whisper result under it, so later failed-fallback sessions
+    could reuse output produced under incompatible settings.
+    """
+    wav = tmp_path / "test.wav"
+    write_wav(wav, 0.5)
+    settings = lemon_settings(tmp_path)
+
+    transcriber = Transcriber.__new__(Transcriber)
+    transcriber._settings = settings
+    lemonade = MagicMock()
+    lemonade.cache_fingerprint.return_value = "lemonade-fp"
+    lemonade.transcribe.side_effect = LemonadeModelError("server down")
+    transcriber._backend = lemonade
+
+    fw = MagicMock()
+    fw.cache_fingerprint.return_value = "fw-fingerprint"
+    fw.transcribe.return_value = fw_result(["recovered"])
+
+    constructions = iter([RuntimeError("transient model load failure"), fw])
+
+    def flaky_new_fw(self):
+        effect = next(constructions)
+        if isinstance(effect, BaseException):
+            raise effect
+        return effect
+
+    monkeypatch.setattr(Transcriber, "_new_fw_backend", flaky_new_fw)
+
+    # First call: Lemonade fails AND faster-whisper construction fails transiently;
+    # the placeholder stays installed and nothing may be cached.
+    with pytest.raises(RuntimeError, match="transient model load failure"):
+        transcriber.transcribe(wav)
+
+    assert isinstance(transcriber._backend, _LatchedFallbackBackend)
+    assert list((tmp_path / "resume").glob("*.json")) == []
+
+    # Second call: construction succeeds. The recovered result must be stored
+    # under the REAL faster-whisper fingerprint, never "fallback-latched".
+    segments, _info = transcriber.transcribe(wav)
+    assert [s.text for s in segments] == ["recovered"]
+    assert fw.transcribe.call_count == 1
+
+    probe = Transcriber.__new__(Transcriber)
+    probe._settings = settings
+    placeholder_key = probe._resume_key(wav, "transcribe", "fallback-latched")
+    fw_key = probe._resume_key(wav, "transcribe", "fw-fingerprint")
+    assert placeholder_key is not None and fw_key is not None
+    resume_dir = tmp_path / "resume"
+    assert _resume.load(placeholder_key, resume_dir) is None
+    assert _resume.load(fw_key, resume_dir) is not None

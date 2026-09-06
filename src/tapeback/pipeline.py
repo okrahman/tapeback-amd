@@ -89,14 +89,19 @@ def stop_and_process(
     Returns path to the saved markdown file.
     """
     on_status("Stopping recording...")
-    monitor_path, mic_path = recorder.stop()
-
-    if live_transcriber is not None:
-        on_status("Stopping live transcription...")
-        try:
-            live_transcriber.stop(on_status)
-        except Exception as exc:
-            on_status(f"Warning: Live transcription stopped with error: {exc}")
+    # Live-worker teardown happens in finally: whatever recorder.stop() does —
+    # including raising on a session another process already stopped — the live
+    # worker must be shut down and awaited before this function exits, or its
+    # subprocess outlives the run and final live chunks are lost.
+    try:
+        monitor_path, mic_path = recorder.stop()
+    finally:
+        if live_transcriber is not None:
+            on_status("Stopping live transcription...")
+            try:
+                live_transcriber.stop(on_status)
+            except Exception as exc:
+                on_status(f"Warning: Live transcription stopped with error: {exc}")
 
     session_name = monitor_path.parent.name
 

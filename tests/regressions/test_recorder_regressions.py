@@ -3,10 +3,12 @@
 import json
 import os
 import stat
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
+import tapeback.pipeline as pipeline_mod
 import tapeback.recorder as recorder_mod
 from tapeback.recorder import detect_devices
 from tests.fixtures import create_session_file
@@ -165,3 +167,89 @@ def test_start_replaces_attacker_readable_recording_file(recorder, settings, tmp
     assert new_stat.st_ino != old_inode
     assert stat.S_IMODE(new_stat.st_mode) == 0o600
     assert mic_path.read_bytes() == b""
+
+
+def test_stop_is_idempotent_when_another_process_stopped_the_session(
+    recorder, settings, tmp_path, monkeypatch
+):
+    """'tapeback stop' deletes session.json in a second process; the original
+    'tapeback start' process wakes and stops its own Recorder — it must get the
+    recorded paths back.
+
+    Bug: stop() raised "No recording in progress." there, which aborted
+    live-worker teardown and final processing for a completely normal stop flow.
+    """
+    monkeypatch.setattr(recorder_mod.const, "TEMP_DIR", str(tmp_path / "tapeback"))
+    _patch_parecord(monkeypatch, tmp_path)
+
+    recorder.start(settings, session_name="two_process_session")
+    session_path = recorder.session_file
+    assert session_path.exists()
+    session = json.loads(session_path.read_text())
+    monitor_path = Path(session["monitor_path"])
+    mic_path = Path(session["mic_path"])
+    assert monitor_path.exists() and mic_path.exists()
+
+    session_path.unlink()  # the other process stopped the session
+
+    assert recorder.stop() == (monitor_path, mic_path)
+
+
+def test_stop_and_process_stops_live_worker_even_when_recorder_stop_raises(
+    settings, monkeypatch
+):
+    """Live-worker teardown must run in finally, whatever recorder.stop() does.
+
+    Bug: recorder.stop() was called before live teardown without try/finally, so
+    a stop() exception skipped live_transcriber.stop() entirely and the worker
+    was terminated abruptly with its final chunks lost.
+    """
+    recorder = MagicMock()
+    recorder.stop.side_effect = RuntimeError("No recording in progress.")
+    live_transcriber = MagicMock()
+
+    with pytest.raises(RuntimeError, match="No recording in progress"):
+        pipeline_mod.stop_and_process(
+            recorder,
+            settings,
+            live_transcriber=live_transcriber,
+            do_summarize=False,
+        )
+
+    live_transcriber.stop.assert_called_once()
+
+
+def test_two_process_start_stop_lifecycle_still_produces_the_note(
+    recorder, settings, tmp_path, monkeypatch
+):
+    """The documented two-process flow: 'tapeback stop' removes the active
+    session while the original 'tapeback start' process wakes in
+    stop_and_process(). The live worker must still be stopped and the final
+    note/transcript produced.
+    """
+    monkeypatch.setattr(recorder_mod.const, "TEMP_DIR", str(tmp_path / "tapeback"))
+    _patch_parecord(monkeypatch, tmp_path)
+
+    recorder.start(settings, session_name="lifecycle_session")
+    live_transcriber = MagicMock()
+    session_path = recorder.session_file
+    session_path.unlink()  # 'tapeback stop' ran in another process
+
+    monkeypatch.setattr(pipeline_mod, "merge_channels", lambda m, mi, out: out / "stereo.wav")
+    monkeypatch.setattr(pipeline_mod, "save_audio_to_vault", lambda p, s, n: tmp_path / f"{n}.wav")
+    monkeypatch.setattr(
+        pipeline_mod,
+        "process_stereo_file",
+        lambda p, out, s, diarize, on_status: ([], {"duration": 1.0}, []),
+    )
+
+    md_path = pipeline_mod.stop_and_process(
+        recorder,
+        settings,
+        live_transcriber=live_transcriber,
+        diarize=False,
+        do_summarize=False,
+    )
+
+    assert md_path.exists()
+    live_transcriber.stop.assert_called_once()

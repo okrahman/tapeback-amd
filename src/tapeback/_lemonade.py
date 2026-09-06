@@ -481,16 +481,17 @@ def _has_phrase(tokens: list[str], phrase: str) -> bool:
 def _is_auth_failure(status: int, structured_tokens: list[str], message_tokens: list[str]) -> bool:
     """Whether the response means "credentials", decided in trust order.
 
-    The status and the structured type/code fields decide first; a model mention
-    in the body outranks incidental auth wording in the free-text message, so
-    "permission denied loading model" stays a model failure that falls back.
+    The status and the structured type/code fields decide first. The narrow
+    message auth phrases are matched BEFORE the generic model override, so
+    "invalid API key for model Whisper" is a credential failure that aborts the
+    run, not a model failure that silently falls back. Only model messages that
+    carry no narrow auth phrase — "permission denied loading model", "model
+    author not found" — stay model failures that fall back.
     """
     if status in (_HTTP_UNAUTHORIZED, _HTTP_FORBIDDEN):
         return True
     if any(_has_phrase(structured_tokens, phrase) for phrase in _STRUCTURED_AUTH_PHRASES):
         return True
-    if "model" in structured_tokens or "model" in message_tokens:
-        return False
     return any(_has_phrase(message_tokens, phrase) for phrase in _MESSAGE_AUTH_PHRASES)
 
 
@@ -508,11 +509,14 @@ def classify_http_failure(  # noqa: PLR0911 — a deliberate flat decision ladde
     2. The structured ``type``/``code`` fields (machine-authored, read broadly,
        token-aware) for auth phrases — a proxy can answer 404 to an auth problem
        and a server can put an auth code in a 400.
-    3. Model semantics: a token-wise "model" mention. This comes before any
-       free-text auth matching, so "permission denied loading model" or
-       "model author not found" on a 500 is a model failure that falls back,
-       not a credential failure that aborts the run.
-    4. A narrow, token-aware auth phrase list against the free-text message.
+    3. A narrow, token-aware auth phrase list against the free-text message —
+       matched BEFORE the model semantics, so "invalid API key for model
+       Whisper" is a credential failure that aborts, not a model failure that
+       falls back.
+    4. Model semantics: a token-wise "model" mention with no narrow auth
+       phrase. "permission denied loading model" or "model author not found"
+       on a 500 is therefore a model failure that falls back, not a credential
+       failure that aborts the run.
     5. Status semantics: 408 and 429/5xx are remote availability failures (the
        408 check comes after auth and model matching so phrasing still wins), a
        bare 404 is a missing endpoint, other 4xx are locally invalid requests.

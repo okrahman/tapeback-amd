@@ -539,6 +539,33 @@ def test_400_client_invalid_request_is_a_configuration_error():
     assert isinstance(err, LemonadeConfigurationError)
 
 
+def test_auth_message_mentioning_model_is_an_auth_error():
+    """A credential message that also mentions "model" must never fall back.
+
+    Regression: _is_auth_failure returned false on the generic "model" token
+    before consulting the narrow message auth phrases, so HTTP 400/408/500 with
+    {"error": {"message": "invalid API key for model Whisper"}} classified as
+    LemonadeModelError — fallback-eligible — and a credential/configuration
+    failure silently fell back to faster-whisper.
+    """
+    body = {"error": {"message": "invalid API key for model Whisper"}}
+    for status in (400, 408, 500):
+        err = classify_http_failure(status, body)
+        assert isinstance(err, LemonadeAuthenticationError)
+
+
+def test_model_messages_without_auth_phrases_still_fall_back():
+    """The historical false positives stay model failures that fall back.
+
+    The narrow message auth phrases were moved BEFORE the model override; these
+    messages carry no narrow auth phrase, so they must still classify as model
+    errors.
+    """
+    for message in ("permission denied loading model", "model author not found"):
+        err = classify_http_failure(500, {"error": {"message": message}})
+        assert isinstance(err, LemonadeModelError)
+
+
 @pytest.mark.parametrize("status", [401, 403])
 def test_auth_statuses_never_fall_back(status):
     err = classify_http_failure(status, {"detail": "unauthorized"})

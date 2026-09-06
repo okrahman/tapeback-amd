@@ -35,6 +35,7 @@ result, and partial output is never cached.
 
 from __future__ import annotations
 
+import math
 import wave
 from collections.abc import Callable
 from pathlib import Path
@@ -61,9 +62,12 @@ class _LatchedFallbackBackend:
     Ensures Lemonade is never called again even if faster-whisper construction fails.
     """
 
-    def __init__(self, cause: LemonadeFallbackError, transcriber: Transcriber) -> None:
+    def __init__(
+        self, cause: LemonadeFallbackError, transcriber: Transcriber, *, use_resume: bool = True
+    ) -> None:
         self._cause = cause
         self._transcriber = transcriber
+        self._use_resume = use_resume
 
     def describe(self) -> str:
         return f"fallback-latched (cause: {self._cause})"
@@ -81,11 +85,17 @@ class _LatchedFallbackBackend:
     ) -> tuple[list[Segment], TranscriptionInfo]:
         fw = self._transcriber._new_fw_backend()
         self._transcriber._backend = fw
-        return fw.transcribe(
+        # Delegate through the facade now that the real backend is in place: the
+        # resume identity for this result must come from faster-whisper's own
+        # fingerprint, never from this placeholder's constant — output cached
+        # under "fallback-latched" would ignore model/device/compute settings
+        # entirely and be served to later incompatible sessions.
+        return self._transcriber.transcribe(
             audio_path,
             stage=stage,
             on_status=on_status,
             language_override=language_override,
+            use_resume=self._use_resume,
         )
 
 
@@ -138,17 +148,25 @@ class Transcriber:
         Lemonade result is never served to or stored for a faster-whisper run (or
         the other way round), and a transcript produced under one effective
         language is never reused for a run that pins another. On a
-        fallback-eligible Lemonade failure the whole input is retried through
+        the fallback-eligible Lemonade failure the whole input is retried through
         faster-whisper — and the facade latches to faster-whisper for the
         lifetime of this Transcriber — with only the accepted faster-whisper
         result cached. `use_resume=False` disables resume IO entirely; live mode
         uses it for ephemeral chunk WAVs that are deleted before any cache entry
         could ever be reused.
         """
+        # A latched placeholder must never be a resume identity: its constant
+        # fingerprint ignores model/device/compute settings, so a result stored
+        # under it would leak across incompatible sessions. Bypass resume IO
+        # while it is installed; the placeholder's transcribe() resolves the real
+        # backend and re-dispatches through this method under the real identity.
+        latched = isinstance(self._backend, _LatchedFallbackBackend)
         fingerprint = self._backend.cache_fingerprint()
         language_token = self._effective_language(language_override)
         key = (
-            self._resume_key(audio_path, stage, fingerprint, language_token) if use_resume else None
+            self._resume_key(audio_path, stage, fingerprint, language_token)
+            if use_resume and not latched
+            else None
         )
         cached = self._load_resume(key, stage, on_status)
         if cached is not None:
@@ -205,10 +223,13 @@ class Transcriber:
         fingerprint and the effective language, so an outage that keeps forcing
         fallback never redoes a channel an earlier fallback already cached. Only the
         result this run actually accepts is stored, under that same identity — unless
-        the caller opted out of resume IO.
+        the caller opted out of resume IO. While the latched-fallback placeholder is
+        still installed (faster-whisper construction itself failed), resume IO is
+        bypassed entirely: the placeholder's constant fingerprint is not an identity
+        any result may be read from or stored under.
         """
         on_status(f"Lemonade transcription failed ({exc}) — falling back to faster-whisper.")
-        self._backend = _LatchedFallbackBackend(exc, self)
+        self._backend = _LatchedFallbackBackend(exc, self, use_resume=use_resume)
         fw = self._new_fw_backend()
         self._backend = fw
         key = (
@@ -283,11 +304,15 @@ class Transcriber:
             on_status("Skipping mic transcription — channel is digitally silent.")
 
         fingerprint = self._backend.cache_fingerprint()
+        # Same rule as transcribe(): while the latched-fallback placeholder is
+        # installed, its constant fingerprint is not a resume identity — bypass
+        # resume IO instead of reading or storing entries under it.
+        latched = isinstance(self._backend, _LatchedFallbackBackend)
         monitor_key = (
             self._resume_key(
                 monitor_16k, "transcribe monitor", fingerprint, self._effective_language(None)
             )
-            if use_resume and monitor_active
+            if use_resume and monitor_active and not latched
             else None
         )
 
@@ -347,7 +372,7 @@ class Transcriber:
                 self._resume_key(
                     mic_16k, "transcribe mic", fingerprint, self._effective_language(mic_language)
                 )
-                if use_resume and mic_active
+                if use_resume and mic_active and not latched
                 else None
             )
             mic_result = self._load_resume(mic_key, "transcribe mic", on_status)
@@ -417,7 +442,7 @@ class Transcriber:
             f"Lemonade transcription failed ({exc}) — falling back to faster-whisper "
             "for both channels."
         )
-        self._backend = _LatchedFallbackBackend(exc, self)
+        self._backend = _LatchedFallbackBackend(exc, self, use_resume=use_resume)
         fw = self._new_fw_backend()
         self._backend = fw
         fw_fingerprint = fw.cache_fingerprint()
@@ -511,13 +536,17 @@ class Transcriber:
         info = dict(
             mic_info if (mic_result is not None and mic_speech > monitor_speech) else monitor_info
         )
-        if "duration" not in info:
-            dur = max(
-                float(monitor_info.get("duration", 0.0)),
-                float(mic_info.get("duration", 0.0)),
-            )
-            if dur > 0.0:
-                info["duration"] = dur
+        # The combined stereo source lasts as long as the LONGER channel. The
+        # metadata may come from either channel, and the one with more speech can
+        # have the shorter recording, so the maximum finite duration always wins
+        # over whichever value the selected info dict happened to carry.
+        durations = [
+            float(d)
+            for d in (mic_info.get("duration"), monitor_info.get("duration"))
+            if isinstance(d, (int, float)) and math.isfinite(float(d)) and float(d) > 0.0
+        ]
+        if durations:
+            info["duration"] = max(durations)
         # Partiality belongs to the run, not to whichever channel happened to be
         # picked for its language — a transcript missing one channel is partial.
         info["partial"] = bool(

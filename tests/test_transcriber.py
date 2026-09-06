@@ -9,6 +9,7 @@ import pytest
 from huggingface_hub.errors import LocalEntryNotFoundError
 
 from tapeback._fw_backend import FasterWhisperBackend, _resolve_compute_type
+from tapeback.models import Segment
 from tapeback.transcriber import Transcriber
 
 
@@ -434,3 +435,51 @@ def test_assemble_stereo_preserves_monitor_metadata_on_silence(settings):
     assert info_skipped["language"] == "fr"
     assert info_skipped["duration"] == 10.0
     assert info_skipped["partial"] is True
+
+
+def test_assemble_stereo_duration_is_the_longer_channel(tmp_vault):
+    """The combined stereo source lasts as long as the LONGER channel.
+
+    Regression: metadata came from the channel with more speech, and duration
+    was only repaired when absent — a channel with more speech but a shorter
+    recording left its shorter duration in the note metadata.
+    """
+    transcriber = Transcriber.__new__(Transcriber)
+    # Mic has the longer recording (90s) but no speech; monitor has the speech
+    # and a 60s recording, so monitor's info dict is selected for metadata.
+    mic_result = ([], {"duration": 90.0})
+    monitor_result = (
+        [Segment(start=0.0, end=5.0, text="speech")],
+        {"duration": 60.0, "language": "en"},
+    )
+
+    _mic_segs, _mon_segs, info = transcriber._assemble_stereo(
+        mic_result=mic_result,
+        monitor_result=monitor_result,
+        mic_skipped=False,
+    )
+
+    assert info["language"] == "en"
+    assert info["duration"] == 90.0
+
+
+def test_assemble_stereo_duration_is_the_longer_channel_monitor_speech(tmp_vault):
+    """Same rule in the inverse ordering: monitor wins speech, mic is longer."""
+    transcriber = Transcriber.__new__(Transcriber)
+    mic_result = (
+        [Segment(start=0.0, end=3.0, text="you")],
+        {"duration": 120.0},
+    )
+    monitor_result = (
+        [Segment(start=0.0, end=10.0, text="them")],
+        {"duration": 60.0, "language": "fr"},
+    )
+
+    _mic_segs, _mon_segs, info = transcriber._assemble_stereo(
+        mic_result=mic_result,
+        monitor_result=monitor_result,
+        mic_skipped=False,
+    )
+
+    assert info["language"] == "fr"
+    assert info["duration"] == 120.0

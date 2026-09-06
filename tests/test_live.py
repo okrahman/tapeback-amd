@@ -1128,3 +1128,130 @@ def test_live_stop_processes_tail_audio_under_min_chunk(tmp_path, monkeypatch):
     lt._process_chunk(is_final=True)
     assert len(lt._segments) == 1
     assert lt._segments[0].text == "Tail segment"
+
+
+# --- suffix containment regression in overlap dedup ---
+
+
+def test_deduplicate_overlap_keeps_one_word_reply_after_longer_sentence():
+    """A quick distinct reply is not the truncated copy of the previous sentence.
+
+    Regression: _same_utterance treated a one-token suffix as identity, so a
+    "you" reply starting 0.3s after "I will call you" was discarded as a
+    duplicate of it, deleting legitimate short utterances from live transcripts.
+    """
+    existing = [Segment(start=9.0, end=9.5, text="I will call you.", speaker="You")]
+    reply = Segment(start=9.3, end=9.6, text="you", speaker="You")
+
+    result = deduplicate_overlap(existing, [reply], overlap_start=60.0)
+
+    assert result == [reply]
+    assert existing[0].text == "I will call you."
+
+
+def test_deduplicate_overlap_keeps_short_segment_when_longer_sentence_ends_with_it():
+    """Inverse ordering: a long distinct sentence must not replace a short segment.
+
+    A sentence that merely ends with the same single word the short segment
+    consists of is different speech, even within the start-time tolerance.
+    """
+    existing = [Segment(start=9.0, end=9.1, text="you", speaker="You")]
+    longer = Segment(start=9.3, end=10.0, text="I will call you", speaker="You")
+
+    result = deduplicate_overlap(existing, [longer], overlap_start=60.0)
+
+    assert result == [longer]
+    assert existing[0].text == "you"
+
+
+def test_deduplicate_overlap_still_dedupes_leading_context_extension():
+    """Multi-token leading-context overlap still deduplicates (unchanged behavior)."""
+    existing = [Segment(start=59.2, end=59.9, text="thank you", speaker="You")]
+    new_segments = [Segment(start=59.3, end=60.8, text="no thank you", speaker="You")]
+
+    result = deduplicate_overlap(existing, new_segments, overlap_start=60.0)
+
+    assert result == []
+    assert existing[0].text == "no thank you"
+
+
+def test_deduplicate_overlap_still_dedupes_genuine_overlap_extension():
+    """A candidate that extends the existing utterance and spans the boundary
+    still replaces it in place (unchanged behavior)."""
+    existing = [Segment(start=59.0, end=60.0, text="no thank you", speaker="You")]
+    new_segments = [Segment(start=59.1, end=61.5, text="no thank you very much", speaker="You")]
+
+    result = deduplicate_overlap(existing, new_segments, overlap_start=61.0)
+
+    assert result == []
+    assert existing[0].text == "no thank you very much"
+
+
+# --- live backend disclosure ---
+
+
+def test_live_fallback_notice_and_backend_switch_are_announced(
+    tmp_path, tmp_vault, monkeypatch, capsys
+):
+    """A mid-session fallback must reach the user and the new backend announced.
+
+    Regression: the live chunk calls passed no status callback, so the facade's
+    fallback notice went to a default no-op and the startup disclosure kept
+    describing Lemonade after the session had silently latched to
+    faster-whisper — a false runtime disclosure exactly when performance,
+    resource use, and privacy expectations change.
+    """
+    settings = Settings(
+        vault_path=tmp_vault,
+        transcription_backend="lemonade",
+        resume_cache_dir=tmp_path / "resume",
+        live_min_chunk=0.1,
+        live_interval=60,
+    )
+    mic_path = tmp_path / "mic.wav"
+    monitor_path = tmp_path / "monitor.wav"
+    create_mono_wav(mic_path, duration=0.5, sample_rate=48000)
+    create_mono_wav(monitor_path, duration=0.5, sample_rate=48000)
+
+    _install_urlopen(
+        monkeypatch,
+        [
+            _lemon_verbose_json("lemonade monitor 1"),
+            _lemon_verbose_json("lemonade mic 1"),
+            TimeoutError("read timed out on interval 2"),
+        ],
+    )
+
+    fw = MagicMock()
+    fw.cache_fingerprint.return_value = "fw-fingerprint"
+    fw.describe.return_value = "Whisper: large-v3-turbo on cpu/int8"
+
+    def fw_transcribe(path, **kwargs):
+        return [Segment(start=0.0, end=1.0, text="fw full session")], {
+            "language": "en",
+            "duration": 1.0,
+            "partial": False,
+        }
+
+    fw.transcribe.side_effect = fw_transcribe
+    monkeypatch.setattr(Transcriber, "_new_fw_backend", lambda self: fw)
+    monkeypatch.setattr(live_mod, "load_transcriber", lambda s: Transcriber(s))
+
+    lt = LiveTranscriber(settings, "announce-session", mic_path, monitor_path)
+
+    # Interval 1 runs on Lemonade; discard its startup disclosure.
+    lt._process_chunk()
+    capsys.readouterr()
+
+    with open(mic_path, "ab") as f:
+        f.write(b"\x01\x00" * 24000)
+    with open(monitor_path, "ab") as f:
+        f.write(b"\x01\x00" * 24000)
+
+    # Interval 2: Lemonade fails, the facade falls back and re-transcribes.
+    lt._process_chunk()
+
+    err = capsys.readouterr().err
+    assert "falling back to faster-whisper" in err
+    assert "Live transcription backend switched:" in err
+    assert "Whisper: large-v3-turbo on cpu/int8" in err

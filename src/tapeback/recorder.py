@@ -170,6 +170,11 @@ class Recorder:
     def __init__(self, state_dir: Path | None = None) -> None:
         self._state_dir = state_dir or _DEFAULT_STATE_DIR
         self._session_file = self._state_dir / const.FILE_SESSION
+        # The session this process started, kept for an idempotent stop: in the
+        # two-process flow 'tapeback stop' deletes session.json from another
+        # process while the original 'tapeback start' process is still waiting
+        # on is_recording() — and that process still needs the recorded paths.
+        self._session_data: SessionData | None = None
 
     @property
     def session_file(self) -> Path:
@@ -241,6 +246,7 @@ class Recorder:
             "started_at": datetime.datetime.now(datetime.UTC).isoformat(),
         }
         self._session_file.write_text(json.dumps(session_data, indent=2))
+        self._session_data = session_data
 
         return session_name
 
@@ -249,8 +255,19 @@ class Recorder:
 
         Returns paths to (monitor.wav, mic.wav).
         Removes session.json.
+
+        Idempotent for a session this Recorder started: in the documented
+        two-process flow, 'tapeback stop' stops parecord and deletes
+        session.json while the original 'tapeback start' process wakes up in
+        stop_and_process(). Raising there would abort live-worker teardown and
+        final processing for a normal stop, so the already-known paths are
+        returned instead. A Recorder that never started a session still raises.
         """
         if not self._session_file.exists():
+            if self._session_data is not None:
+                session = self._session_data
+                self._session_data = None
+                return Path(session["monitor_path"]), Path(session["mic_path"])
             raise RuntimeError("No recording in progress.")
 
         session: SessionData = json.loads(self._session_file.read_text())
@@ -264,6 +281,7 @@ class Recorder:
         _wait_and_kill(pids)
 
         self._session_file.unlink()
+        self._session_data = None
 
         return Path(session["monitor_path"]), Path(session["mic_path"])
 

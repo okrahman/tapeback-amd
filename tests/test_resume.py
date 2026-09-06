@@ -86,6 +86,60 @@ def test_key_changes_when_an_output_affecting_setting_changes(cached_settings, a
     assert base != _resume.resume_key(audio, _resume.settings_fingerprint(other), "transcribe")
 
 
+@pytest.mark.parametrize(
+    "field",
+    [
+        "min_free_vram_mib",
+        "thermal_clamp_check",
+        "thermal_clamp_wait",
+        "thermal_clamp_cpu_fallback",
+    ],
+)
+def test_key_changes_when_a_device_resolution_setting_changes(cached_settings, audio, field):
+    """Device-resolution settings decide CPU vs CUDA and belong in the identity.
+
+    Regression: these settings participate in actual device resolution in
+    _fw_backend._resolve_device but were missing from the fingerprint, so a run
+    that changed only a threshold/clamp control reused a transcript produced on
+    the previous device path.
+    """
+    changed = {
+        "min_free_vram_mib": 99999,
+        "thermal_clamp_wait": 5.0,
+    }.get(field)
+    if changed is None:
+        # Booleans flip from whatever the suite's env isolation preset: the
+        # conftest disables the clamp check to keep tests off the real GPU.
+        changed = not getattr(cached_settings, field)
+    base = _resume.resume_key(audio, _resume.settings_fingerprint(cached_settings), "transcribe")
+    other = cached_settings.model_copy(update={field: changed})
+    assert base != _resume.resume_key(audio, _resume.settings_fingerprint(other), "transcribe")
+
+
+def test_threshold_only_change_does_not_serve_the_stale_cache(cached_settings, audio):
+    """A threshold/clamp-only change must execute, not return the old transcript.
+
+    Regression: the resume key was computed from the requested device/compute
+    type only, so changing min_free_vram_mib (which can flip the resolved device)
+    left the key unchanged and the second run was served the first run's output
+    without ever running the requested backend path.
+    """
+    with patch("tapeback._fw_backend.WhisperModel") as mock_model_cls:
+        instance = mock_model_cls.return_value
+        instance.transcribe.return_value = (
+            iter([_whisper_segment(0.0, 5.0, "готово")]),
+            _info(),
+        )
+        Transcriber(cached_settings).transcribe(audio, stage="transcribe monitor")
+
+        instance.transcribe.reset_mock()
+        other = cached_settings.model_copy(update={"min_free_vram_mib": 99999})
+        Transcriber(other).transcribe(audio, stage="transcribe monitor")
+
+    # The second run executed the requested backend instead of reusing the cache.
+    instance.transcribe.assert_called_once()
+
+
 def test_key_is_none_for_missing_audio(cached_settings, tmp_path):
     fingerprint = _resume.settings_fingerprint(cached_settings)
     missing = tmp_path / "gone.wav"
