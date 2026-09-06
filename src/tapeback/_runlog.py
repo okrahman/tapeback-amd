@@ -20,6 +20,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from tapeback._fs import refuse_symlink_target, write_private_text
+
 if TYPE_CHECKING:
     from tapeback.settings import Settings
 
@@ -224,14 +226,14 @@ def write_run_log(record: RunLog, directory: Path) -> Path | None:
     already been saved by this point.
     """
     try:
-        directory.mkdir(parents=True, exist_ok=True)
         # Timestamp in the name keeps repeated runs of one session distinguishable
         # and makes lexicographic order equal chronological order for pruning.
         stamp = record.started_at.replace(":", "-")
         path = directory / f"{stamp}_{record.session}.json"
-        path.write_text(json.dumps(record.to_dict(), indent=2, ensure_ascii=False))
+        refuse_symlink_target(path, "write the run record")
+        write_private_text(path, json.dumps(record.to_dict(), indent=2, ensure_ascii=False))
         _prune_old_records(directory)
-    except OSError:
+    except (OSError, RuntimeError):
         return None
     return path
 

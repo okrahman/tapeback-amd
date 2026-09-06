@@ -11,7 +11,12 @@ from pathlib import Path
 from typing import TypedDict
 
 from tapeback import const
-from tapeback._fs import ensure_private_dir, require_fresh_regular_target
+from tapeback._fs import (
+    ensure_private_dir,
+    refuse_symlink_target,
+    require_fresh_regular_target,
+    write_private_text,
+)
 from tapeback.settings import Settings
 
 
@@ -235,8 +240,6 @@ class Recorder:
             stderr=subprocess.PIPE,
         )
 
-        # Save session state
-        self._state_dir.mkdir(parents=True, exist_ok=True)
         # Annotated: the literal is inferred as dict[str, int | str], which ty
         # correctly rejects against the SessionData contract below.
         session_data: SessionData = {
@@ -247,7 +250,10 @@ class Recorder:
             "mic_path": str(mic_path),
             "started_at": datetime.datetime.now(datetime.UTC).isoformat(),
         }
-        self._session_file.write_text(json.dumps(session_data, indent=2))
+        # Save session state — private (0600 in a verified 0700 dir), atomic, and
+        # never through a planted symlink: it names the recording files.
+        refuse_symlink_target(self._session_file, "write the session state")
+        write_private_text(self._session_file, json.dumps(session_data, indent=2))
         self._session_data = session_data
 
         return session_name

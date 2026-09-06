@@ -27,6 +27,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from tapeback._fs import refuse_symlink_target, write_private_text
 from tapeback.models import Segment, Word
 from tapeback.settings import Settings
 
@@ -203,6 +204,12 @@ def load(key: ResumeKey, directory: Path) -> tuple[list[Segment], dict[str, Any]
     """Return a previously stored channel, or None. Never raises on bad cache data."""
     path = directory / key.filename
     try:
+        refuse_symlink_target(path, "load the resume entry")
+    except RuntimeError:
+        # A planted symlink at the entry path must never be followed: the entry
+        # would be read from (or, in store(), written to) an attacker-chosen file.
+        return None
+    try:
         payload = json.loads(path.read_text())
         return _from_payload(payload)
     except (OSError, ValueError, KeyError, TypeError, RecursionError):
@@ -219,13 +226,15 @@ def store(
     """Persist a completed channel. Returns the path, or None if it could not be written.
 
     Failing to write a cache entry must never fail the run that produced it.
+    The entry holds full transcript text, so it is written 0600 into a verified
+    0700 directory, atomically (tmp + rename), and never through a symlink.
     """
+    path = directory / key.filename
     try:
-        directory.mkdir(parents=True, exist_ok=True)
-        path = directory / key.filename
-        path.write_text(json.dumps(_to_payload(segments, info), ensure_ascii=False))
+        refuse_symlink_target(path, "store the resume entry")
+        write_private_text(path, json.dumps(_to_payload(segments, info), ensure_ascii=False))
         _prune(directory)
-    except OSError:
+    except (OSError, RuntimeError):
         return None
     return path
 

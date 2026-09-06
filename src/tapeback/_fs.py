@@ -86,3 +86,30 @@ def require_fresh_regular_target(path: Path, purpose: str) -> None:
         path.unlink()
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
     os.close(fd)
+
+
+def write_private_text(path: Path, text: str) -> None:
+    """Atomically write `text` to a 0600 file inside a verified 0700 directory.
+
+    Transcript-adjacent files (resume-cache entries, run records, session
+    state) hold the same sensitive content the staging helpers protect, so
+    they get the same treatment — plus two properties those helpers do not
+    need:
+
+    - private by default: created O_CREAT|O_EXCL mode 0600, never subject to
+      a permissive umask;
+    - atomic: the payload is written to a temporary file in the same
+      directory and `os.replace`d into place, so a crash mid-write can never
+      leave a truncated file at the real path (a reader sees either the old
+      entry or the new one, never a half-written one).
+    """
+    ensure_private_dir(path.parent)
+    tmp = path.with_name(f".{path.name}.tmp.{os.getpid()}")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.replace(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
