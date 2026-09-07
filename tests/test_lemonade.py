@@ -25,6 +25,7 @@ import tapeback._lemonade_audio as lemon_audio
 import tapeback._lemonade_transport as lemon_transport
 import tapeback._lemonade_validate as lemon_validate
 from tapeback._lemonade import (
+    AUDIO_PREPARATION_POLICY_VERSION,
     DEDUP_POLICY_VERSION,
     LemonadeAuthenticationError,
     LemonadeBackend,
@@ -53,13 +54,13 @@ from tapeback.settings import Settings
 # --- helpers ---
 
 
-def write_wav(path: Path, duration_s: float, rate: int = 16000) -> None:
-    """A silent PCM WAV of the requested duration."""
+def write_wav(path: Path, duration_s: float, rate: int = 16000, sample: int = 1) -> None:
+    """A constant 16-bit PCM WAV of the requested duration."""
     with wave.open(str(path), "wb") as wf:
         wf.setnchannels(1)
         wf.setsampwidth(2)
         wf.setframerate(rate)
-        wf.writeframes(b"\x00\x00" * int(duration_s * rate))
+        wf.writeframes(struct.pack("<h", sample) * int(duration_s * rate))
 
 
 def lemon_settings(tmp_path, **overrides) -> Settings:
@@ -136,6 +137,16 @@ def install_urlopen(monkeypatch, bodies):
     return calls
 
 
+def uploaded_wav(request) -> tuple[tuple[int, int, int, int], bytes]:
+    """Extract the WAV part from one mocked multipart request."""
+    body = request.data
+    start = body.index(b"audio/wav\r\n\r\n") + len(b"audio/wav\r\n\r\n")
+    end = body.rindex(b"\r\n--tapeback-")
+    with wave.open(io.BytesIO(body[start:end]), "rb") as wf:
+        params = (wf.getnchannels(), wf.getsampwidth(), wf.getframerate(), wf.getnframes())
+        return params, wf.readframes(wf.getnframes())
+
+
 def http_error(status: int, payload: dict | str | bytes = "") -> urllib.error.HTTPError:
     body = payload if isinstance(payload, bytes) else json.dumps(payload).encode()
     return urllib.error.HTTPError("http://x", status, "err", Message(), io.BytesIO(body))
@@ -182,7 +193,7 @@ def test_malformed_api_key_is_a_configuration_error(tmp_path):
 def test_describe_names_model_and_endpoint(tmp_path):
     backend = LemonadeBackend(lemon_settings(tmp_path))
     described = backend.describe()
-    assert "Whisper-Large-v3-Turbo" in described
+    assert "Whisper-Large-v3" in described
     assert "127.0.0.1:13305" in described
 
 
@@ -224,6 +235,16 @@ def test_fingerprint_tracks_the_dedup_policy_version(tmp_path, monkeypatch):
     assert backend.cache_fingerprint() != before
 
 
+def test_fingerprint_tracks_audio_preparation_policy(tmp_path, monkeypatch):
+    backend = LemonadeBackend(lemon_settings(tmp_path))
+    before = backend.cache_fingerprint()
+    monkeypatch.setattr(
+        "tapeback._lemonade.AUDIO_PREPARATION_POLICY_VERSION",
+        AUDIO_PREPARATION_POLICY_VERSION + "-changed",
+    )
+    assert backend.cache_fingerprint() != before
+
+
 def test_token_bearing_cache_entries_are_not_reused_after_policy_bump(tmp_path, monkeypatch):
     wav = tmp_path / "a.wav"
     write_wav(wav, 0.5)
@@ -254,7 +275,7 @@ def test_multipart_request_carries_model_format_and_file(tmp_path, monkeypatch):
     request = calls[0]
     assert request.full_url == "http://127.0.0.1:13305/v1/audio/transcriptions"
     body = request.data.decode("utf-8", errors="replace")
-    assert 'name="model"' in body and "Whisper-Large-v3-Turbo" in body
+    assert 'name="model"' in body and "Whisper-Large-v3" in body
     assert 'name="response_format"' in body and "verbose_json" in body
     assert 'name="file"' in body and 'filename="audio.wav"' in body
     assert request.headers["Content-type"].startswith("multipart/form-data")
@@ -285,6 +306,152 @@ def test_no_hotwords_or_prompt_field_is_sent(tmp_path, monkeypatch):
 
 
 # --- chunking, offsets, dedup, progress ---
+
+
+@pytest.mark.parametrize(
+    ("active_frames", "silent_frames", "expected_frames"),
+    [
+        (100, 900, 600),  # long tail: keep 0.5 s after activity
+        (100, 200, 300),  # short tail: do not add silence
+        (1000, 0, 1000),  # no tail
+        (999, 1, 1000),  # final active frame
+    ],
+)
+def test_exact_silence_upload_endpoint(
+    tmp_path, monkeypatch, active_frames, silent_frames, expected_frames
+):
+    rate = 1000
+    wav = tmp_path / "tail.wav"
+    with wave.open(str(wav), "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(rate)
+        wf.writeframes(struct.pack("<h", 1) * active_frames)
+        wf.writeframes(b"\x00\x00" * silent_frames)
+    original = wav.read_bytes()
+    calls = install_urlopen(monkeypatch, [verbose_json([seg(0.0, 0.05)])])
+
+    _segments, info = LemonadeBackend(
+        lemon_settings(tmp_path, lemonade_chunk_seconds=10.0)
+    ).transcribe(wav)
+
+    assert uploaded_wav(calls[0])[0][3] == expected_frames
+    assert wav.read_bytes() == original
+    assert info["duration"] == pytest.approx((active_frames + silent_frames) / rate)
+
+
+def test_extremely_quiet_nonzero_sample_is_retained(tmp_path, monkeypatch):
+    wav = tmp_path / "quiet.wav"
+    with wave.open(str(wav), "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(1000)
+        wf.writeframes(b"\x00\x00" * 100)
+        wf.writeframes(struct.pack("<h", -1))
+        wf.writeframes(b"\x00\x00" * 800)
+    calls = install_urlopen(monkeypatch, [verbose_json([])])
+
+    LemonadeBackend(lemon_settings(tmp_path, lemonade_chunk_seconds=10.0)).transcribe(wav)
+
+    params, frames = uploaded_wav(calls[0])
+    assert params[3] == 601
+    assert frames[200:202] == struct.pack("<h", -1)
+
+
+def test_multichannel_frame_is_active_when_any_channel_is_nonzero(tmp_path, monkeypatch):
+    wav = tmp_path / "stereo.wav"
+    with wave.open(str(wav), "wb") as wf:
+        wf.setnchannels(2)
+        wf.setsampwidth(2)
+        wf.setframerate(1000)
+        wf.writeframes(b"\x00\x00" * 2 * 100)
+        wf.writeframes(struct.pack("<hh", 0, 1))
+        wf.writeframes(b"\x00\x00" * 2 * 800)
+    calls = install_urlopen(monkeypatch, [verbose_json([])])
+
+    LemonadeBackend(lemon_settings(tmp_path, lemonade_chunk_seconds=10.0)).transcribe(wav)
+
+    assert uploaded_wav(calls[0])[0][3] == 601
+
+
+def test_backward_scan_crosses_block_boundary(tmp_path, monkeypatch):
+    monkeypatch.setattr(lemon_audio, "_SILENCE_SCAN_BLOCK_FRAMES", 8)
+    wav = tmp_path / "blocks.wav"
+    with wave.open(str(wav), "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(10)
+        wf.writeframes(struct.pack("<h", 1) + b"\x00\x00" * 23)
+    calls = install_urlopen(monkeypatch, [verbose_json([])])
+
+    LemonadeBackend(lemon_settings(tmp_path, lemonade_chunk_seconds=10.0)).transcribe(wav)
+
+    assert uploaded_wav(calls[0])[0][3] == 6
+
+
+def test_entirely_silent_supported_wav_skips_upload_and_preserves_language(tmp_path, monkeypatch):
+    wav = tmp_path / "silent.wav"
+    write_wav(wav, 2.0, rate=1000, sample=0)
+    calls = install_urlopen(monkeypatch, [AssertionError("must not upload")])
+    statuses: list[str] = []
+
+    segments, info = LemonadeBackend(lemon_settings(tmp_path, language="de")).transcribe(
+        wav, on_status=statuses.append
+    )
+
+    assert calls == []
+    assert segments == []
+    assert info == {"language": "de", "duration": 2.0, "partial": False}
+    assert any("entirely silent" in status and "submitted 0.000s" in status for status in statuses)
+
+
+def test_trimming_removes_final_chunks_and_shortens_last_with_overlap(tmp_path, monkeypatch):
+    wav = tmp_path / "chunk-tail.wav"
+    with wave.open(str(wav), "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(1000)
+        wf.writeframes(struct.pack("<h", 1) * 1200)
+        wf.writeframes(b"\x00\x00" * 1800)
+    calls = install_urlopen(monkeypatch, [verbose_json([]), verbose_json([])])
+    statuses: list[str] = []
+
+    _segments, info = LemonadeBackend(lemon_settings(tmp_path)).transcribe(
+        wav, on_status=statuses.append
+    )
+
+    assert len(calls) == 2
+    assert [uploaded_wav(call)[0][3] for call in calls] == [1000, 1200]
+    assert info["duration"] == 3.0
+    assert any("original 3.000s, submitted 1.700s" in status for status in statuses)
+
+
+def test_trimmed_timestamp_validation_uses_submitted_chunk_duration(tmp_path, monkeypatch):
+    wav = tmp_path / "trimmed.wav"
+    with wave.open(str(wav), "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(1000)
+        wf.writeframes(struct.pack("<h", 1) * 100)
+        wf.writeframes(b"\x00\x00" * 1900)
+    install_urlopen(monkeypatch, [verbose_json([seg(0.0, 1.7)])])
+
+    with pytest.raises(LemonadeCapabilityError, match="past the audio"):
+        LemonadeBackend(lemon_settings(tmp_path, lemonade_chunk_seconds=10.0)).transcribe(wav)
+
+
+def test_unsupported_sample_width_is_uploaded_unchanged(tmp_path, monkeypatch):
+    wav = tmp_path / "pcm8.wav"
+    with wave.open(str(wav), "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(1)
+        wf.setframerate(1000)
+        wf.writeframes(b"\x00" * 1000)
+    calls = install_urlopen(monkeypatch, [verbose_json([])])
+
+    LemonadeBackend(lemon_settings(tmp_path, lemonade_chunk_seconds=10.0)).transcribe(wav)
+
+    assert uploaded_wav(calls[0])[0][3] == 1000
 
 
 def test_long_wav_is_chunked_with_overlap_and_shifted_timestamps(tmp_path, monkeypatch):

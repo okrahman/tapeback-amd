@@ -2,6 +2,7 @@
 
 import io
 import json
+import struct
 import subprocess
 import sys
 import urllib.error
@@ -33,7 +34,7 @@ def write_wav(path: Path, duration_s: float, rate: int = 16000) -> None:
         wf.setnchannels(1)
         wf.setsampwidth(2)
         wf.setframerate(rate)
-        wf.writeframes(b"\x00\x00" * int(duration_s * rate))
+        wf.writeframes(struct.pack("<h", 1) * int(duration_s * rate))
 
 
 def lemon_settings(tmp_path, **overrides) -> Settings:
@@ -512,7 +513,7 @@ def test_choosing_lemonade_does_not_import_faster_whisper():
 def test_describe_delegates_to_the_lemonade_backend(tmp_path):
     transcriber = Transcriber(lemon_settings(tmp_path))
     described = transcriber.describe()
-    assert "Lemonade" in described and "Whisper-Large-v3-Turbo" in described
+    assert "Lemonade" in described and "Whisper-Large-v3" in described
 
 
 def test_unavailable_error_falls_back(tmp_path, monkeypatch, mock_fw, audio):

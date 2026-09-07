@@ -182,7 +182,7 @@ server on every run. To keep transcription fully local instead, opt out with
 ```bash
 # Optional — defaults shown. Recording audio is sent to this server on every run.
 export TAPEBACK_LEMONADE_URL=http://127.0.0.1:13305
-export TAPEBACK_LEMONADE_MODEL=Whisper-Large-v3-Turbo
+export TAPEBACK_LEMONADE_MODEL=Whisper-Large-v3
 
 # Opt out of the Lemonade backend to stay fully local:
 # export TAPEBACK_TRANSCRIPTION_BACKEND=faster-whisper
@@ -459,7 +459,7 @@ server of its choosing.
 |---|---|---|
 | `TAPEBACK_TRANSCRIPTION_BACKEND` | `lemonade` | `lemonade` (default: sends WAVs to a [Lemonade Server](#lemonade-server-backend) you run yourself, with automatic fallback to faster-whisper on eligible failures) or `faster-whisper` (opt-out: built-in local model, fully local) |
 | `TAPEBACK_LEMONADE_URL` | `http://127.0.0.1:13305` | Lemonade Server base URL. Must be a bare URL — no embedded credentials (`user:pass@host`), query string, or fragment. Plaintext `http://` is allowed only for loopback hosts (`localhost`, `127.0.0.0/8`, `::1`); remote endpoints must use `https://` (Lemonade backend only) |
-| `TAPEBACK_LEMONADE_MODEL` | `Whisper-Large-v3-Turbo` | Model identifier as the server knows it (Lemonade backend only) |
+| `TAPEBACK_LEMONADE_MODEL` | `Whisper-Large-v3` | Model identifier as the server knows it. Full v3 generally needs more resources and may take longer than Turbo; set `Whisper-Large-v3-Turbo` explicitly to choose Turbo (Lemonade backend only) |
 | `TAPEBACK_LEMONADE_API_KEY` | *(off)* | Optional bearer token; sent only in the `Authorization` header, never logged or cached (Lemonade backend only) |
 | `TAPEBACK_LEMONADE_TIMEOUT_SECONDS` | `600` | Total end-to-end request deadline — DNS resolution, connect, proxy CONNECT, TLS, upload, and every response read share one budget, each blocking operation getting the remaining time. The configured value applies in both batch and live mode; hitting it falls back to faster-whisper rather than resubmitting (Lemonade backend only) |
 | `TAPEBACK_LEMONADE_DIAGNOSTICS_TIMEOUT_SECONDS` | `10` | Per-request timeout for the `tapeback status` health/system-info probes only — deliberately short so a stalled endpoint cannot hang status for minutes. Transcription keeps the generous inference timeout above (Lemonade backend only) |

@@ -166,8 +166,9 @@ class Settings(BaseSettings):
     # structurally (lowercased scheme/host, default port dropped) before display
     # or use, so what status shows is what requests target.
     lemonade_url: str = "http://127.0.0.1:13305"
-    # Model identifier as Lemonade Server knows it (e.g. "Whisper-Large-v3-Turbo").
-    lemonade_model: str = "Whisper-Large-v3-Turbo"
+    # Full v3 is more resource-intensive and can take longer than Turbo, but is the
+    # higher-quality Lemonade default. Explicit server model identifiers still win.
+    lemonade_model: str = "Whisper-Large-v3"
     # Optional bearer token for a Lemonade Server that requires auth. SecretStr keeps
     # it out of repr/logs; it is sent only in the Authorization header and never
     # appears in cache fingerprints or error messages.

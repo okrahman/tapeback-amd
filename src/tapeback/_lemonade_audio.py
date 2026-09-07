@@ -37,6 +37,28 @@ from tapeback.settings import Settings
 DEDUP_POLICY_VERSION = 3
 
 
+# Lemonade can hallucinate speech from a long exact-digital-silence tail. For
+# supported 16-bit PCM WAVs, retain this much of the silence already present after
+# the final active frame. This is an upload policy only: the source remains intact.
+TRAILING_SILENCE_PADDING_SECONDS = 0.5
+
+
+# Cache identity for all audio preparation that happens before HTTP chunking.
+# Include the padding value in the token so changing either the algorithm or the
+# amount retained necessarily invalidates older Lemonade results.
+AUDIO_PREPARATION_POLICY_VERSION = (
+    f"pcm16-exact-silence-v1-padding-{TRAILING_SILENCE_PADDING_SECONDS!r}s"
+)
+
+
+# Fixed-size reverse reads keep the silence scan's peak memory independent of the
+# recording length. Expressed in frames so multichannel frames are never split.
+_SILENCE_SCAN_BLOCK_FRAMES = 64 * 1024
+
+
+_PCM16_SAMPLE_WIDTH_BYTES = 2
+
+
 # Conservative internal cap on one chunk's WAV payload. A 300 s mono 16 kHz PCM chunk
 # is ~9.6 MB, so this binds only for unusual formats — it is a memory guard, not a
 # claim about the server.
@@ -101,6 +123,44 @@ def _wav_params(audio_path: Path) -> tuple[int, int, int, int] | None:
         return params
     except (wave.Error, OSError):
         return None
+
+
+def _lemonade_upload_frames(audio_path: Path, params: tuple[int, int, int, int]) -> int:
+    """Return the PCM frame endpoint Lemonade should receive.
+
+    Only 16-bit PCM WAVs participate. The file is scanned backwards in bounded
+    blocks until a frame containing any nonzero channel sample is found. The
+    returned endpoint retains existing silence for the configured padding and is
+    capped at the original frame count. Zero means the supported input is entirely
+    silent. Unsupported encodings retain their original endpoint unchanged.
+    """
+    channels, sampwidth, framerate, n_frames = params
+    if sampwidth != _PCM16_SAMPLE_WIDTH_BYTES or framerate <= 0 or n_frames <= 0:
+        return n_frames
+
+    frame_bytes = channels * sampwidth
+    try:
+        with wave.open(str(audio_path), "rb") as wf:
+            if wf.getcomptype() != "NONE":
+                return n_frames
+            block_end = n_frames
+            while block_end > 0:
+                block_start = max(0, block_end - _SILENCE_SCAN_BLOCK_FRAMES)
+                wf.setpos(block_start)
+                frames = wf.readframes(block_end - block_start)
+                actual_frames = len(frames) // frame_bytes
+                for relative in range(actual_frames - 1, -1, -1):
+                    start = relative * frame_bytes
+                    if any(frames[start : start + frame_bytes]):
+                        last_active = block_start + relative
+                        padding = int(TRAILING_SILENCE_PADDING_SECONDS * framerate)
+                        return min(n_frames, last_active + 1 + padding)
+                block_end = block_start
+    except (wave.Error, OSError):
+        # `_wav_params` already established readability. If the second open/read
+        # races with a file change, preserve the established whole-input behavior.
+        return n_frames
+    return 0
 
 
 def _wrap_wav(frames: bytes, channels: int, sampwidth: int, framerate: int) -> bytes:

@@ -31,6 +31,7 @@ def test_settings_defaults(tmp_vault):
     """Default settings should match expected values."""
     s = Settings(vault_path=tmp_vault)
     assert s.whisper_model == "large-v3-turbo"
+    assert s.lemonade_model == "Whisper-Large-v3"
     assert s.language == "auto"
     assert s.device == "cuda"
     assert s.compute_type == "auto"
@@ -44,6 +45,12 @@ def test_settings_defaults(tmp_vault):
     assert s.attachments_dir == "attachments/audio"
     assert s.diarize is True
     assert s.max_speakers is None
+
+
+def test_explicit_lemonade_turbo_override_remains_effective(monkeypatch, vault_env):
+    monkeypatch.setenv("TAPEBACK_LEMONADE_MODEL", "Whisper-Large-v3-Turbo")
+
+    assert Settings().lemonade_model == "Whisper-Large-v3-Turbo"
 
 
 def test_settings_hf_token_from_env(monkeypatch, vault_env):

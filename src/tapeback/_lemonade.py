@@ -37,7 +37,9 @@ from tapeback._backends import StatusCallback, TranscriptionInfo
 # even though the implementation now lives in the sibling modules.
 from tapeback._lemonade_audio import (
     _UPLOAD_FILENAME,
+    AUDIO_PREPARATION_POLICY_VERSION,
     DEDUP_POLICY_VERSION,
+    _lemonade_upload_frames,
     _max_payload_bytes,
     _MergeState,
     _plan_chunks,
@@ -81,6 +83,7 @@ from tapeback.settings import Settings
 _MIN_WAV_BYTES_PER_SECOND = 8000
 
 __all__ = [
+    "AUDIO_PREPARATION_POLICY_VERSION",
     "DEDUP_POLICY_VERSION",
     "LemonadeAuthenticationError",
     "LemonadeBackend",
@@ -197,7 +200,7 @@ class LemonadeBackend:
         """Identity of everything that changes this backend's transcription output.
 
         Included: backend identity, normalized server URL, model, NORMALIZED
-        language, chunk duration, overlap duration, and the dedup policy version.
+        language, chunk duration, overlap duration, and audio/merge policy versions.
         Normalizing the language matters: `english` and `en` produce identical
         output but would otherwise be two cache identities and over-invalidate.
         Deliberately
@@ -213,6 +216,7 @@ class LemonadeBackend:
             f"chunk_seconds={self._settings.lemonade_chunk_seconds!r}",
             f"overlap_seconds={self._settings.lemonade_overlap_seconds!r}",
             f"dedup_policy={DEDUP_POLICY_VERSION}",
+            f"audio_preparation_policy={AUDIO_PREPARATION_POLICY_VERSION}",
             f"gate_mic_silence={self._settings.gate_mic_silence!r}",
         )
         return hashlib.sha256("\x00".join(parts).encode()).hexdigest()[:32]
@@ -262,7 +266,7 @@ class LemonadeBackend:
         try:
             # A degenerate header (0 framerate/frames) is not chunkable either.
             if params is not None and params[2] > 0 and params[3] > 0:
-                duration = self._transcribe_wav(audio_path, params, stage, on_status, state)
+                self._transcribe_wav(audio_path, params, stage, on_status, state)
             else:
                 # Not a parseable WAV: send it whole. The pipeline supplies PCM WAV,
                 # so this is the tolerant path for unusual but valid inputs. The
@@ -322,10 +326,25 @@ class LemonadeBackend:
         on_status: StatusCallback,
         state: _MergeState,
     ) -> float:
-        """Send one request per chunk and merge the responses. Returns the duration."""
+        """Prepare, chunk, and send a WAV while preserving original time metadata."""
         channels, sampwidth, framerate, n_frames = params
-        plan = _plan_chunks(channels, sampwidth, framerate, n_frames, self._settings)
-        progress = ProgressReporter(stage, n_frames / framerate, on_status)
+        upload_frames = _lemonade_upload_frames(audio_path, params)
+        original_duration = n_frames / framerate
+        submitted_duration = upload_frames / framerate
+        progress = ProgressReporter(stage, original_duration, on_status)
+        if upload_frames == 0:
+            on_status(
+                f"  {stage}: entirely silent 16-bit PCM WAV; skipped Lemonade upload "
+                f"(original {original_duration:.3f}s, submitted 0.000s)"
+            )
+            progress.update(original_duration)
+            return original_duration
+        if upload_frames < n_frames:
+            on_status(
+                f"  {stage}: trimmed exact trailing silence for Lemonade "
+                f"(original {original_duration:.3f}s, submitted {submitted_duration:.3f}s)"
+            )
+        plan = _plan_chunks(channels, sampwidth, framerate, upload_frames, self._settings)
         with wave.open(str(audio_path), "rb") as wf:
             for index in range(plan.total):
                 chunk = plan.chunk(index)
@@ -345,7 +364,11 @@ class LemonadeBackend:
                     final_chunk=chunk.index == chunk.total - 1,
                 )
                 progress.update(chunk.core_end / framerate)
-        return n_frames / framerate
+        if upload_frames < n_frames:
+            # Once every submitted chunk succeeds, account for the omitted tail in
+            # original-recording progress. Interrupted runs deliberately skip this.
+            progress.update(original_duration)
+        return original_duration
 
     def _explicit_language(self, language_override: str | None) -> str | None:
         """The language to pin from the first request, or None for auto-detection.
