@@ -4,8 +4,9 @@ Meeting recorder for Linux. Records system audio + microphone via
 PipeWire/PulseAudio, transcribes with Whisper, identifies speakers, saves
 Markdown to your Obsidian vault. Transcription runs through a
 [Lemonade Server](https://github.com/lemonade-sdk/lemonade) you control by
-default — no cloud services or API keys — with fully local faster-whisper
-transcription one setting away.
+default. Lemonade is tapeback's first-class transcription path — no cloud
+service or API key is required — backed by an automatic local faster-whisper
+fallback that prefers CUDA and drops to CPU when CUDA cannot safely run.
 
 Works with any video call platform: Google Meet, Zoom, Teams, Telegram, Discord, Slack huddles.
 
@@ -15,7 +16,7 @@ Works with any video call platform: Google Meet, Zoom, Teams, Telegram, Discord,
 
 - **Live transcription** (opt-in): read the transcript while the meeting is still going — Whisper transcribes in the background every 60 seconds (set `TAPEBACK_LIVE=true`)
 - **Platform-agnostic**: captures OS-level audio, works with any app
-- **Lemonade backend (default)**: transcribe through a [Lemonade Server](https://github.com/lemonade-sdk/lemonade) you run yourself — **recording audio is sent to that server**; automatic fallback to local faster-whisper on eligible failures
+- **First-class Lemonade backend (default)**: transcribe through a [Lemonade Server](https://github.com/lemonade-sdk/lemonade) you run yourself — **recording audio is sent to that server**; eligible failures fall back to local faster-whisper on CUDA, then CPU when CUDA cannot safely run
 - **Local transcription (opt-out)**: set `TAPEBACK_TRANSCRIPTION_BACKEND=faster-whisper` to transcribe fully locally with faster-whisper on CPU or CUDA GPU
 - **Speaker diarization**: pyannote identifies who said what
 - **Stereo channel separation**: your mic (left) vs. others (right) for accurate "You" attribution
@@ -174,7 +175,8 @@ for background.
 
 ## Lemonade Server backend
 
-By default tapeback transcribes through a [Lemonade Server](https://github.com/lemonade-sdk/lemonade)
+Lemonade is tapeback's first-class, default transcription backend. Tapeback
+transcribes through a [Lemonade Server](https://github.com/lemonade-sdk/lemonade)
 instance you start and manage yourself, and recording audio is sent to that
 server on every run. To keep transcription fully local instead, opt out with
 `TAPEBACK_TRANSCRIPTION_BACKEND=faster-whisper`.
@@ -187,6 +189,125 @@ export TAPEBACK_LEMONADE_MODEL=Whisper-Large-v3
 # Opt out of the Lemonade backend to stay fully local:
 # export TAPEBACK_TRANSCRIPTION_BACKEND=faster-whisper
 ```
+
+### Recommended Lemonade setup
+
+Install [Lemonade Server](https://lemonade-server.ai/docs/guide/install/) before
+starting tapeback. Linux packages install the `lemond` system service and normally
+start it automatically; verify it is available, or start it explicitly:
+
+```bash
+lemonade --version
+lemonade status
+
+# Packaged Linux installations only, if the service is not already running:
+sudo systemctl enable --now lemond
+```
+
+The setup below was validated with Lemonade 11.6.0. Use a current supported
+release; 11.6.0 is the tested baseline, not a request to downgrade. If Lemonade is
+absent, tapeback's eligible-failure fallback can still produce a transcript, but
+the first-class Lemonade path requires a running server on the configured endpoint.
+
+`Whisper-Large-v3` with beam size 4, no retained text context, and Silero VAD
+is the recommended default. VAD keeps `whisper.cpp` from decoding long silent
+regions, while `--max-context 0` prevents a bad phrase from feeding back into a
+repetition loop. Download the official
+[`ggml-silero-v6.2.0.bin`](https://huggingface.co/ggml-org/whisper-vad/resolve/main/ggml-silero-v6.2.0.bin)
+model to a persistent path the Lemonade service account can read:
+
+```bash
+curl -fL -o ggml-silero-v6.2.0.bin \
+  https://huggingface.co/ggml-org/whisper-vad/resolve/main/ggml-silero-v6.2.0.bin
+
+# Current Linux packages use /var/lib/lemonade. See the legacy-path note below
+# if that directory does not exist on an older installation.
+LEMONADE_STATE_DIR=/var/lib/lemonade
+sudo install -D -m 0644 -o lemonade -g lemonade \
+  ggml-silero-v6.2.0.bin \
+  "$LEMONADE_STATE_DIR/vad/ggml-silero-v6.2.0.bin"
+
+LEMONADE_VAD_MODEL="$LEMONADE_STATE_DIR/vad/ggml-silero-v6.2.0.bin"
+
+lemonade config set \
+  "whispercpp.args=--beam-size 4 --max-context 0 --vad --vad-model $LEMONADE_VAD_MODEL"
+lemonade unload Whisper-Large-v3
+lemonade load Whisper-Large-v3
+```
+
+The final `load` may download roughly 3 GB for `Whisper-Large-v3`, plus a
+hardware-specific `whisper.cpp` backend. A slow first load is expected; subsequent
+loads reuse the cache. Keep enough free disk space and do not interrupt a download
+merely because the first load takes longer than later ones.
+
+#### Verify the setup
+
+Confirm the server is healthy, the model is loaded, and the saved decoder arguments
+are active before recording an important meeting:
+
+```bash
+lemonade status
+lemonade config | grep -E 'whispercpp\.(args|backend)'
+tapeback status
+```
+
+Look for a healthy server, `Whisper-Large-v3` loaded, and `whispercpp.args`
+containing `--beam-size 4 --max-context 0 --vad --vad-model ...`. `tapeback status`
+should report `Backend: lemonade`, the expected endpoint, and the same model.
+
+#### Tested and supported configurations
+
+These are Lemonade Server settings, not `TAPEBACK_*` settings: tapeback defaults
+to `Whisper-Large-v3`, but it does not install the VAD model or manage Lemonade's
+`whisper.cpp` command line. The profile was verified with Lemonade 11.6.0,
+`Whisper-Large-v3`, `whispercpp.backend=rocm`, and a Radeon 8060S (`gfx1151`).
+That is the tested AMD profile, not the only supported configuration.
+
+ROCm is recommended for an AMD GPU supported by Lemonade. On other hardware, let
+Lemonade select a supported backend or choose one listed by `lemonade backends`;
+do not copy `whispercpp.backend=rocm` onto an unsupported machine. To reproduce the
+tested AMD profile explicitly:
+
+```bash
+lemonade config set whispercpp.backend=rocm
+lemonade unload Whisper-Large-v3
+lemonade load Whisper-Large-v3
+```
+
+Current packaged Linux releases store service state under `/var/lib/lemonade`.
+The tested 11.6.0 system used the legacy path
+`/opt/var/lib/lemonade/.cache/vad/ggml-silero-v6.2.0.bin`; set
+`LEMONADE_STATE_DIR=/opt/var/lib/lemonade/.cache` in the installation commands
+above when maintaining that older layout.
+
+#### Persistence, upgrades, and rollback
+
+`lemonade config set` writes a persistent override, so the decoder arguments and
+backend choice survive model reloads and system restarts. The VAD file must remain
+at the configured path and readable by the Lemonade service account.
+
+Lemonade upgrades can update the bundled `whisper.cpp` and its accepted arguments.
+After an upgrade, check the [Lemonade release notes](https://github.com/lemonade-sdk/lemonade/releases),
+rerun the verification commands above, and consult the bundled
+`whisper-server --help` output if the model no longer loads. Do not assume an
+argument rejected by a new backend is a tapeback failure.
+
+To return to the simpler decoder configuration without VAD or the context override:
+
+```bash
+lemonade config set 'whispercpp.args=--beam-size 4'
+lemonade unload Whisper-Large-v3
+lemonade load Whisper-Large-v3
+```
+
+The downloaded VAD file can remain in place; an unreferenced model is harmless.
+
+The full resilience path is **Lemonade → local faster-whisper on CUDA → CPU**.
+An eligible Lemonade failure switches the whole run to faster-whisper. Its
+configured default is CUDA; it selects CPU when CUDA is unavailable, has too
+little free VRAM, is thermally clamped, or fails during model loading or
+inference. See [Lemonade: the run fell back to faster-whisper](#lemonade-the-run-fell-back-to-faster-whisper)
+for the eligible and non-eligible failure cases.
 
 Tapeback owns nothing about the server: you choose where it runs, on what hardware,
 and how it is served. None of that is tapeback configuration, and `tapeback status`
@@ -242,15 +363,18 @@ Fallback, and what never falls back: when the server is unreachable, the model i
 missing or unloadable, the endpoint cannot serve timestamped segments (including
 text-only FLM-style backends — tapeback requires segment timestamps and rejects
 compact text output in full), or a request times out (a proxy/server `408 Request
-Timeout` counts as one), the run switches to
-faster-whisper for that input and caches only the accepted result. Authentication
-rejections (401/403) and locally invalid configuration (bad URL, malformed key)
+Timeout` counts as one), the whole run switches to local faster-whisper and caches
+only the accepted result. Faster-whisper prefers configured CUDA and selects CPU
+when CUDA cannot safely run, as described in the recommended setup above.
+Authentication rejections (401/403) and locally invalid configuration (bad URL, malformed key)
 do **not** fall back — retrying with another backend cannot fix them, so they fail
 loudly instead.
 
-Decoder-side knobs (`TAPEBACK_HOTWORDS`, beam size, temperature ladder, VAD) are
-faster-whisper-specific; the Lemonade backend ignores them rather than guessing at
-equivalents. `TAPEBACK_DEVICE` still applies to faster-whisper and diarization.
+Tapeback's decoder-side knobs (`TAPEBACK_HOTWORDS`, `TAPEBACK_BEAM_SIZE`, the
+temperature ladder, and `TAPEBACK_VAD_FILTER`) are faster-whisper-specific; the
+Lemonade backend ignores them rather than guessing at equivalents. Configure
+Lemonade's own decoder with `lemonade config set`, as shown above.
+`TAPEBACK_DEVICE` still applies to faster-whisper and diarization.
 
 `tapeback status` shows the configured backend, endpoint and model, and — for the
 status command only — tries the optional `/v1/health` and `/v1/system-info`
@@ -457,7 +581,7 @@ server of its choosing.
 
 | Variable | Default | Description |
 |---|---|---|
-| `TAPEBACK_TRANSCRIPTION_BACKEND` | `lemonade` | `lemonade` (default: sends WAVs to a [Lemonade Server](#lemonade-server-backend) you run yourself, with automatic fallback to faster-whisper on eligible failures) or `faster-whisper` (opt-out: built-in local model, fully local) |
+| `TAPEBACK_TRANSCRIPTION_BACKEND` | `lemonade` | First-class default: sends WAVs to a [Lemonade Server](#lemonade-server-backend) you run yourself, with automatic fallback to faster-whisper on configured CUDA and then CPU when CUDA cannot safely run. Use `faster-whisper` to opt out and transcribe fully locally |
 | `TAPEBACK_LEMONADE_URL` | `http://127.0.0.1:13305` | Lemonade Server base URL. Must be a bare URL — no embedded credentials (`user:pass@host`), query string, or fragment. Plaintext `http://` is allowed only for loopback hosts (`localhost`, `127.0.0.0/8`, `::1`); remote endpoints must use `https://` (Lemonade backend only) |
 | `TAPEBACK_LEMONADE_MODEL` | `Whisper-Large-v3` | Model identifier as the server knows it. Full v3 generally needs more resources and may take longer than Turbo; set `Whisper-Large-v3-Turbo` explicitly to choose Turbo (Lemonade backend only) |
 | `TAPEBACK_LEMONADE_API_KEY` | *(off)* | Optional bearer token; sent only in the `Authorization` header, never logged or cached (Lemonade backend only) |
@@ -700,9 +824,12 @@ Fixes, in order of reliability:
 
 ### Lemonade: the run fell back to faster-whisper
 
-With the default Lemonade backend, an eligible failure switches the
-transcription to local faster-whisper ("Lemonade transcription failed (...) — falling back to
-faster-whisper" in the status output) and the transcript is still produced. The facade
+With the first-class default Lemonade backend, an eligible failure switches the
+whole run to local faster-whisper ("Lemonade transcription failed (...) — falling back to
+faster-whisper" in the status output) and the transcript is still produced.
+Faster-whisper prefers configured CUDA, then selects CPU when CUDA is unavailable,
+has too little free VRAM, is thermally clamped, or fails during model loading or
+inference. The facade
 also latches to faster-whisper for the rest of the run — in live transcription this
 means the failed server is never asked for anything again, so one live interval can
 never mix a faster-whisper channel with a later Lemonade one. What the
