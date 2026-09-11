@@ -2,133 +2,46 @@
 
 from __future__ import annotations
 
-import struct
 import sys
 import threading
-import wave
+import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING
-
-import numpy as np
 
 from tapeback import const
 from tapeback._gpu import free_gpu_memory
 from tapeback._lazy import load_transcriber
+from tapeback._lemonade import LemonadeAuthenticationError, LemonadeConfigurationError
+from tapeback._live_chunks import BYTES_PER_SAMPLE, _ChunkTranscriber
+from tapeback._live_pcm import (  # noqa: F401 — re-export; tests import from here
+    adjust_timestamps,
+    deduplicate_overlap,
+    find_data_offset,
+    resample_48k_to_16k,
+)
+from tapeback.channel import is_channel_active
 from tapeback.formatter import format_live_markdown
-from tapeback.models import Segment, Word
+from tapeback.models import Segment
 from tapeback.settings import Settings
 from tapeback.vault import save_live_markdown
 
 if TYPE_CHECKING:
     from tapeback.transcriber import Transcriber
 
+
 # Tolerance for deduplication: segments within this many seconds are considered duplicates
-DEDUP_TOLERANCE_SEC = 0.5
+
+
+# Poll rather than joining indefinitely so a legitimate long model load,
+# download, or local fallback remains visible to the caller.
+_STOP_PROGRESS_INTERVAL_SECONDS = 10.0
+
 
 # Bytes per sample for s16le mono
-BYTES_PER_SAMPLE = 2
 
 
-def find_data_offset(path: Path) -> int:
-    """Find the byte offset where PCM data starts in a WAV file.
-
-    Scans RIFF chunks to locate the 'data' chunk. Returns the byte position
-    immediately after the data chunk header (i.e. where raw PCM bytes begin).
-
-    Falls back to the standard 44-byte offset if parsing fails.
-    """
-    try:
-        with open(path, "rb") as f:
-            riff = f.read(4)
-            if riff != b"RIFF":
-                return const.WAV_HEADER_FALLBACK
-            f.read(4)  # file size (unreliable for growing files)
-            wave_id = f.read(4)
-            if wave_id != b"WAVE":
-                return const.WAV_HEADER_FALLBACK
-            # Scan sub-chunks until we find "data"
-            while True:
-                chunk_id = f.read(const.WAV_CHUNK_HEADER_BYTES)
-                if len(chunk_id) < const.WAV_CHUNK_HEADER_BYTES:
-                    return const.WAV_HEADER_FALLBACK
-                chunk_size_bytes = f.read(const.WAV_CHUNK_HEADER_BYTES)
-                if len(chunk_size_bytes) < const.WAV_CHUNK_HEADER_BYTES:
-                    return const.WAV_HEADER_FALLBACK
-                if chunk_id == b"data":
-                    return f.tell()
-                (chunk_size,) = struct.unpack("<I", chunk_size_bytes)
-                f.seek(chunk_size, 1)
-    except OSError:
-        return const.WAV_HEADER_FALLBACK
-
-
-def resample_48k_to_16k(pcm_bytes: bytes) -> np.ndarray:
-    """Downsample raw s16le PCM from 48 kHz to 16 kHz.
-
-    Simple decimation by factor 3 (no anti-aliasing filter).
-    Adequate quality for a live preview — the final pipeline uses ffmpeg with loudnorm.
-    """
-    samples = np.frombuffer(pcm_bytes, dtype=np.int16)
-    return samples[:: const.RESAMPLE_FACTOR]
-
-
-def adjust_timestamps(segments: list[Segment], offset_seconds: float) -> list[Segment]:
-    """Shift all segment and word timestamps by offset_seconds."""
-    result: list[Segment] = []
-    for seg in segments:
-        words: list[Word] | None = None
-        if seg.words:
-            words = [
-                Word(
-                    start=w.start + offset_seconds,
-                    end=w.end + offset_seconds,
-                    word=w.word,
-                    probability=w.probability,
-                )
-                for w in seg.words
-            ]
-        result.append(
-            Segment(
-                start=seg.start + offset_seconds,
-                end=seg.end + offset_seconds,
-                text=seg.text,
-                words=words,
-                speaker=seg.speaker,
-            )
-        )
-    return result
-
-
-def deduplicate_overlap(
-    existing: list[Segment],
-    new_segments: list[Segment],
-    overlap_start: float,
-) -> list[Segment]:
-    """Remove segments from new_segments that duplicate existing ones in the overlap zone.
-
-    A new segment is considered a duplicate if its start time is within
-    DEDUP_TOLERANCE_SEC of any existing segment's start time AND it falls
-    within the overlap region (before overlap_start + tolerance).
-    """
-    if not existing or overlap_start <= 0:
-        return new_segments
-
-    existing_starts = {s.start for s in existing}
-
-    kept: list[Segment] = []
-    for seg in new_segments:
-        # Segments clearly past the overlap zone — always keep
-        if seg.start >= overlap_start + DEDUP_TOLERANCE_SEC:
-            kept.append(seg)
-            continue
-        # Check if this segment duplicates an existing one
-        is_dup = any(abs(seg.start - es) < DEDUP_TOLERANCE_SEC for es in existing_starts)
-        if not is_dup:
-            kept.append(seg)
-    return kept
-
-
-class LiveTranscriber:
+class LiveTranscriber(_ChunkTranscriber):
     """Background transcription thread that runs during recording.
 
     Periodically reads new audio from growing WAV files written by parecord,
@@ -153,6 +66,9 @@ class LiveTranscriber:
         self._mic_byte_offset = 0  # bytes of PCM data already processed
         self._monitor_byte_offset = 0
         self._segments: list[Segment] = []
+        self._active_backend_fingerprint: str | None = None
+        self._fatal_error: Exception | None = None
+        self._last_detected_language: str | None = None
 
         self._stop_event = threading.Event()
         self._thread = threading.Thread(
@@ -179,10 +95,22 @@ class LiveTranscriber:
         """Start the background transcription thread."""
         self._thread.start()
 
-    def stop(self) -> None:
-        """Stop the background thread, process final chunk, free GPU memory."""
+    def stop(self, on_status: Callable[[str], None] | None = None) -> None:
+        """Stop the background thread, process final chunk, free GPU memory.
+
+        Establishes a hard lifecycle boundary: when this returns, the worker is
+        verifiably dead — it can issue no further request and write no live note
+        afterwards. Model construction, downloads, isolated-worker startup, and
+        faster-whisper fallback are not bounded by the Lemonade HTTP timeout, so
+        legitimate work is awaited to completion and periodically reported.
+        """
         self._stop_event.set()
-        self._thread.join(timeout=120)
+        started_waiting = time.monotonic()
+        while self._thread.is_alive():
+            self._thread.join(timeout=_STOP_PROGRESS_INTERVAL_SECONDS)
+            if self._thread.is_alive() and on_status is not None:
+                elapsed = time.monotonic() - started_waiting
+                on_status(f"Still waiting for live transcription ({elapsed:.0f}s elapsed)...")
 
         # Free GPU memory so the full pipeline can use it
         if self._transcriber is not None:
@@ -190,11 +118,30 @@ class LiveTranscriber:
             self._transcriber = None
             free_gpu_memory()
 
+        if self._fatal_error is not None:
+            raise self._fatal_error
+
     def _ensure_transcriber(self) -> Transcriber:
         """Lazily create the Transcriber (loads Whisper model)."""
         if self._transcriber is None:
             self._transcriber = load_transcriber(self._settings)
+            # Match the post-recording pipeline, which reports the backend through
+            # the status callback: live transcription must disclose which backend
+            # is active — and, for Lemonade, that audio leaves this machine — the
+            # same way once, when the backend is actually loaded.
+            print(f"Live transcription backend: {self._transcriber.describe()}", file=sys.stderr)
         return self._transcriber
+
+    def _report_status(self, message: str) -> None:
+        """Status sink passed to every facade call the worker makes.
+
+        The facade reports backend transitions through it — above all the
+        fallback notice ("Lemonade transcription failed ... falling back to
+        faster-whisper"). Without a real sink those notices go to the default
+        no-op and a mid-session backend change happens in silence, exactly when
+        performance, resource use, and privacy expectations change.
+        """
+        print(message, file=sys.stderr)
 
     def _transcription_loop(self) -> None:
         """Main loop: wait for interval, then process a chunk."""
@@ -204,6 +151,15 @@ class LiveTranscriber:
         while not self._stop_event.wait(timeout=self._settings.live_interval):
             try:
                 self._process_chunk()
+            except (LemonadeAuthenticationError, LemonadeConfigurationError) as exc:
+                self._fatal_error = exc
+                import traceback  # noqa: PLC0415 — only on error
+
+                print(
+                    f"Error: Terminal live transcription error:\n{traceback.format_exc()}",
+                    file=sys.stderr,
+                )
+                break
             except Exception:
                 import traceback  # noqa: PLC0415 — only on error
 
@@ -212,21 +168,42 @@ class LiveTranscriber:
                     file=sys.stderr,
                 )
 
-        # Process final chunk on stop
-        try:
-            self._process_chunk()
-        except Exception:
-            import traceback  # noqa: PLC0415 — only on error
+        # Process final chunk on stop only if no terminal fatal error occurred
+        if self._fatal_error is None:
+            try:
+                self._process_chunk(is_final=True)
+            except (LemonadeAuthenticationError, LemonadeConfigurationError) as exc:
+                self._fatal_error = exc
+                import traceback  # noqa: PLC0415 — only on error
 
-            print(
-                f"Warning: Live transcription final chunk error:\n{traceback.format_exc()}",
-                file=sys.stderr,
-            )
+                print(
+                    "Error: Terminal live transcription final chunk error:\n"
+                    f"{traceback.format_exc()}",
+                    file=sys.stderr,
+                )
+            except Exception:
+                import traceback  # noqa: PLC0415 — only on error
 
-    def _process_chunk(self) -> None:
-        """Read new audio from both channels, transcribe, update markdown."""
-        min_bytes = int(
-            self._settings.live_min_chunk * self._settings.sample_rate * BYTES_PER_SAMPLE
+                print(
+                    f"Warning: Live transcription final chunk error:\n{traceback.format_exc()}",
+                    file=sys.stderr,
+                )
+
+    def _process_chunk(self, *, is_final: bool = False) -> None:
+        """Read new audio from both channels, transcribe, update markdown.
+
+        Both channels of one interval are transcribed as ONE backend transaction
+        (monitor first, see `_transcribe_pair`), so a Lemonade fallback triggered by
+        the second channel can never mix a Lemonade first channel with a faster-whisper
+        second channel in one interval. Byte cursors and accumulated segments are
+        committed atomically: a raise while transcribing leaves both cursors in place,
+        so the next cycle re-reads the same audio and recovers the interval instead of
+        silently dropping it.
+        """
+        min_bytes = (
+            0
+            if is_final
+            else int(self._settings.live_min_chunk * self._settings.sample_rate * BYTES_PER_SAMPLE)
         )
         overlap_bytes = int(
             self._settings.live_overlap * self._settings.sample_rate * BYTES_PER_SAMPLE
@@ -250,146 +227,116 @@ class LiveTranscriber:
         if mic_pcm is None and monitor_pcm is None:
             return
 
-        transcriber = self._ensure_transcriber()
-        new_segments: list[Segment] = []
-
-        if mic_pcm is not None:
-            mic_segs = self._transcribe_chunk(
-                transcriber, mic_pcm, self._mic_byte_offset, overlap_bytes, is_mic=True
-            )
-            new_segments.extend(mic_segs)
+        # Inspect the exact samples that would be submitted after live resampling
+        # before loading a backend or creating temporary WAVs. Even when both sides
+        # are silent, commit the cursors so the same interval is not reconsidered.
+        mic_active = mic_pcm is not None and is_channel_active(resample_48k_to_16k(mic_pcm))
+        monitor_active = monitor_pcm is not None and is_channel_active(
+            resample_48k_to_16k(monitor_pcm)
+        )
+        if not mic_active and not monitor_active:
             self._mic_byte_offset = mic_new_offset
+            self._monitor_byte_offset = monitor_new_offset
+            return
 
-        if monitor_pcm is not None:
-            monitor_segs = self._transcribe_chunk(
+        transcriber = self._ensure_transcriber()
+        mic_segments: list[Segment] = []
+        monitor_segments: list[Segment] = []
+        staging_segments = list(self._segments)
+        partial = False
+
+        if mic_pcm is not None and monitor_pcm is not None:
+            mic_segments, monitor_segments, partial = self._transcribe_pair(
+                transcriber,
+                mic_pcm,
+                monitor_pcm,
+                overlap_bytes,
+                mic_active=mic_active,
+                monitor_active=monitor_active,
+                existing_segments=staging_segments,
+            )
+        elif mic_pcm is not None:
+            mic_segments, partial = self._transcribe_chunk(
+                transcriber,
+                mic_pcm,
+                self._mic_byte_offset,
+                overlap_bytes,
+                is_mic=True,
+                existing_segments=staging_segments,
+            )
+        elif monitor_pcm is not None:
+            monitor_segments, partial = self._transcribe_chunk(
                 transcriber,
                 monitor_pcm,
                 self._monitor_byte_offset,
                 overlap_bytes,
                 is_mic=False,
+                existing_segments=staging_segments,
             )
-            new_segments.extend(monitor_segs)
-            self._monitor_byte_offset = monitor_new_offset
 
-        if new_segments:
-            self._segments.extend(new_segments)
-            self._segments.sort(key=lambda s: s.start)
-
-        self._write_live_markdown()
-
-    def _read_new_pcm(
-        self,
-        wav_path: Path,
-        byte_offset: int,
-        min_bytes: int,
-        overlap_bytes: int,
-        *,
-        is_mic: bool,
-    ) -> tuple[bytes | None, int]:
-        """Read new raw PCM bytes from a growing WAV file.
-
-        Returns (pcm_bytes_including_overlap, new_byte_offset) or (None, byte_offset)
-        if not enough new data.
-        """
-        if not wav_path.exists():
-            return None, byte_offset
-
-        # Parse data offset lazily (once per file)
-        if is_mic:
-            if self._mic_data_offset is None:
-                self._mic_data_offset = find_data_offset(wav_path)
-            data_offset = self._mic_data_offset
+        current_fp = transcriber._backend.cache_fingerprint()
+        if partial:
+            # A partial result covers only the decoded prefix of the submitted
+            # interval (interrupt semantics, see FasterWhisperBackend._collect_segments).
+            # Committing it would advance the cursors past the undecoded suffix and
+            # lose that audio forever, so commit nothing: segments, cursors and the
+            # backend fingerprint all stay as they were, and the next cycle retries
+            # the whole interval — including any backend-switch repair it triggers.
+            if is_final:
+                # There is no next cycle after the final pass, so say what happened
+                # instead of dropping the interval silently. Only the live preview's
+                # tail is affected: the post-recording pipeline transcribes the
+                # whole file.
+                self._report_status(
+                    "The final live interval was only partially decoded — its "
+                    "undecoded tail is absent from the live note. The full "
+                    "transcript produced after recording is not affected."
+                )
+            return
+        if (
+            self._active_backend_fingerprint is not None
+            and current_fp != self._active_backend_fingerprint
+            and (self._mic_byte_offset > 0 or self._monitor_byte_offset > 0)
+        ):
+            # Backend switch occurred mid-session: re-transcribe all committed audio
+            # from offset 0 with the new backend so the transcript is never mixed.
+            # Committed audio, not emitted segments, is the state boundary: a prior
+            # decoder may have returned silence for audio the fallback can recognize.
+            # Re-announce the backend first: the disclosure printed at startup
+            # described the backend that just failed, and the user must see the
+            # transition (which model, which device, audio local or not) before
+            # the re-transcription runs on it.
+            print(
+                f"Live transcription backend switched: {transcriber.describe()}",
+                file=sys.stderr,
+            )
+            updated_segments = self._retranscribe_full(
+                transcriber, mic_new_offset, monitor_new_offset
+            )
+        elif mic_segments or monitor_segments or staging_segments != self._segments:
+            updated_segments = staging_segments + mic_segments + monitor_segments
+            updated_segments.sort(key=lambda s: s.start)
         else:
-            if self._monitor_data_offset is None:
-                self._monitor_data_offset = find_data_offset(wav_path)
-            data_offset = self._monitor_data_offset
+            updated_segments = self._segments
 
-        file_size = wav_path.stat().st_size
-        available_pcm = file_size - data_offset
-        new_bytes = available_pcm - byte_offset
+        # Write markdown before committing in-memory segments and cursors, so a
+        # write failure (e.g. disk full, permission error) leaves cursors in place
+        # without duplicating segments upon retry.
+        self._write_live_markdown(updated_segments)
+        self._segments = updated_segments
+        self._active_backend_fingerprint = current_fp
 
-        if new_bytes < min_bytes:
-            return None, byte_offset
+        # Commit both cursors only once the whole interval succeeded — never between
+        # the two channels, or an error in the second would skip the first's audio
+        # forever.
+        self._mic_byte_offset = mic_new_offset
+        self._monitor_byte_offset = monitor_new_offset
 
-        # Include overlap from previous chunk
-        read_start = max(0, byte_offset - overlap_bytes)
-        read_length = available_pcm - read_start
-
-        with open(wav_path, "rb") as f:
-            f.seek(data_offset + read_start)
-            pcm_bytes = f.read(read_length)
-
-        # Ensure even number of bytes (s16le = 2 bytes per sample)
-        if len(pcm_bytes) % BYTES_PER_SAMPLE != 0:
-            pcm_bytes = pcm_bytes[: len(pcm_bytes) - (len(pcm_bytes) % BYTES_PER_SAMPLE)]
-
-        new_offset = available_pcm
-        return pcm_bytes, new_offset
-
-    def _transcribe_chunk(
-        self,
-        transcriber: Transcriber,
-        pcm_bytes: bytes,
-        byte_offset: int,
-        overlap_bytes: int,
-        *,
-        is_mic: bool,
-    ) -> list[Segment]:
-        """Resample, write temp WAV, transcribe, adjust timestamps, deduplicate."""
-        samples_16k = resample_48k_to_16k(pcm_bytes)
-        if len(samples_16k) == 0:
-            return []
-
-        # Write temp WAV for faster-whisper
-        suffix = "mic" if is_mic else "monitor"
-        chunk_path = self._mic_path.parent / f"chunk_{suffix}.wav"
-        self._write_chunk_wav(samples_16k, chunk_path)
-
-        # Transcribe
-        segments, _info = transcriber.transcribe(chunk_path)
-
-        # Clean up temp file
-        chunk_path.unlink(missing_ok=True)
-
-        # Calculate absolute time offset
-        read_start = max(0, byte_offset - overlap_bytes)
-        chunk_start_seconds = read_start / (self._settings.sample_rate * BYTES_PER_SAMPLE)
-
-        # Adjust timestamps to absolute
-        segments = adjust_timestamps(segments, chunk_start_seconds)
-
-        # Assign speaker
-        speaker = const.SPEAKER_YOU if is_mic else const.SPEAKER_OTHER
-        segments = [
-            Segment(
-                start=s.start,
-                end=s.end,
-                text=s.text,
-                words=s.words,
-                speaker=speaker,
-            )
-            for s in segments
-        ]
-
-        # Deduplicate overlap with existing segments
-        overlap_boundary = byte_offset / (self._settings.sample_rate * BYTES_PER_SAMPLE)
-        segments = deduplicate_overlap(self._segments, segments, overlap_boundary)
-
-        return segments
-
-    @staticmethod
-    def _write_chunk_wav(samples_16k: np.ndarray, path: Path) -> None:
-        """Write a valid 16 kHz mono WAV file from int16 samples."""
-        with wave.open(str(path), "wb") as wf:
-            wf.setnchannels(1)
-            wf.setsampwidth(2)  # 16-bit
-            wf.setframerate(const.SAMPLE_RATE_16K)
-            wf.writeframes(samples_16k.tobytes())
-
-    def _write_live_markdown(self) -> None:
+    def _write_live_markdown(self, segments: list[Segment] | None = None) -> None:
         """Write (or overwrite) the live markdown file in the vault."""
+        target_segments = self._segments if segments is None else segments
         markdown = format_live_markdown(
-            self._segments,
+            target_segments,
             self._session_name,
             self._settings.language,
         )

@@ -12,13 +12,16 @@ back is for the process to end.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+from tapeback import const
 from tapeback._worker import (
+    EVENT_BACKEND,
     EVENT_ERROR,
     EVENT_INFO,
     EVENT_SEGMENT,
@@ -30,6 +33,43 @@ from tapeback.settings import Settings
 
 # How long to wait for a worker to exit after we ask it to stop, before killing it.
 WORKER_SHUTDOWN_TIMEOUT_SEC = 10.0
+
+# Environment variables that must never reach the transcription worker. The JSON
+# job carries everything the worker needs, and the worker pins its own backend —
+# so ambient `TAPEBACK_*` variables could only contradict the job or leak
+# configuration into the child. Provider credentials are denied by name because
+# the worker cannot transcribe with them and must never be in a position to log,
+# dump, or forward them. The provider names are derived from the production
+# mapping (const.PROVIDER_ENV_VARS) rather than duplicated here — a new provider
+# must be denied the moment it is added, not the next time someone remembers.
+# The remaining names are credentials the worker has no summarizer mapping for
+# (transcription-side and cloud credentials) and are kept denied explicitly.
+_WORKER_DENIED_ENV_KEYS = frozenset(const.PROVIDER_ENV_VARS.values()) | {
+    "HF_TOKEN",
+    "HUGGING_FACE_HUB_TOKEN",
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AZURE_OPENAI_API_KEY",
+    # Alternative names for mapped providers, kept denied defensively.
+    "GOOGLE_API_KEY",
+    "QWEN_API_KEY",
+}
+
+
+def _worker_env() -> dict[str, str]:
+    """A scrubbed environment for the transcription worker.
+
+    Strips every `TAPEBACK_*` variable (the worker takes its settings from the
+    JSON job on stdin, and ambient values must never override or supplement
+    them) and every known provider credential. Operational variables the
+    worker legitimately needs — PATH, HOME, CUDA/NVIDIA driver variables,
+    XDG paths — are inherited unchanged.
+    """
+    return {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith("TAPEBACK_") and key not in _WORKER_DENIED_ENV_KEYS
+    }
 
 
 class WorkerFailed(RuntimeError):
@@ -49,6 +89,10 @@ def job_settings(settings: Settings) -> dict[str, Any]:
     # Load-bearing: the worker builds a Transcriber of its own, and inheriting this
     # would have it spawn another worker, and that one another, without end.
     payload["isolate_transcription"] = False
+    # The worker exists only for faster-whisper's CUDA OOM problem; the parent's
+    # backend decision is the façade's, made before any worker spawns. Pinning it
+    # keeps the child from re-reading the ambient environment.
+    payload["transcription_backend"] = "faster-whisper"
     # The parent stores the result; a child writing it too would be a second, racier
     # writer of the same file for no benefit.
     payload["resume_cache"] = False
@@ -71,7 +115,18 @@ def _to_segment(data: dict[str, Any]) -> Segment:
     )
 
 
-def transcribe_isolated(
+def _with_identity(info: dict[str, Any], resolved: dict[str, Any]) -> dict[str, Any]:
+    """Attach the worker's resolved device/compute identity, if it reported one.
+
+    The parent's fingerprint must reflect where the work actually ran, so the
+    identity rides on the info dict; `FasterWhisperBackend` adopts it and strips
+    it again before the result reaches callers or the resume cache.
+    """
+    identity = {key: resolved[key] for key in ("device", "compute_type") if key in resolved}
+    return {**info, **identity} if identity else info
+
+
+def transcribe_isolated(  # noqa: PLR0912 — one flat ladder over the worker's event protocol
     audio_path: Path,
     settings: Settings,
     *,
@@ -97,6 +152,7 @@ def transcribe_isolated(
 
     segments: list[Segment] = []
     info: dict[str, Any] = {}
+    resolved: dict[str, Any] = {}
     error: str | None = None
 
     process = subprocess.Popen(
@@ -105,6 +161,7 @@ def transcribe_isolated(
         stdout=subprocess.PIPE,
         text=True,
         bufsize=1,
+        env=_worker_env(),
     )
     stdin, stdout = process.stdin, process.stdout
     if stdin is None or stdout is None:  # pragma: no cover — both were opened as PIPEs
@@ -130,6 +187,8 @@ def transcribe_isolated(
                 on_status(event["message"])
             elif kind == EVENT_SEGMENT:
                 segments.append(_to_segment(event["data"]))
+            elif kind == EVENT_BACKEND:
+                resolved = event["data"]
             elif kind == EVENT_INFO:
                 info = event["data"]
             elif kind == EVENT_ERROR:
@@ -139,12 +198,12 @@ def transcribe_isolated(
         on_status(f"Interrupted — keeping the {len(segments)} segments the worker sent.")
         info = dict(info)
         info["partial"] = True
-        return segments, info
+        return segments, _with_identity(info, resolved)
     finally:
         _stop(process)
 
     if info:
-        return segments, info
+        return segments, _with_identity(info, resolved)
 
     # No info event means the worker never finished. Segments already received are
     # still worth keeping — this is the out-of-memory path the isolation exists for.
@@ -153,7 +212,9 @@ def transcribe_isolated(
             f"Worker stopped early ({error or f'exit code {process.returncode}'}) — "
             f"keeping the {len(segments)} segments it produced."
         )
-        return segments, {"partial": True, "language": "", "duration": 0.0}
+        return segments, _with_identity(
+            {"partial": True, "language": "", "duration": 0.0}, resolved
+        )
 
     raise WorkerFailed(error or f"transcription worker exited with code {process.returncode}")
 

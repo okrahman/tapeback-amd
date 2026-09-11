@@ -7,7 +7,7 @@ src/tapeback/
   cli.py          Click CLI (start, stop, process, summarize, status, tray)
   recorder.py     PulseAudio recording via parecord
   audio.py        ffmpeg audio processing (split channels, normalize, convert)
-  transcriber.py  faster-whisper transcription
+  transcriber.py  transcription: Lemonade (default) / faster-whisper (local fallback)
   diarizer.py     pyannote speaker diarization + spectral speaker merging
   formatter.py    Markdown generation (pure formatting, no I/O)
   vault.py        Obsidian vault file I/O

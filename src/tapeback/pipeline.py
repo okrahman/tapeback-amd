@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import fcntl
+import hashlib
+import os
 import shutil
 import tempfile
 from collections.abc import Callable
@@ -12,6 +15,7 @@ if TYPE_CHECKING:
     from tapeback.live import LiveTranscriber
 
 from tapeback import const
+from tapeback._fs import ensure_private_dir
 from tapeback._gpu import free_gpu_memory, sample_gpu
 from tapeback._lazy import load_transcriber
 from tapeback._runlog import run_log
@@ -27,6 +31,7 @@ from tapeback.channel import (
     classify_segment_by_channel,
     filter_silent_segments,
     identify_user_speaker,
+    is_channel_active,
     load_stereo_channels,
     split_on_silence,
 )
@@ -52,8 +57,17 @@ def _noop_status(msg: str) -> None:
 
 
 def _gpu_telemetry_enabled(settings: Settings) -> bool:
-    """GPU sampling is only meaningful for a run that actually asked for the GPU."""
-    return settings.gpu_telemetry and settings.device == "cuda"
+    """GPU sampling is only meaningful for a run that actually asked for the GPU.
+
+    TAPEBACK_DEVICE stays applicable to faster-whisper and diarization, but with the
+    Lemonade backend the transcription GPU is the server's business, not ours — there
+    is no local inference to sample and no accelerator tapeback should name.
+    """
+    return (
+        settings.gpu_telemetry
+        and settings.device == "cuda"
+        and settings.transcription_backend == "faster-whisper"
+    )
 
 
 def stop_and_process(
@@ -67,17 +81,27 @@ def stop_and_process(
 ) -> Path:
     """Stop recording and run the full dual-channel processing pipeline.
 
-    If a live_transcriber is active, stops it first to free GPU memory
-    before the full pipeline creates its own Whisper model.
+    Recording is finalized before live preview teardown, so a slow or failed
+    preview can never leave parecord running. If a live transcriber is active,
+    the pipeline then waits for its worker to exit and free GPU memory before
+    creating its own Whisper model.
 
     Returns path to the saved markdown file.
     """
-    if live_transcriber is not None:
-        on_status("Stopping live transcription...")
-        live_transcriber.stop()
-
     on_status("Stopping recording...")
-    monitor_path, mic_path = recorder.stop()
+    # Live-worker teardown happens in finally: whatever recorder.stop() does —
+    # including raising on a session another process already stopped — the live
+    # worker must be shut down and awaited before this function exits, or its
+    # subprocess outlives the run and final live chunks are lost.
+    try:
+        monitor_path, mic_path = recorder.stop()
+    finally:
+        if live_transcriber is not None:
+            on_status("Stopping live transcription...")
+            try:
+                live_transcriber.stop(on_status)
+            except Exception as exc:
+                on_status(f"Warning: Live transcription stopped with error: {exc}")
 
     session_name = monitor_path.parent.name
 
@@ -103,7 +127,10 @@ def stop_and_process(
                     session_name=session_name,
                     audio_rel_path=audio_rel_path,
                     duration_seconds=float(info.get("duration", 0.0)),
-                    language=str(info.get("language", settings.language)),
+                    # `or` (not a default argument) so an empty language — what an
+                    # auto-detection run with zero segments reports — falls back to
+                    # the configured language instead of persisting an empty field.
+                    language=str(info.get("language") or settings.language),
                     partial=bool(info.get("partial")),
                 ),
                 raw_segments=raw_segments,
@@ -123,6 +150,29 @@ def stop_and_process(
     return md_path
 
 
+def _acquire_staging_lock(tmp_dir: Path) -> int:
+    """Lock the staging dir against concurrent jobs on the same source identity.
+
+    Two processes handling the same input would otherwise share the fixed
+    filenames inside the directory and delete it under each other. The lock is
+    advisory-but-exclusive across tapeback processes: a second job fails fast
+    with a clear message instead of corrupting the first one's artifacts. The
+    OS releases the flock if a process dies, so a crashed run never wedges the
+    directory. Returns the lock fd; the caller must close it (releasing the
+    lock).
+    """
+    lock_fd = os.open(tmp_dir / "proc.lock", os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(lock_fd)
+        raise RuntimeError(
+            "Another tapeback process is already working on this recording; "
+            "wait for it to finish and try again."
+        ) from None
+    return lock_fd
+
+
 def process_file(
     audio_path: Path,
     settings: Settings,
@@ -137,7 +187,23 @@ def process_file(
         name = audio_path.stem
     validate_session_name(name)
 
-    tmp_dir = Path(tempfile.mkdtemp(prefix="tapeback_"))
+    # Stable staging directory per input audio identity, so resume cache keys
+    # (which hash the converted files' paths) remain stable across runs. The
+    # predictability is an attacker-facing property, so the directory is
+    # verified (owner, real dir, 0700) rather than blindly accepted, and an
+    # inter-process lock keeps two jobs on the same source identity from
+    # interleaving writes into the shared fixed filenames.
+    try:
+        stat = audio_path.stat()
+        ident = f"{audio_path.resolve()}:{stat.st_size}:{stat.st_mtime_ns}"
+    except OSError:
+        ident = str(audio_path.resolve())
+    staging_hash = hashlib.sha256(ident.encode()).hexdigest()[:16]
+    staging_root = Path(tempfile.gettempdir()) / "tapeback"
+    ensure_private_dir(staging_root)
+    tmp_dir = staging_root / f"proc_{staging_hash}"
+    ensure_private_dir(tmp_dir)
+    lock_fd = _acquire_staging_lock(tmp_dir)
 
     try:
         with run_log(name, settings, on_status) as report:
@@ -162,7 +228,9 @@ def process_file(
                     session_name=name,
                     audio_rel_path=audio_rel_path,
                     duration_seconds=float(info.get("duration", 0.0)),
-                    language=str(info.get("language", settings.language)),
+                    # Same `or` rule as the stereo path above: an empty language
+                    # must fall back to the configured language, never persist "".
+                    language=str(info.get("language") or settings.language),
                     partial=bool(info.get("partial")),
                 ),
                 raw_segments=raw_segments,
@@ -175,7 +243,7 @@ def process_file(
                 _maybe_summarize(md_path, settings, report)
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
-
+        os.close(lock_fd)
     return md_path
 
 
@@ -204,6 +272,12 @@ def process_stereo_file(
     with stage_timer("load channels", on_status):
         mic_raw, monitor_raw, raw_sr = load_stereo_channels(stereo_path)
 
+    # Exact digital silence is the only pre-transcription activity rule. Keep this
+    # separate from the RMS-based post-transcription filters below so quiet speech is
+    # still sent to the backend.
+    mic_active = True if mic_raw is None else is_channel_active(mic_raw)
+    monitor_active = True if monitor_raw is None else is_channel_active(monitor_raw)
+
     on_status("Splitting channels...")
     with stage_timer("split", on_status):
         mic_16k, monitor_16k = split_channels_16k(stereo_path, output_dir)
@@ -211,7 +285,12 @@ def process_stereo_file(
     if settings.gate_mic_silence:
         # Silence the mic where the user only listens, so Whisper doesn't loop on it.
         with stage_timer("gate mic", on_status):
-            gate_wav_inactive(mic_16k, mic_raw, monitor_raw, raw_sr)
+            gated_mic_active = gate_wav_inactive(mic_16k, mic_raw, monitor_raw, raw_sr)
+            # Keep compatibility with callers that replace the old side-effect-only
+            # helper in tests or integrations; the production helper always returns
+            # a bool based on its post-gating PCM.
+            if gated_mic_active is not None:
+                mic_active = bool(gated_mic_active)
 
     on_status("Transcribing (this may take a few minutes)...")
     with stage_timer("load model", on_status):
@@ -220,7 +299,11 @@ def process_stereo_file(
     try:
         with sample_gpu(on_status, enabled=_gpu_telemetry_enabled(settings)):
             mic_segments, monitor_segments, info = transcriber.transcribe_stereo(
-                mic_16k, monitor_16k, on_status=on_status
+                mic_16k,
+                monitor_16k,
+                on_status=on_status,
+                mic_active=mic_active,
+                monitor_active=monitor_active,
             )
     finally:
         # Release VRAM even when the stage raised, so a failure here does not starve

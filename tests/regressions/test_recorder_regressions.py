@@ -2,10 +2,14 @@
 
 import json
 import os
+import stat
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
+import tapeback.pipeline as pipeline_mod
+import tapeback.recorder as recorder_mod
 from tapeback.recorder import detect_devices
 from tests.fixtures import create_session_file
 
@@ -44,6 +48,51 @@ def test_stop_without_start_raises(recorder):
         recorder.stop()
 
 
+def test_stop_refuses_a_planted_session_symlink(recorder, session_file, tmp_path):
+    """stop() must refuse to read session.json through a planted symlink.
+
+    Bug: the read side of session.json followed planted symlinks even though the
+    write side refuses them (os.replace never follows, refuse_symlink_target is
+    called before the write). A symlink followed on read could crash stop() with
+    an unrelated OSError mid-teardown — or worse, read from an attacker-chosen
+    target.
+    """
+    victim = tmp_path / "victim.json"
+    victim.write_text("{}")
+    session_file.unlink(missing_ok=True)
+    session_file.symlink_to(victim)
+
+    with pytest.raises(RuntimeError, match="Refusing"):
+        recorder.stop()
+
+    assert victim.read_text() == "{}"
+
+
+def test_is_recording_refuses_a_planted_session_symlink(recorder, session_file, tmp_path):
+    """is_recording() must refuse a planted session.json symlink, not follow it."""
+    victim = tmp_path / "victim.json"
+    victim.write_text("{}")
+    session_file.unlink(missing_ok=True)
+    session_file.symlink_to(victim)
+
+    with pytest.raises(RuntimeError, match="Refusing"):
+        recorder.is_recording()
+
+    assert victim.read_text() == "{}"
+
+
+def test_is_recording_treats_unreadable_session_file_as_not_recording(recorder, session_file):
+    """An unreadable-but-regular session file is 'not recording', not a crash.
+
+    Same contract as the existing corrupt-JSON handling: is_recording() returns
+    False so a status command stays usable.
+    """
+    session_file.write_text("{}")
+    session_file.chmod(0o000)
+
+    assert recorder.is_recording() is False
+
+
 def test_start_while_recording_raises(recorder, settings, session_file):
     """start() while already recording should raise RuntimeError.
 
@@ -70,3 +119,180 @@ def test_parecord_not_found(recorder, settings):
         pytest.raises(RuntimeError, match="parecord not found"),
     ):
         recorder.start(settings)
+
+
+def _patch_parecord(monkeypatch, tmp_path):
+    """Stub device detection and parecord so start() never spawns anything."""
+    monkeypatch.setattr(recorder_mod.shutil, "which", lambda name: "/usr/bin/parecord")
+    monkeypatch.setattr(recorder_mod, "detect_devices", lambda settings: ("mon", "mic"))
+    proc = MagicMock()
+    proc.pid = 4242
+    monkeypatch.setattr(recorder_mod.subprocess, "Popen", lambda *a, **kw: proc)
+
+
+def test_start_repairs_permissive_session_dir(recorder, settings, tmp_path, monkeypatch):
+    """A pre-created 0777 session directory must be repaired to 0700, not accepted.
+
+    Bug: mkdir(mode=0o700, exist_ok=True) silently accepted a pre-existing
+    permissive directory, exposing the recording WAVs.
+    """
+    monkeypatch.setattr(recorder_mod.const, "TEMP_DIR", str(tmp_path / "tapeback"))
+    _patch_parecord(monkeypatch, tmp_path)
+    session_dir = tmp_path / "tapeback" / "repair_session"
+    session_dir.mkdir(parents=True, mode=0o777)
+    os.chmod(session_dir, 0o777)  # noqa: S103 — deliberately permissive: reproduces the attack
+
+    name = recorder.start(settings, session_name="repair_session")
+
+    assert name == "repair_session"
+    assert stat.S_IMODE(session_dir.stat().st_mode) == 0o700
+
+
+def test_start_refuses_symlinked_recording_path(recorder, settings, tmp_path, monkeypatch):
+    """parecord must not write through a planted symlink at the fixed WAV path."""
+    monkeypatch.setattr(recorder_mod.const, "TEMP_DIR", str(tmp_path / "tapeback"))
+    _patch_parecord(monkeypatch, tmp_path)
+    sentinel = tmp_path / "victim.txt"
+    sentinel.write_text("do not touch")
+    session_dir = tmp_path / "tapeback" / "symlink_session"
+    session_dir.mkdir(parents=True)
+    os.symlink(sentinel, session_dir / "mic.wav")
+
+    with pytest.raises(RuntimeError, match="symlink"):
+        recorder.start(settings, session_name="symlink_session")
+
+    assert sentinel.read_text() == "do not touch"
+
+
+def test_start_replaces_planted_fifo_at_recording_path(recorder, settings, tmp_path, monkeypatch):
+    """A planted FIFO must never become the microphone's write target.
+
+    Bug: refuse_symlink_target accepted every non-symlink inode. In the
+    permissive-directory scenario the 0700 repair targets, an attacker who
+    planted mic.wav as a FIFO and opened it before the chmod kept a live
+    descriptor that parecord would stream microphone audio into.
+    """
+    monkeypatch.setattr(recorder_mod.const, "TEMP_DIR", str(tmp_path / "tapeback"))
+    _patch_parecord(monkeypatch, tmp_path)
+    session_dir = tmp_path / "tapeback" / "fifo_session"
+    session_dir.mkdir(parents=True, mode=0o777)
+    os.chmod(session_dir, 0o777)  # noqa: S103 — deliberately permissive: reproduces the attack
+    os.mkfifo(session_dir / "mic.wav")
+
+    name = recorder.start(settings, session_name="fifo_session")
+
+    assert name == "fifo_session"
+    mic_path = session_dir / "mic.wav"
+    mic_stat = os.lstat(mic_path)
+    assert stat.S_ISREG(mic_stat.st_mode)
+    assert stat.S_IMODE(mic_stat.st_mode) == 0o600
+
+
+def test_start_replaces_attacker_readable_recording_file(recorder, settings, tmp_path, monkeypatch):
+    """A planted regular file must be replaced, not written into.
+
+    An attacker who created a permissive regular file at the predictable path
+    before the directory was secured holds an open descriptor on that inode;
+    recording data must go to a fresh inode the attacker cannot read.
+    """
+    monkeypatch.setattr(recorder_mod.const, "TEMP_DIR", str(tmp_path / "tapeback"))
+    _patch_parecord(monkeypatch, tmp_path)
+    session_dir = tmp_path / "tapeback" / "stale_session"
+    session_dir.mkdir(parents=True, mode=0o777)
+    os.chmod(session_dir, 0o777)  # noqa: S103 — deliberately permissive: reproduces the attack
+    mic_path = session_dir / "mic.wav"
+    mic_path.write_text("attacker-controlled")
+    os.chmod(mic_path, 0o666)  # noqa: S103
+    old_inode = os.lstat(mic_path).st_ino
+
+    recorder.start(settings, session_name="stale_session")
+
+    new_stat = os.lstat(mic_path)
+    assert stat.S_ISREG(new_stat.st_mode)
+    assert new_stat.st_ino != old_inode
+    assert stat.S_IMODE(new_stat.st_mode) == 0o600
+    assert mic_path.read_bytes() == b""
+
+
+def test_stop_is_idempotent_when_another_process_stopped_the_session(
+    recorder, settings, tmp_path, monkeypatch
+):
+    """'tapeback stop' deletes session.json in a second process; the original
+    'tapeback start' process wakes and stops its own Recorder — it must get the
+    recorded paths back.
+
+    Bug: stop() raised "No recording in progress." there, which aborted
+    live-worker teardown and final processing for a completely normal stop flow.
+    """
+    monkeypatch.setattr(recorder_mod.const, "TEMP_DIR", str(tmp_path / "tapeback"))
+    _patch_parecord(monkeypatch, tmp_path)
+
+    recorder.start(settings, session_name="two_process_session")
+    session_path = recorder.session_file
+    assert session_path.exists()
+    session = json.loads(session_path.read_text())
+    monitor_path = Path(session["monitor_path"])
+    mic_path = Path(session["mic_path"])
+    assert monitor_path.exists() and mic_path.exists()
+
+    session_path.unlink()  # the other process stopped the session
+
+    assert recorder.stop() == (monitor_path, mic_path)
+
+
+def test_stop_and_process_stops_live_worker_even_when_recorder_stop_raises(settings, monkeypatch):
+    """Live-worker teardown must run in finally, whatever recorder.stop() does.
+
+    Bug: recorder.stop() was called before live teardown without try/finally, so
+    a stop() exception skipped live_transcriber.stop() entirely and the worker
+    was terminated abruptly with its final chunks lost.
+    """
+    recorder = MagicMock()
+    recorder.stop.side_effect = RuntimeError("No recording in progress.")
+    live_transcriber = MagicMock()
+
+    with pytest.raises(RuntimeError, match="No recording in progress"):
+        pipeline_mod.stop_and_process(
+            recorder,
+            settings,
+            live_transcriber=live_transcriber,
+            do_summarize=False,
+        )
+
+    live_transcriber.stop.assert_called_once()
+
+
+def test_two_process_start_stop_lifecycle_still_produces_the_note(
+    recorder, settings, tmp_path, monkeypatch
+):
+    """The documented two-process flow: 'tapeback stop' removes the active
+    session while the original 'tapeback start' process wakes in
+    stop_and_process(). The live worker must still be stopped and the final
+    note/transcript produced.
+    """
+    monkeypatch.setattr(recorder_mod.const, "TEMP_DIR", str(tmp_path / "tapeback"))
+    _patch_parecord(monkeypatch, tmp_path)
+
+    recorder.start(settings, session_name="lifecycle_session")
+    live_transcriber = MagicMock()
+    session_path = recorder.session_file
+    session_path.unlink()  # 'tapeback stop' ran in another process
+
+    monkeypatch.setattr(pipeline_mod, "merge_channels", lambda m, mi, out: out / "stereo.wav")
+    monkeypatch.setattr(pipeline_mod, "save_audio_to_vault", lambda p, s, n: tmp_path / f"{n}.wav")
+    monkeypatch.setattr(
+        pipeline_mod,
+        "process_stereo_file",
+        lambda p, out, s, diarize, on_status: ([], {"duration": 1.0}, []),
+    )
+
+    md_path = pipeline_mod.stop_and_process(
+        recorder,
+        settings,
+        live_transcriber=live_transcriber,
+        diarize=False,
+        do_summarize=False,
+    )
+
+    assert md_path.exists()
+    live_transcriber.stop.assert_called_once()

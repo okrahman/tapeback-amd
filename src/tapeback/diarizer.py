@@ -251,17 +251,25 @@ def _resegment_by_words(
         speaker = word_speakers[group_start][0]
         text = "".join(w.word for w in group_words).strip()
         if text:
-            result.append(
-                (
-                    Segment(
-                        start=group_words[0].start,
-                        end=group_words[-1].end,
-                        text=text,
-                        words=group_words,
-                    ),
-                    speaker,
+            # Defensive: clamp rebuilt boundaries to the parent segment. Word
+            # timestamps are validated to the chunk when they enter the pipeline,
+            # but a resume cache written by an older version may carry words
+            # outside their segment — their boundaries must never leak past the
+            # segment they belong to.
+            start = max(group_words[0].start, segment.start)
+            end = min(group_words[-1].end, segment.end)
+            if end > start:
+                result.append(
+                    (
+                        Segment(
+                            start=start,
+                            end=end,
+                            text=text,
+                            words=group_words,
+                        ),
+                        speaker,
+                    )
                 )
-            )
         group_start = i
 
     return result if result else [(segment, None)]

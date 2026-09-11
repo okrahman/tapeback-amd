@@ -6,7 +6,10 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from tapeback import _resume
+from tapeback import audio as audio_mod
+from tapeback import pipeline as pipeline_mod
 from tapeback.models import Segment, Word
+from tapeback.settings import Settings
 from tapeback.transcriber import Transcriber
 
 
@@ -40,26 +43,36 @@ def _whisper_segment(start: float, end: float, text: str):
 
 
 def test_key_changes_when_the_audio_changes(cached_settings, audio, tmp_path):
-    first = _resume.resume_key(audio, cached_settings, "transcribe monitor")
+    fingerprint = _resume.settings_fingerprint(cached_settings)
+    first = _resume.resume_key(audio, fingerprint, "transcribe monitor")
     audio.write_bytes(b"different content, different size")
-    second = _resume.resume_key(audio, cached_settings, "transcribe monitor")
+    second = _resume.resume_key(audio, fingerprint, "transcribe monitor")
     assert first is not None
     assert first != second
 
 
 def test_key_changes_per_channel(cached_settings, audio):
-    assert _resume.resume_key(audio, cached_settings, "transcribe mic") != _resume.resume_key(
-        audio, cached_settings, "transcribe monitor"
+    fingerprint = _resume.settings_fingerprint(cached_settings)
+    assert _resume.resume_key(audio, fingerprint, "transcribe mic") != _resume.resume_key(
+        audio, fingerprint, "transcribe monitor"
     )
 
 
 @pytest.mark.parametrize(
     "field",
-    ["whisper_model", "compute_type", "beam_size", "chunk_length", "hotwords", "language"],
+    [
+        "whisper_model",
+        "compute_type",
+        "beam_size",
+        "chunk_length",
+        "hotwords",
+        "language",
+        "gate_mic_silence",
+    ],
 )
 def test_key_changes_when_an_output_affecting_setting_changes(cached_settings, audio, field):
     """A cached channel is only reusable if it would be produced the same way."""
-    base = _resume.resume_key(audio, cached_settings, "transcribe")
+    base = _resume.resume_key(audio, _resume.settings_fingerprint(cached_settings), "transcribe")
     changed = {
         "whisper_model": "tiny",
         "compute_type": "float32",
@@ -67,17 +80,74 @@ def test_key_changes_when_an_output_affecting_setting_changes(cached_settings, a
         "chunk_length": 7,
         "hotwords": "different, glossary",
         "language": "de",
+        "gate_mic_silence": False,
     }[field]
     other = cached_settings.model_copy(update={field: changed})
-    assert base != _resume.resume_key(audio, other, "transcribe")
+    assert base != _resume.resume_key(audio, _resume.settings_fingerprint(other), "transcribe")
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "min_free_vram_mib",
+        "thermal_clamp_check",
+        "thermal_clamp_wait",
+        "thermal_clamp_cpu_fallback",
+    ],
+)
+def test_key_changes_when_a_device_resolution_setting_changes(cached_settings, audio, field):
+    """Device-resolution settings decide CPU vs CUDA and belong in the identity.
+
+    Regression: these settings participate in actual device resolution in
+    _fw_backend._resolve_device but were missing from the fingerprint, so a run
+    that changed only a threshold/clamp control reused a transcript produced on
+    the previous device path.
+    """
+    changed = {
+        "min_free_vram_mib": 99999,
+        "thermal_clamp_wait": 5.0,
+    }.get(field)
+    if changed is None:
+        # Booleans flip from whatever the suite's env isolation preset: the
+        # conftest disables the clamp check to keep tests off the real GPU.
+        changed = not getattr(cached_settings, field)
+    base = _resume.resume_key(audio, _resume.settings_fingerprint(cached_settings), "transcribe")
+    other = cached_settings.model_copy(update={field: changed})
+    assert base != _resume.resume_key(audio, _resume.settings_fingerprint(other), "transcribe")
+
+
+def test_threshold_only_change_does_not_serve_the_stale_cache(cached_settings, audio):
+    """A threshold/clamp-only change must execute, not return the old transcript.
+
+    Regression: the resume key was computed from the requested device/compute
+    type only, so changing min_free_vram_mib (which can flip the resolved device)
+    left the key unchanged and the second run was served the first run's output
+    without ever running the requested backend path.
+    """
+    with patch("tapeback._fw_backend.WhisperModel") as mock_model_cls:
+        instance = mock_model_cls.return_value
+        instance.transcribe.return_value = (
+            iter([_whisper_segment(0.0, 5.0, "готово")]),
+            _info(),
+        )
+        Transcriber(cached_settings).transcribe(audio, stage="transcribe monitor")
+
+        instance.transcribe.reset_mock()
+        other = cached_settings.model_copy(update={"min_free_vram_mib": 99999})
+        Transcriber(other).transcribe(audio, stage="transcribe monitor")
+
+    # The second run executed the requested backend instead of reusing the cache.
+    instance.transcribe.assert_called_once()
 
 
 def test_key_is_none_for_missing_audio(cached_settings, tmp_path):
-    assert _resume.resume_key(tmp_path / "gone.wav", cached_settings, "transcribe") is None
+    fingerprint = _resume.settings_fingerprint(cached_settings)
+    missing = tmp_path / "gone.wav"
+    assert _resume.resume_key(missing, fingerprint, "transcribe") is None
 
 
 def test_round_trip_preserves_segments_and_words(cached_settings, audio, tmp_path):
-    key = _resume.resume_key(audio, cached_settings, "transcribe")
+    key = _resume.resume_key(audio, _resume.settings_fingerprint(cached_settings), "transcribe")
     assert key is not None
     directory = tmp_path / "resume"
     segments = [
@@ -103,7 +173,7 @@ def test_round_trip_preserves_segments_and_words(cached_settings, audio, tmp_pat
 
 def test_corrupt_entry_is_ignored(cached_settings, audio, tmp_path):
     """A half-written cache file must cost a redo, not a failed run."""
-    key = _resume.resume_key(audio, cached_settings, "transcribe")
+    key = _resume.resume_key(audio, _resume.settings_fingerprint(cached_settings), "transcribe")
     assert key is not None
     directory = tmp_path / "resume"
     directory.mkdir()
@@ -115,7 +185,7 @@ def test_corrupt_entry_is_ignored(cached_settings, audio, tmp_path):
 def test_second_run_reuses_the_first(cached_settings, audio):
     """The point: an interrupted run must not redo a channel it already finished."""
     messages: list[str] = []
-    with patch("tapeback.transcriber.WhisperModel") as mock_model_cls:
+    with patch("tapeback._fw_backend.WhisperModel") as mock_model_cls:
         instance = mock_model_cls.return_value
         instance.transcribe.return_value = (
             iter([_whisper_segment(0.0, 5.0, "готово")]),
@@ -141,7 +211,7 @@ def test_partial_results_are_not_cached(cached_settings, audio, tmp_path):
         yield _whisper_segment(0.0, 5.0, "начало")
         raise KeyboardInterrupt
 
-    with patch("tapeback.transcriber.WhisperModel") as mock_model_cls:
+    with patch("tapeback._fw_backend.WhisperModel") as mock_model_cls:
         instance = mock_model_cls.return_value
         instance.transcribe.return_value = (_interrupting(), _info())
         segments, info = Transcriber(cached_settings).transcribe(audio, stage="transcribe")
@@ -155,7 +225,7 @@ def test_cache_can_be_disabled(settings, audio, tmp_path):
     s = settings.model_copy(
         update={"device": "cpu", "resume_cache": False, "resume_cache_dir": tmp_path / "resume"}
     )
-    with patch("tapeback.transcriber.WhisperModel") as mock_model_cls:
+    with patch("tapeback._fw_backend.WhisperModel") as mock_model_cls:
         instance = mock_model_cls.return_value
         instance.transcribe.return_value = (iter([_whisper_segment(0.0, 5.0, "x")]), _info())
         Transcriber(s).transcribe(audio)
@@ -181,3 +251,174 @@ def test_prune_keeps_the_newest(tmp_path):
 def test_default_dir_honours_xdg(monkeypatch, tmp_path):
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
     assert _resume.default_resume_dir() == tmp_path / "xdg" / "tapeback" / "resume"
+
+
+def test_process_file_deterministic_staging_preserves_resume_keys(tmp_path, monkeypatch):
+    """process_file creates deterministic staging dirs and preserves mtimes for resume cache."""
+    settings = Settings(
+        vault_path=tmp_path / "vault",
+        resume_cache=True,
+        resume_cache_dir=tmp_path / "resume",
+        device="cpu",
+    )
+    fake_wav = tmp_path / "meeting.wav"
+    wav_header = (
+        b"RIFF\x24\x00\x00\x00WAVEfmt \x10\x00\x00\x00\x01\x00\x02\x00"
+        b"\x80>\x00\x00\x00}\x00\x00\x04\x00\x10\x00data\x00\x00\x00\x00"
+    )
+    fake_wav.write_bytes(wav_header)
+
+    split_keys_1: list[str] = []
+
+    def mock_transcribe_stereo_1(mic_16k, mon_16k, **kwargs):
+        k_mon = _resume.resume_key(mon_16k, "test_fp", "transcribe monitor")
+        k_mic = _resume.resume_key(mic_16k, "test_fp", "transcribe mic")
+        assert k_mon is not None and k_mic is not None
+        split_keys_1.extend([k_mon.digest, k_mic.digest])
+        return [], [], {"duration": 1.0}
+
+    monkeypatch.setattr(pipeline_mod, "load_stereo_channels", lambda p: (None, None, 16000))
+    monkeypatch.setattr(
+        audio_mod,
+        "split_channels_16k",
+        lambda p, out: (out / "mic_16k.wav", out / "monitor_16k.wav"),
+    )
+
+    def mock_split(stereo_wav, output_dir):
+        m = output_dir / "mic_16k.wav"
+        mo = output_dir / "monitor_16k.wav"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        m.write_bytes(b"mic audio")
+        mo.write_bytes(b"mon audio")
+        st = stereo_wav.stat()
+        os.utime(m, (st.st_atime, st.st_mtime))
+        os.utime(mo, (st.st_atime, st.st_mtime))
+        return m, mo
+
+    monkeypatch.setattr(pipeline_mod, "split_channels_16k", mock_split)
+    monkeypatch.setattr(pipeline_mod, "gate_wav_inactive", lambda *args: True)
+    monkeypatch.setattr(pipeline_mod, "split_on_silence", lambda segs, *args, **kw: segs)
+    monkeypatch.setattr(pipeline_mod, "filter_silent_segments", lambda segs, *args, **kw: segs)
+    monkeypatch.setattr(pipeline_mod, "diarization_available", lambda: False)
+    monkeypatch.setattr(pipeline_mod, "is_stereo", lambda p: True)
+
+    mock_transcriber = MagicMock()
+    mock_transcriber.describe.return_value = "mock_backend"
+    mock_transcriber.transcribe_stereo.side_effect = mock_transcribe_stereo_1
+    monkeypatch.setattr(pipeline_mod, "load_transcriber", lambda s: mock_transcriber)
+
+    pipeline_mod.process_file(
+        fake_wav, settings, name="test_session", diarize=False, do_summarize=False
+    )
+
+    # Second run on the same file should produce identical resume keys
+    split_keys_2: list[str] = []
+
+    def mock_transcribe_stereo_2(mic_16k, mon_16k, **kwargs):
+        k_mon = _resume.resume_key(mon_16k, "test_fp", "transcribe monitor")
+        k_mic = _resume.resume_key(mic_16k, "test_fp", "transcribe mic")
+        assert k_mon is not None and k_mic is not None
+        split_keys_2.extend([k_mon.digest, k_mic.digest])
+        return [], [], {"duration": 1.0}
+
+    mock_transcriber.transcribe_stereo.side_effect = mock_transcribe_stereo_2
+    pipeline_mod.process_file(
+        fake_wav, settings, name="test_session", diarize=False, do_summarize=False
+    )
+
+    assert len(split_keys_1) == 2
+    assert split_keys_1 == split_keys_2
+
+
+def test_load_handles_recursion_error(tmp_path, monkeypatch):
+    """Corrupt or deeply nested JSON in the resume cache that raises RecursionError returns None."""
+    key = _resume.ResumeKey("a" * 32)
+    entry = tmp_path / key.filename
+    entry.write_text("{}")
+
+    def _raise_recursion(*args, **kwargs):
+        raise RecursionError("maximum recursion depth exceeded")
+
+    monkeypatch.setattr("tapeback._resume.json.loads", _raise_recursion)
+    assert _resume.load(key, tmp_path) is None
+
+
+_MALFORMED_PAYLOADS = [
+    # The shapes that motivated full schema validation: parseable JSON that the
+    # old key-presence-only loader accepted and later crashed on.
+    '{"segments": [], "info": []}',  # info is not an object
+    '{"segments": {}, "info": {}}',  # segments is not an array
+    '[{"segments": [], "info": {}}]',  # payload is not an object
+    '{"info": {}}',  # segments key missing
+    '{"segments": [{"end": 1.0, "text": "x"}], "info": {}}',  # segment start missing
+    '{"segments": [{"start": "0", "end": 1.0, "text": "x"}], "info": {}}',  # start not a number
+    '{"segments": [{"start": true, "end": 1.0, "text": "x"}], "info": {}}',  # bool is not a number
+    '{"segments": [{"start": NaN, "end": 1.0, "text": "x"}], "info": {}}',  # NaN start
+    '{"segments": [{"start": 0.0, "end": Infinity, "text": "x"}], "info": {}}',  # infinite end
+    '{"segments": [{"start": 2.0, "end": 1.0, "text": "x"}], "info": {}}',  # start after end
+    '{"segments": [{"start": 0.0, "end": 1.0, "text": 5}], "info": {}}',  # text not a string
+    '{"segments": [{"start": 0.0, "end": 1.0, "text": "x", "speaker": 3}], "info": {}}',
+    '{"segments": [{"start": 0.0, "end": 1.0, "text": "x", "words": "no"}], "info": {}}',
+    '{"segments": [{"start": 0.0, "end": 1.0, "text": "x", "words": [1]}], "info": {}}',
+    '{"segments": [{"start": 0.0, "end": 1.0, "text": "x", "words": [{"start": 1.0, "end": 0.5, "word": "w", "probability": 0.9}]}], "info": {}}',  # noqa: E501 — word start after end
+    '{"segments": [{"start": 0.0, "end": 1.0, "text": "x", "words": [{"start": 0.0, "end": 0.5, "word": "w", "probability": "hi"}]}], "info": {}}',  # noqa: E501 — word probability not a number
+]
+
+
+@pytest.mark.parametrize("payload", _MALFORMED_PAYLOADS)
+def test_malformed_but_valid_json_entry_is_a_cache_miss(cached_settings, audio, tmp_path, payload):
+    """A parseable but off-schema entry is a cache miss, never a crashed run.
+
+    load() promises "never raises on bad cache data". The old loader only relied
+    on KeyError/TypeError, so a syntactically valid entry like
+    {"segments": [], "info": []} loaded fine and later raised AttributeError in
+    transcribe_stereo() — wedging every rerun for that audio/key.
+    """
+    key = _resume.resume_key(audio, "test_fp", "test_stage")
+    assert key is not None
+    r_dir = _resume.resume_dir(cached_settings)
+    r_dir.mkdir(parents=True, exist_ok=True)
+    (r_dir / key.filename).write_text(payload)
+    assert _resume.load(key, r_dir) is None
+
+
+def test_partial_segment_word_round_trip_survives_validation(cached_settings, audio):
+    """The validator accepts exactly what store() writes — including speaker/words."""
+    key = _resume.resume_key(audio, "test_fp", "test_stage")
+    assert key is not None
+    r_dir = _resume.resume_dir(cached_settings)
+    segments = [
+        Segment(
+            start=0.5,
+            end=2.5,
+            text="hello",
+            speaker="SPEAKER_00",
+            words=[Word(start=0.5, end=1.0, word="hello", probability=0.9)],
+        ),
+        Segment(start=3.0, end=4.0, text="no words"),
+    ]
+    info = {"duration": 4.0, "language": "en", "partial": False}
+    assert _resume.store(key, r_dir, segments, info) is not None
+    loaded = _resume.load(key, r_dir)
+    assert loaded is not None
+    loaded_segments, loaded_info = loaded
+    assert loaded_segments == segments
+    assert loaded_info == info
+
+
+def test_complete_silent_channel_is_cached(cached_settings, audio):
+    """A completely silent channel with empty segments is stored and reloaded from cache."""
+    key = _resume.resume_key(audio, "test_fp", "test_stage")
+    assert key is not None
+    r_dir = _resume.resume_dir(cached_settings)
+
+    transcriber = Transcriber(cached_settings)
+    info = {"duration": 5.0, "language": "en", "partial": False}
+    transcriber._store_resume(key, [], info)
+
+    loaded = _resume.load(key, r_dir)
+    assert loaded is not None
+    loaded_segs, loaded_info = loaded
+    assert loaded_segs == []
+    assert loaded_info["duration"] == 5.0
+    assert loaded_info["language"] == "en"

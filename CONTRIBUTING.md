@@ -1,7 +1,8 @@
 # Contributing
 
 Thanks for taking the time. tapeback records meeting audio on Linux, transcribes it
-locally with faster-whisper, and writes markdown to an Obsidian vault.
+through a Lemonade Server by default (with a local faster-whisper fallback), and
+writes markdown to an Obsidian vault.
 
 ## Setup
 

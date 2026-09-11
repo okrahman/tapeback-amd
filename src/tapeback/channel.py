@@ -9,6 +9,16 @@ from tapeback import const
 from tapeback.models import DiarizationSegment, Segment
 
 
+def is_channel_active(samples: np.ndarray) -> bool:
+    """Return whether PCM samples contain any nonzero value.
+
+    This is deliberately an exact digital-silence check. A single nonzero sample
+    (including a very quiet sample with amplitude 1) keeps the channel active; RMS
+    thresholds belong to the separate post-transcription quality filters.
+    """
+    return bool(np.any(samples != 0))
+
+
 def _rms_for_range(
     start: float,
     end: float,
@@ -197,16 +207,6 @@ def _build_sub_segments(seg: Segment, split_points: list[float]) -> list[Segment
                     speaker=seg.speaker,
                 )
             )
-        elif sub_end - sub_start >= const.MIN_SUB_SEGMENT_DURATION_SEC:
-            result.append(
-                Segment(
-                    start=sub_start,
-                    end=sub_end,
-                    text=seg.text,
-                    words=None,
-                    speaker=seg.speaker,
-                )
-            )
 
     return result
 
@@ -232,6 +232,12 @@ def split_on_silence(
     result: list[Segment] = []
 
     for seg in segments:
+        # Without lexical word timings there is no safe way to assign a segment's
+        # authoritative text across silence-derived intervals. Keep it whole; RMS
+        # filtering still applies to the complete segment.
+        if not seg.words:
+            result.append(seg)
+            continue
         sf = max(0, min(int(seg.start * sample_rate), len(mic_samples)))
         ef = max(0, min(int(seg.end * sample_rate), len(mic_samples)))
 

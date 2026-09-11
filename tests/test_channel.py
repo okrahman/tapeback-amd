@@ -67,16 +67,24 @@ def test_stereo_channel_pipeline_flow(stereo_wav):
     assert identify_user_speaker(dsegs, wav) == "SPEAKER_00"
 
 
-def test_split_on_silence_without_words_splits_by_duration(stereo_wav):
-    """A wordless segment still splits on a real pause; sub-segments keep the text."""
+def test_split_on_silence_without_words_keeps_authoritative_text_whole(stereo_wav):
+    """A wordless segment is not duplicated across silence-derived intervals."""
     wav = stereo_wav([(1.5, 0.8, 0.0), (1.5, 0.0, 0.0), (1.5, 0.8, 0.0)])
     mic_raw, _monitor_raw, sr = load_stereo_channels(wav)
 
     seg = Segment(start=0.0, end=4.5, text="no word timings", words=None, speaker="You")
     result = split_on_silence([seg], mic_raw, sr, pause_threshold=1.0)
 
-    assert len(result) >= 2
-    assert all(s.text == "no word timings" for s in result)
+    assert result == [seg]
+
+
+def test_filter_silent_segments_without_words_uses_whole_segment_rms():
+    sr = 16000
+    samples = np.concatenate([np.full(sr, 1000, dtype=np.int16), np.zeros(sr, dtype=np.int16)])
+    seg = Segment(start=0.0, end=2.0, text="segment text", words=None)
+
+    assert filter_silent_segments([seg], samples, sr) == [seg]
+    assert filter_silent_segments([seg], np.zeros_like(samples), sr) == []
 
 
 def test_split_on_silence_segment_shorter_than_window_unchanged():

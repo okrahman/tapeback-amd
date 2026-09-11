@@ -11,6 +11,12 @@ from pathlib import Path
 from typing import TypedDict
 
 from tapeback import const
+from tapeback._fs import (
+    ensure_private_dir,
+    refuse_symlink_target,
+    require_fresh_regular_target,
+    write_private_text,
+)
 from tapeback.settings import Settings
 
 
@@ -169,6 +175,11 @@ class Recorder:
     def __init__(self, state_dir: Path | None = None) -> None:
         self._state_dir = state_dir or _DEFAULT_STATE_DIR
         self._session_file = self._state_dir / const.FILE_SESSION
+        # The session this process started, kept for an idempotent stop: in the
+        # two-process flow 'tapeback stop' deletes session.json from another
+        # process while the original 'tapeback start' process is still waiting
+        # on is_recording() — and that process still needs the recorded paths.
+        self._session_data: SessionData | None = None
 
     @property
     def session_file(self) -> Path:
@@ -196,12 +207,18 @@ class Recorder:
             validate_session_name(session_name)
 
         base_dir = Path(const.TEMP_DIR)
-        base_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        ensure_private_dir(base_dir)
         tmp_dir = base_dir / session_name
-        tmp_dir.mkdir(exist_ok=True, mode=0o700)
+        ensure_private_dir(tmp_dir)
 
         monitor_path = tmp_dir / const.FILE_MONITOR
         mic_path = tmp_dir / const.FILE_MIC
+        # The WAV paths are predictable, so refuse to let parecord write through
+        # a planted symlink, FIFO, or attacker-held regular file; inside a
+        # verified 0700 directory each output is re-created as a fresh 0600
+        # regular file only we could have made.
+        require_fresh_regular_target(monitor_path, "record the monitor channel")
+        require_fresh_regular_target(mic_path, "record the mic channel")
 
         base_cmd = [
             "parecord",
@@ -223,9 +240,9 @@ class Recorder:
             stderr=subprocess.PIPE,
         )
 
-        # Save session state
-        self._state_dir.mkdir(parents=True, exist_ok=True)
-        session_data = {
+        # Annotated: the literal is inferred as dict[str, int | str], which ty
+        # correctly rejects against the SessionData contract below.
+        session_data: SessionData = {
             "pid_monitor": monitor_proc.pid,
             "pid_mic": mic_proc.pid,
             "session_name": session_name,
@@ -233,7 +250,11 @@ class Recorder:
             "mic_path": str(mic_path),
             "started_at": datetime.datetime.now(datetime.UTC).isoformat(),
         }
-        self._session_file.write_text(json.dumps(session_data, indent=2))
+        # Save session state — private (0600 in a verified 0700 dir), atomic, and
+        # never through a planted symlink: it names the recording files.
+        refuse_symlink_target(self._session_file, "write the session state")
+        write_private_text(self._session_file, json.dumps(session_data, indent=2))
+        self._session_data = session_data
 
         return session_name
 
@@ -242,11 +263,22 @@ class Recorder:
 
         Returns paths to (monitor.wav, mic.wav).
         Removes session.json.
+
+        Idempotent for a session this Recorder started: in the documented
+        two-process flow, 'tapeback stop' stops parecord and deletes
+        session.json while the original 'tapeback start' process wakes up in
+        stop_and_process(). Raising there would abort live-worker teardown and
+        final processing for a normal stop, so the already-known paths are
+        returned instead. A Recorder that never started a session still raises.
         """
         if not self._session_file.exists():
+            if self._session_data is not None:
+                session = self._session_data
+                self._session_data = None
+                return Path(session["monitor_path"]), Path(session["mic_path"])
             raise RuntimeError("No recording in progress.")
 
-        session: SessionData = json.loads(self._session_file.read_text())
+        session = self._load_session_file()
         pids = [session["pid_monitor"], session["pid_mic"]]
 
         # Send SIGTERM to both
@@ -257,8 +289,19 @@ class Recorder:
         _wait_and_kill(pids)
 
         self._session_file.unlink()
+        self._session_data = None
 
         return Path(session["monitor_path"]), Path(session["mic_path"])
+
+    def _load_session_file(self) -> SessionData:
+        """Read session.json with the same symlink refusal the write path enforces.
+
+        The write side refuses a planted symlink before ever touching the path;
+        the read side must not follow one either. Refusal raises RuntimeError —
+        tampering with the state file must surface loudly, never be followed.
+        """
+        refuse_symlink_target(self._session_file, "read the session state")
+        return json.loads(self._session_file.read_text())
 
     def is_recording(self) -> bool:
         """Check if recording is active (session.json exists and processes are alive)."""
@@ -266,8 +309,12 @@ class Recorder:
             return False
 
         try:
-            session: SessionData = json.loads(self._session_file.read_text())
-        except (json.JSONDecodeError, KeyError):
+            session: SessionData = self._load_session_file()
+        except (json.JSONDecodeError, KeyError, OSError):
+            # Corrupt or unreadable-but-regular state is treated as "not
+            # recording" — a status check must stay usable. A planted symlink
+            # is refused loudly by _load_session_file instead of being caught
+            # here: OSError never sees it.
             return False
 
         for key in ("pid_monitor", "pid_mic"):
@@ -284,5 +331,5 @@ class Recorder:
         """Return session info dict if recording, else None."""
         if not self.is_recording():
             return None
-        data: SessionData = json.loads(self._session_file.read_text())
+        data: SessionData = self._load_session_file()
         return data

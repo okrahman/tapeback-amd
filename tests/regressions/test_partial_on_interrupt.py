@@ -1,10 +1,12 @@
 """Regression tests for keeping work when transcription is interrupted."""
 
+import wave
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
+from tapeback import _resume
 from tapeback.formatter import TranscriptMeta, format_markdown
 from tapeback.models import Segment
 from tapeback.transcriber import Transcriber
@@ -16,6 +18,14 @@ def _info(duration: float = 600.0):
     return info
 
 
+def _write_wav(path: Path, duration_s: float, rate: int = 16000) -> None:
+    with wave.open(str(path), "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(rate)
+        wf.writeframes(b"\x00\x00" * int(duration_s * rate))
+
+
 def _segment(start: float, end: float, text: str):
     seg = MagicMock()
     seg.start, seg.end, seg.text, seg.words = start, end, text, []
@@ -24,8 +34,8 @@ def _segment(start: float, end: float, text: str):
 
 @pytest.fixture
 def gpu_ready(monkeypatch):
-    monkeypatch.setattr("tapeback.transcriber.wait_for_clamp_release", lambda *_a, **_k: True)
-    monkeypatch.setattr("tapeback.transcriber.get_free_vram_mib", lambda: 4096)
+    monkeypatch.setattr("tapeback._fw_backend.wait_for_clamp_release", lambda *_a, **_k: True)
+    monkeypatch.setattr("tapeback._fw_backend.get_free_vram_mib", lambda: 4096)
 
 
 def _interrupting_segments(count_before_interrupt: int):
@@ -48,7 +58,7 @@ def test_interrupt_keeps_the_segments_already_decoded(settings, gpu_ready):
     """
     s = settings.model_copy(update={"device": "cuda"})
 
-    with patch("tapeback.transcriber.WhisperModel") as mock_model_cls:
+    with patch("tapeback._fw_backend.WhisperModel") as mock_model_cls:
         instance = mock_model_cls.return_value
         instance.transcribe.return_value = (_interrupting_segments(3), _info())
 
@@ -62,7 +72,7 @@ def test_interrupt_keeps_the_segments_already_decoded(settings, gpu_ready):
 def test_uninterrupted_run_is_not_marked_partial(settings, gpu_ready):
     s = settings.model_copy(update={"device": "cuda"})
 
-    with patch("tapeback.transcriber.WhisperModel") as mock_model_cls:
+    with patch("tapeback._fw_backend.WhisperModel") as mock_model_cls:
         instance = mock_model_cls.return_value
         instance.transcribe.return_value = (iter([_segment(0.0, 5.0, "готово")]), _info())
 
@@ -76,7 +86,7 @@ def test_interrupt_in_the_second_channel_keeps_the_first(settings, gpu_ready):
     """Monitor runs first; losing it because the mic was interrupted wastes the lot."""
     s = settings.model_copy(update={"device": "cuda"})
 
-    with patch("tapeback.transcriber.WhisperModel") as mock_model_cls:
+    with patch("tapeback._fw_backend.WhisperModel") as mock_model_cls:
         instance = mock_model_cls.return_value
         instance.transcribe.side_effect = [
             (iter([_segment(0.0, 5.0, "монитор")]), _info()),
@@ -96,7 +106,7 @@ def test_interrupt_in_the_first_channel_skips_the_second(settings, gpu_ready):
     """Ctrl+C means stop, so the remaining channel must not be started."""
     s = settings.model_copy(update={"device": "cuda"})
 
-    with patch("tapeback.transcriber.WhisperModel") as mock_model_cls:
+    with patch("tapeback._fw_backend.WhisperModel") as mock_model_cls:
         instance = mock_model_cls.return_value
         instance.transcribe.side_effect = [
             (_interrupting_segments(1), _info()),
@@ -111,6 +121,52 @@ def test_interrupt_in_the_first_channel_skips_the_second(settings, gpu_ready):
     assert mic == []
     assert info["partial"] is True
     assert instance.transcribe.call_count == 1
+
+
+def test_interrupt_in_second_channel_commits_monitor_resume_entry(settings, gpu_ready, tmp_path):
+    """A complete monitor must be cached even though the mic (second channel)
+    interrupted, so a re-run reuses it and only redoes the mic.
+
+    Regression: the all-or-none commit stored NEITHER channel when the mic was
+    partial, and the fallback stereo path repeated the rule — a re-run retranscribed
+    the whole monitor, contradicting _resume.py's contract.
+    """
+    s = settings.model_copy(update={"resume_cache_dir": tmp_path / "resume"})
+    mic_wav = tmp_path / "mic.wav"
+    monitor_wav = tmp_path / "monitor.wav"
+    _write_wav(mic_wav, 0.5)
+    _write_wav(monitor_wav, 0.5)
+
+    with patch("tapeback._fw_backend.WhisperModel") as mock_model_cls:
+        instance = mock_model_cls.return_value
+        instance.transcribe.side_effect = [
+            (iter([_segment(0.0, 5.0, "монитор")]), _info()),
+            (_interrupting_segments(2), _info()),
+        ]
+        first = Transcriber(s)
+        _mic, monitor, info = first.transcribe_stereo(mic_wav, monitor_wav)
+
+        assert len(monitor) == 1
+        assert info["partial"] is True
+
+        key = first._resume_key(
+            monitor_wav, "transcribe monitor", first._backend.cache_fingerprint()
+        )
+        assert key is not None
+        stored = _resume.load(key, tmp_path / "resume")
+        assert stored is not None
+        assert [seg.text for seg in stored[0]] == ["монитор"]
+
+        # A fresh run reuses the cached monitor and only redoes the mic.
+        instance.transcribe.side_effect = None
+        instance.transcribe.return_value = (iter([_segment(0.0, 5.0, "mic-again")]), _info())
+        second = Transcriber(s)
+        _mic2, monitor2, info2 = second.transcribe_stereo(mic_wav, monitor_wav)
+
+        assert [seg.text for seg in monitor2] == ["монитор"]
+        assert [seg.text for seg in _mic2] == ["mic-again"]
+        assert info2["partial"] is False
+        assert instance.transcribe.call_count == 3  # 2 (first run) + 1 (fresh mic only)
 
 
 def test_partial_transcript_is_marked_in_the_note():
@@ -155,7 +211,7 @@ def test_second_interrupt_still_propagates(settings, gpu_ready):
         yield _segment(0.0, 5.0, "one")
         raise KeyboardInterrupt
 
-    with patch("tapeback.transcriber.WhisperModel") as mock_model_cls:
+    with patch("tapeback._fw_backend.WhisperModel") as mock_model_cls:
         instance = mock_model_cls.return_value
         instance.transcribe.return_value = (_double_interrupt(), _info())
         transcriber = Transcriber(s)
@@ -164,7 +220,7 @@ def test_second_interrupt_still_propagates(settings, gpu_ready):
         # A later interrupt (e.g. during saving) is a fresh one and must not be eaten.
         instance.transcribe.return_value = (_double_interrupt(), _info())
         with (
-            patch.object(transcriber, "_collect_segments", side_effect=KeyboardInterrupt),
+            patch.object(transcriber._backend, "_collect_segments", side_effect=KeyboardInterrupt),
             pytest.raises(KeyboardInterrupt),
         ):
             transcriber.transcribe(Path("/fake/audio.wav"))

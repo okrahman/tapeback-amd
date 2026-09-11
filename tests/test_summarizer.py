@@ -5,10 +5,10 @@ from unittest.mock import MagicMock, patch
 import pytest
 from pydantic import SecretStr
 
+from tapeback import const
 from tapeback.models import ActionItem, Summary
 from tapeback.settings import DEFAULT_MODELS, Settings
 from tapeback.summarizer import (
-    _PROVIDER_ENV_VARS,
     _build_provider_chain,
     _call_llm,
     _get_model,
@@ -166,7 +166,7 @@ def test_api_key_resolution_tapeback_env(tmp_vault, monkeypatch):
     assert _resolve_api_key(settings) == "tapeback-key"
 
 
-@pytest.mark.parametrize("provider,env_var", list(_PROVIDER_ENV_VARS.items()))
+@pytest.mark.parametrize("provider,env_var", list(const.PROVIDER_ENV_VARS.items()))
 def test_api_key_resolution_provider_env(tmp_vault, monkeypatch, provider, env_var):
     """Falls back to provider-specific env var when TAPEBACK_LLM_API_KEY is empty."""
     monkeypatch.setenv(env_var, "test-key")

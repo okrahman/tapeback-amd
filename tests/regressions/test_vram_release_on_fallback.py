@@ -5,6 +5,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from tapeback._fw_backend import FasterWhisperBackend
 from tapeback.transcriber import Transcriber
 
 OOM = "CUDA failed with error out of memory"
@@ -18,8 +19,8 @@ def _info():
 
 @pytest.fixture
 def clear_gpu(monkeypatch):
-    monkeypatch.setattr("tapeback.transcriber.wait_for_clamp_release", lambda *_a, **_k: True)
-    monkeypatch.setattr("tapeback.transcriber.get_free_vram_mib", lambda: 4096)
+    monkeypatch.setattr("tapeback._fw_backend.wait_for_clamp_release", lambda *_a, **_k: True)
+    monkeypatch.setattr("tapeback._fw_backend.get_free_vram_mib", lambda: 4096)
 
 
 def test_low_free_vram_skips_cuda_entirely(settings, monkeypatch, capsys):
@@ -30,15 +31,15 @@ def test_low_free_vram_skips_cuda_entirely(settings, monkeypatch, capsys):
     CT2_CUDA_ALLOCATOR=cuda_malloc_async. Attempting a load that cannot fit therefore
     costs the whole card, so it must be refused up front.
     """
-    monkeypatch.setattr("tapeback.transcriber.get_free_vram_mib", lambda: 95)
+    monkeypatch.setattr("tapeback._fw_backend.get_free_vram_mib", lambda: 95)
     clamp_calls: list[object] = []
     monkeypatch.setattr(
-        "tapeback.transcriber.wait_for_clamp_release",
+        "tapeback._fw_backend.wait_for_clamp_release",
         lambda *a, **k: clamp_calls.append(a) or True,
     )
     s = settings.model_copy(update={"device": "cuda", "min_free_vram_mib": 1200})
 
-    with patch("tapeback.transcriber.WhisperModel") as mock_model_cls:
+    with patch("tapeback._fw_backend.WhisperModel") as mock_model_cls:
         transcriber = Transcriber(s)
 
     assert transcriber.describe() == "Whisper: large-v3-turbo on cpu/int8"
@@ -49,21 +50,21 @@ def test_low_free_vram_skips_cuda_entirely(settings, monkeypatch, capsys):
 
 
 def test_enough_free_vram_uses_cuda(settings, monkeypatch):
-    monkeypatch.setattr("tapeback.transcriber.get_free_vram_mib", lambda: 1200)
-    monkeypatch.setattr("tapeback.transcriber.wait_for_clamp_release", lambda *_a, **_k: True)
+    monkeypatch.setattr("tapeback._fw_backend.get_free_vram_mib", lambda: 1200)
+    monkeypatch.setattr("tapeback._fw_backend.wait_for_clamp_release", lambda *_a, **_k: True)
     s = settings.model_copy(update={"device": "cuda", "min_free_vram_mib": 1200})
 
-    with patch("tapeback.transcriber.WhisperModel"):
+    with patch("tapeback._fw_backend.WhisperModel"):
         assert Transcriber(s).describe() == "Whisper: large-v3-turbo on cuda/int8_float16"
 
 
 def test_unknown_free_vram_does_not_block_cuda(settings, monkeypatch):
     """No nvidia-smi means no answer — never refuse the GPU over a check we cannot run."""
-    monkeypatch.setattr("tapeback.transcriber.get_free_vram_mib", lambda: None)
-    monkeypatch.setattr("tapeback.transcriber.wait_for_clamp_release", lambda *_a, **_k: True)
+    monkeypatch.setattr("tapeback._fw_backend.get_free_vram_mib", lambda: None)
+    monkeypatch.setattr("tapeback._fw_backend.wait_for_clamp_release", lambda *_a, **_k: True)
     s = settings.model_copy(update={"device": "cuda"})
 
-    with patch("tapeback.transcriber.WhisperModel"):
+    with patch("tapeback._fw_backend.WhisperModel"):
         assert Transcriber(s).describe() == "Whisper: large-v3-turbo on cuda/int8_float16"
 
 
@@ -77,7 +78,7 @@ def test_vram_is_released_before_the_cpu_model_is_built_at_load(settings, clear_
     transcription failure degraded the whole run.
     """
     calls: list[str] = []
-    monkeypatch.setattr("tapeback.transcriber.free_gpu_memory", lambda: calls.append("free"))
+    monkeypatch.setattr("tapeback._fw_backend.free_gpu_memory", lambda: calls.append("free"))
 
     s = settings.model_copy(update={"device": "cuda", "thermal_clamp_wait": 60.0})
 
@@ -87,7 +88,7 @@ def test_vram_is_released_before_the_cpu_model_is_built_at_load(settings, clear_
             raise RuntimeError(OOM)
         return MagicMock()
 
-    with patch("tapeback.transcriber.WhisperModel", side_effect=_construct):
+    with patch("tapeback._fw_backend.WhisperModel", side_effect=_construct):
         transcriber = Transcriber(s)
 
     assert calls == ["build:cuda", "free", "build:cpu"], calls
@@ -99,7 +100,7 @@ def test_vram_is_released_before_the_cpu_model_is_built_at_inference(
 ):
     """Same ordering when the OOM happens while transcribing, not while loading."""
     calls: list[str] = []
-    monkeypatch.setattr("tapeback.transcriber.free_gpu_memory", lambda: calls.append("free"))
+    monkeypatch.setattr("tapeback._fw_backend.free_gpu_memory", lambda: calls.append("free"))
 
     s = settings.model_copy(update={"device": "cuda", "thermal_clamp_wait": 60.0})
 
@@ -112,7 +113,7 @@ def test_vram_is_released_before_the_cpu_model_is_built_at_inference(
         calls.append(f"build:{kwargs['device']}")
         return gpu_model if kwargs["device"] == "cuda" else cpu_model
 
-    with patch("tapeback.transcriber.WhisperModel", side_effect=_construct):
+    with patch("tapeback._fw_backend.WhisperModel", side_effect=_construct):
         transcriber = Transcriber(s)
         transcriber.transcribe(Path("/fake/audio.wav"))
 
@@ -130,14 +131,15 @@ def test_failed_gpu_model_is_not_referenced_after_fallback(settings, clear_gpu):
     cpu_model.transcribe.return_value = (iter([]), _info())
 
     with patch(
-        "tapeback.transcriber.WhisperModel",
+        "tapeback._fw_backend.WhisperModel",
         side_effect=lambda *_a, **k: gpu_model if k["device"] == "cuda" else cpu_model,
     ):
         transcriber = Transcriber(s)
         transcriber.transcribe(Path("/fake/audio.wav"))
 
-    assert transcriber._model is cpu_model
-    assert transcriber._model is not gpu_model
+    assert isinstance(transcriber._backend, FasterWhisperBackend)
+    assert transcriber._backend._model is cpu_model
+    assert transcriber._backend._model is not gpu_model
 
 
 def test_non_cuda_runtime_error_still_propagates(settings, clear_gpu):
@@ -145,7 +147,7 @@ def test_non_cuda_runtime_error_still_propagates(settings, clear_gpu):
     s = settings.model_copy(update={"device": "cuda", "thermal_clamp_wait": 60.0})
 
     with (
-        patch("tapeback.transcriber.WhisperModel", side_effect=RuntimeError("corrupt audio")),
+        patch("tapeback._fw_backend.WhisperModel", side_effect=RuntimeError("corrupt audio")),
         pytest.raises(RuntimeError, match="corrupt audio"),
     ):
         Transcriber(s)

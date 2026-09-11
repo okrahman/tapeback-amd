@@ -9,9 +9,9 @@ import pytest
 from click.testing import CliRunner
 from pydantic import SecretStr
 
+from tapeback import const
 from tapeback.recorder import Recorder
 from tapeback.settings import Settings
-from tapeback.summarizer import _PROVIDER_ENV_VARS
 
 
 def _pyannote_available() -> bool:
@@ -64,7 +64,7 @@ def isolate_settings_sources(monkeypatch):
     # every test a live provider chain, and one forgotten mock would bill the vendor.
     # Driven off the production mapping on purpose — a new provider must be isolated
     # the moment it is added, not the next time someone remembers this list.
-    for env_var in _PROVIDER_ENV_VARS.values():
+    for env_var in const.PROVIDER_ENV_VARS.values():
         monkeypatch.delenv(env_var, raising=False)
     # Same rule applied to the machine's thermal state: without this every test that
     # builds a Transcriber on "cuda" polls the real GPU and can sit in the clamp wait,
@@ -94,7 +94,7 @@ def vault_env(tmp_vault, monkeypatch):
 @pytest.fixture
 def settings(tmp_vault):
     """Settings with temporary vault."""
-    return Settings(vault_path=tmp_vault)
+    return Settings(vault_path=tmp_vault, transcription_backend="faster-whisper")
 
 
 @pytest.fixture
@@ -156,6 +156,7 @@ def e2e_settings(tmp_path):
     return Settings(
         vault_path=vault,
         hf_token=SecretStr(os.environ.get("TAPEBACK_HF_TOKEN", os.environ.get("HF_TOKEN", ""))),
+        transcription_backend="faster-whisper",
     )
 
 
@@ -359,7 +360,7 @@ def clear_all_provider_env_vars(monkeypatch) -> None:
     Redundant since isolate_settings_sources does the same for every test; kept because
     call sites read as an explicit statement of what the test depends on.
     """
-    for env_var in _PROVIDER_ENV_VARS.values():
+    for env_var in const.PROVIDER_ENV_VARS.values():
         monkeypatch.delenv(env_var, raising=False)
 
 

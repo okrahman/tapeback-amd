@@ -6,10 +6,12 @@ section: sound
 priority: optional
 maintainer: "Yast <yastcher@gmail.com>"
 description: |
-  Local meeting recorder with transcription and speaker diarization.
+  Meeting recorder with transcription and speaker diarization.
   CLI tool for recording meeting audio (Google Meet, Zoom, Teams, Telegram)
-  on Linux via PulseAudio/PipeWire system audio capture. Transcribes locally
-  with faster-whisper and saves markdown notes to an Obsidian vault.
+  on Linux via PulseAudio/PipeWire system audio capture. Transcribes through
+  a Lemonade Server by default (automatic fallback to local faster-whisper,
+  or opt out to keep transcription fully local) and saves markdown notes to
+  an Obsidian vault.
 homepage: https://github.com/yastcher/tapeback
 license: Apache-2.0
 

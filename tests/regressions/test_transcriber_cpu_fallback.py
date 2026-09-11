@@ -11,6 +11,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from tapeback._fw_backend import FasterWhisperBackend
 from tapeback.transcriber import Transcriber
 
 
@@ -24,7 +25,7 @@ def _whisper_info() -> MagicMock:
 
 def test_non_cuda_runtime_error_propagates_without_cpu_fallback(settings):
     cuda_settings = settings.model_copy(update={"device": "cuda"})
-    with patch("tapeback.transcriber.WhisperModel") as mock_model_cls:
+    with patch("tapeback._fw_backend.WhisperModel") as mock_model_cls:
         instance = mock_model_cls.return_value
         instance.transcribe.side_effect = RuntimeError("corrupt audio frame")
 
@@ -34,7 +35,8 @@ def test_non_cuda_runtime_error_propagates_without_cpu_fallback(settings):
 
         # No silent CPU retry — transcribe attempted exactly once, device unchanged.
         assert instance.transcribe.call_count == 1
-        assert transcriber._device == "cuda"
+        assert isinstance(transcriber._backend, FasterWhisperBackend)
+        assert transcriber._backend._device == "cuda"
 
 
 def test_cuda_oom_falls_back_to_cpu_and_retries(settings):
@@ -45,7 +47,7 @@ def test_cuda_oom_falls_back_to_cpu_and_retries(settings):
     good_seg.text = " hi "
     good_seg.words = []
 
-    with patch("tapeback.transcriber.WhisperModel") as mock_model_cls:
+    with patch("tapeback._fw_backend.WhisperModel") as mock_model_cls:
         instance = mock_model_cls.return_value
         instance.transcribe.side_effect = [
             RuntimeError("CUDA failed with error out of memory"),
@@ -56,7 +58,8 @@ def test_cuda_oom_falls_back_to_cpu_and_retries(settings):
         segments, _info = transcriber.transcribe(Path("/fake/audio.wav"))
 
         assert instance.transcribe.call_count == 2  # retried after CPU fallback
-        assert transcriber._device == "cpu"
+        assert isinstance(transcriber._backend, FasterWhisperBackend)
+        assert transcriber._backend._device == "cpu"
         assert segments[0].text == "hi"
 
 
@@ -70,7 +73,7 @@ def test_cuda_inference_error_message_is_surfaced(settings, capsys):
     good_seg = MagicMock()
     good_seg.start, good_seg.end, good_seg.text, good_seg.words = 0.0, 1.0, "ok", []
 
-    with patch("tapeback.transcriber.WhisperModel") as mock_model_cls:
+    with patch("tapeback._fw_backend.WhisperModel") as mock_model_cls:
         instance = mock_model_cls.return_value
         instance.transcribe.side_effect = [
             RuntimeError("CUDA failed with error out of memory"),

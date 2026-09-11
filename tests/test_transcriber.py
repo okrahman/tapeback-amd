@@ -8,7 +8,9 @@ from unittest.mock import MagicMock, patch
 import pytest
 from huggingface_hub.errors import LocalEntryNotFoundError
 
-from tapeback.transcriber import Transcriber, _resolve_compute_type
+from tapeback._fw_backend import FasterWhisperBackend, _resolve_compute_type
+from tapeback.models import Segment
+from tapeback.transcriber import Transcriber
 
 
 @pytest.mark.parametrize(
@@ -75,7 +77,7 @@ def test_transcribe_stereo_pipeline(settings):
     mock_info.language_probability = 0.99
     mock_info.duration = 5.0
 
-    with patch("tapeback.transcriber.WhisperModel") as mock_model_cls:
+    with patch("tapeback._fw_backend.WhisperModel") as mock_model_cls:
         instance = mock_model_cls.return_value
         # Monitor is transcribed FIRST so its detected language can be reused for the
         # gated mic channel — see tests/regressions/test_language_detection.py.
@@ -112,7 +114,7 @@ def test_transcribe_stereo_pipeline(settings):
 
 def test_load_model_prefers_local_cache(settings):
     """Model load tries the local cache first — no HuggingFace round-trip per start."""
-    with patch("tapeback.transcriber.WhisperModel") as mock_model_cls:
+    with patch("tapeback._fw_backend.WhisperModel") as mock_model_cls:
         Transcriber(settings)
 
     assert mock_model_cls.call_count == 1
@@ -122,14 +124,15 @@ def test_load_model_prefers_local_cache(settings):
 def test_load_model_downloads_when_not_cached(settings):
     """If the model isn't cached, fall back to a network download (local_files_only=False)."""
     instance = MagicMock()
-    with patch("tapeback.transcriber.WhisperModel") as mock_model_cls:
+    with patch("tapeback._fw_backend.WhisperModel") as mock_model_cls:
         mock_model_cls.side_effect = [LocalEntryNotFoundError("not cached"), instance]
         transcriber = Transcriber(settings)
 
     assert mock_model_cls.call_count == 2
     assert mock_model_cls.call_args_list[0].kwargs["local_files_only"] is True
     assert mock_model_cls.call_args_list[1].kwargs["local_files_only"] is False
-    assert transcriber._model is instance
+    assert isinstance(transcriber._backend, FasterWhisperBackend)
+    assert transcriber._backend._model is instance
 
 
 def test_transcribe_stereo_reports_per_channel_timings(settings):
@@ -145,7 +148,7 @@ def test_transcribe_stereo_reports_per_channel_timings(settings):
     mon_seg.start, mon_seg.end, mon_seg.text, mon_seg.words = 0.0, 2.0, "theirs", []
 
     messages: list[str] = []
-    with patch("tapeback.transcriber.WhisperModel") as mock_model_cls:
+    with patch("tapeback._fw_backend.WhisperModel") as mock_model_cls:
         instance = mock_model_cls.return_value
         instance.transcribe.side_effect = [
             (iter([mic_seg]), mock_info),
@@ -173,7 +176,7 @@ def test_transcribe_passes_language_and_hallucination_settings(settings):
     info = MagicMock()
     info.language, info.language_probability, info.duration = "en", 0.9, 1.0
 
-    with patch("tapeback.transcriber.WhisperModel") as mock_model_cls:
+    with patch("tapeback._fw_backend.WhisperModel") as mock_model_cls:
         instance = mock_model_cls.return_value
         instance.transcribe.return_value = (iter([]), info)
 
@@ -191,7 +194,7 @@ def test_transcribe_passes_beam_size_and_temperature(settings):
     info = MagicMock()
     info.language, info.language_probability, info.duration = "en", 0.9, 1.0
 
-    with patch("tapeback.transcriber.WhisperModel") as mock_model_cls:
+    with patch("tapeback._fw_backend.WhisperModel") as mock_model_cls:
         instance = mock_model_cls.return_value
         instance.transcribe.return_value = (iter([]), info)
 
@@ -209,8 +212,8 @@ def test_batched_inference_used_when_batch_size_positive(settings):
     info.language, info.language_probability, info.duration = "en", 0.9, 1.0
 
     with (
-        patch("tapeback.transcriber.WhisperModel") as mock_model_cls,
-        patch("tapeback.transcriber.BatchedInferencePipeline") as mock_batched_cls,
+        patch("tapeback._fw_backend.WhisperModel") as mock_model_cls,
+        patch("tapeback._fw_backend.BatchedInferencePipeline") as mock_batched_cls,
     ):
         batched = mock_batched_cls.return_value
         batched.transcribe.return_value = (iter([]), info)
@@ -227,7 +230,7 @@ def test_hotwords_reach_whisper_when_configured(settings):
     info = MagicMock()
     info.language, info.language_probability, info.duration = "ru", 0.9, 1.0
 
-    with patch("tapeback.transcriber.WhisperModel") as mock_model_cls:
+    with patch("tapeback._fw_backend.WhisperModel") as mock_model_cls:
         instance = mock_model_cls.return_value
         instance.transcribe.return_value = (iter([]), info)
 
@@ -249,7 +252,7 @@ def test_hotwords_omitted_when_empty(settings):
     info = MagicMock()
     info.language, info.language_probability, info.duration = "ru", 0.9, 1.0
 
-    with patch("tapeback.transcriber.WhisperModel") as mock_model_cls:
+    with patch("tapeback._fw_backend.WhisperModel") as mock_model_cls:
         instance = mock_model_cls.return_value
         instance.transcribe.return_value = (iter([]), info)
 
@@ -269,8 +272,8 @@ def test_batching_warns_which_settings_it_drops(settings, capsys):
         }
     )
     with (
-        patch("tapeback.transcriber.WhisperModel"),
-        patch("tapeback.transcriber.BatchedInferencePipeline"),
+        patch("tapeback._fw_backend.WhisperModel"),
+        patch("tapeback._fw_backend.BatchedInferencePipeline"),
     ):
         Transcriber(s)
 
@@ -286,7 +289,7 @@ def test_batching_warns_which_settings_it_drops(settings, capsys):
 
 def test_no_batching_warning_when_batching_is_off(settings, capsys):
     s = settings.model_copy(update={"device": "cpu", "batch_size": 0})
-    with patch("tapeback.transcriber.WhisperModel"):
+    with patch("tapeback._fw_backend.WhisperModel"):
         Transcriber(s)
 
     assert "TAPEBACK_BATCH_SIZE" not in capsys.readouterr().err
@@ -302,7 +305,7 @@ def test_describe_reports_resolved_device_and_compute_type(settings):
             "batch_size": 0,
         }
     )
-    with patch("tapeback.transcriber.WhisperModel"):
+    with patch("tapeback._fw_backend.WhisperModel"):
         description = Transcriber(s).describe()
 
     assert description == "Whisper: large-v3 on cpu/int8"
@@ -314,8 +317,8 @@ def test_describe_mentions_batch_size_when_batching_enabled(settings):
         update={"device": "cpu", "compute_type": "int8", "whisper_model": "tiny", "batch_size": 8}
     )
     with (
-        patch("tapeback.transcriber.WhisperModel"),
-        patch("tapeback.transcriber.BatchedInferencePipeline"),
+        patch("tapeback._fw_backend.WhisperModel"),
+        patch("tapeback._fw_backend.BatchedInferencePipeline"),
     ):
         description = Transcriber(s).describe()
 
@@ -328,7 +331,7 @@ def test_describe_reflects_cpu_fallback_after_cuda_failure(settings):
     info = MagicMock()
     info.language, info.language_probability, info.duration = "en", 0.9, 1.0
 
-    with patch("tapeback.transcriber.WhisperModel") as mock_model_cls:
+    with patch("tapeback._fw_backend.WhisperModel") as mock_model_cls:
         instance = mock_model_cls.return_value
         instance.transcribe.side_effect = [
             RuntimeError("CUDA failed with error out of memory"),
@@ -355,7 +358,7 @@ def test_transcribe_reports_progress_through_on_status(settings):
         segs.append(seg)
 
     messages: list[str] = []
-    with patch("tapeback.transcriber.WhisperModel") as mock_model_cls:
+    with patch("tapeback._fw_backend.WhisperModel") as mock_model_cls:
         instance = mock_model_cls.return_value
         instance.transcribe.return_value = (iter(segs), info)
         # min_interval defaults to 10s of wall clock; a fake clock makes every
@@ -380,7 +383,7 @@ def test_transcribe_progress_silent_by_default(settings):
     seg = MagicMock()
     seg.start, seg.end, seg.text, seg.words = 0.0, 60.0, "text", []
 
-    with patch("tapeback.transcriber.WhisperModel") as mock_model_cls:
+    with patch("tapeback._fw_backend.WhisperModel") as mock_model_cls:
         instance = mock_model_cls.return_value
         instance.transcribe.return_value = (iter([seg]), info)
         segments, _info = Transcriber(s).transcribe(Path("/fake/audio.wav"))
@@ -395,8 +398,8 @@ def test_plain_inference_when_batch_size_zero(settings):
     info.language, info.language_probability, info.duration = "en", 0.9, 1.0
 
     with (
-        patch("tapeback.transcriber.WhisperModel") as mock_model_cls,
-        patch("tapeback.transcriber.BatchedInferencePipeline") as mock_batched_cls,
+        patch("tapeback._fw_backend.WhisperModel") as mock_model_cls,
+        patch("tapeback._fw_backend.BatchedInferencePipeline") as mock_batched_cls,
     ):
         instance = mock_model_cls.return_value
         instance.transcribe.return_value = (iter([]), info)
@@ -405,3 +408,78 @@ def test_plain_inference_when_batch_size_zero(settings):
 
     instance.transcribe.assert_called_once()
     mock_batched_cls.assert_not_called()
+
+
+def test_assemble_stereo_preserves_monitor_metadata_on_silence(settings):
+    """When both channels contain silence, monitor_info metadata is preserved."""
+    transcriber = Transcriber(settings)
+    monitor_result = ([], {"duration": 10.0, "language": "fr", "language_probability": 0.95})
+    mic_result = ([], {"duration": 10.0, "language": "en", "language_probability": 0.5})
+
+    mic_segs, mon_segs, info = transcriber._assemble_stereo(
+        mic_result=mic_result,
+        monitor_result=monitor_result,
+        mic_skipped=False,
+    )
+    assert mic_segs == []
+    assert mon_segs == []
+    assert info["language"] == "fr"
+    assert info["duration"] == 10.0
+
+    # Also test when mic is skipped
+    _, _, info_skipped = transcriber._assemble_stereo(
+        mic_result=None,
+        monitor_result=monitor_result,
+        mic_skipped=True,
+    )
+    assert info_skipped["language"] == "fr"
+    assert info_skipped["duration"] == 10.0
+    assert info_skipped["partial"] is True
+
+
+def test_assemble_stereo_duration_is_the_longer_channel(tmp_vault):
+    """The combined stereo source lasts as long as the LONGER channel.
+
+    Regression: metadata came from the channel with more speech, and duration
+    was only repaired when absent — a channel with more speech but a shorter
+    recording left its shorter duration in the note metadata.
+    """
+    transcriber = Transcriber.__new__(Transcriber)
+    # Mic has the longer recording (90s) but no speech; monitor has the speech
+    # and a 60s recording, so monitor's info dict is selected for metadata.
+    mic_result = ([], {"duration": 90.0})
+    monitor_result = (
+        [Segment(start=0.0, end=5.0, text="speech")],
+        {"duration": 60.0, "language": "en"},
+    )
+
+    _mic_segs, _mon_segs, info = transcriber._assemble_stereo(
+        mic_result=mic_result,
+        monitor_result=monitor_result,
+        mic_skipped=False,
+    )
+
+    assert info["language"] == "en"
+    assert info["duration"] == 90.0
+
+
+def test_assemble_stereo_duration_is_the_longer_channel_monitor_speech(tmp_vault):
+    """Same rule in the inverse ordering: monitor wins speech, mic is longer."""
+    transcriber = Transcriber.__new__(Transcriber)
+    mic_result = (
+        [Segment(start=0.0, end=3.0, text="you")],
+        {"duration": 120.0},
+    )
+    monitor_result = (
+        [Segment(start=0.0, end=10.0, text="them")],
+        {"duration": 60.0, "language": "fr"},
+    )
+
+    _mic_segs, _mon_segs, info = transcriber._assemble_stereo(
+        mic_result=mic_result,
+        monitor_result=monitor_result,
+        mic_skipped=False,
+    )
+
+    assert info["language"] == "fr"
+    assert info["duration"] == 120.0

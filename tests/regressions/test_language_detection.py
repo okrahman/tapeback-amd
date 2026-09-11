@@ -30,7 +30,7 @@ def test_monitor_language_is_reused_for_the_mic_channel(settings):
     """
     s = settings.model_copy(update={"device": "cpu", "language": "auto"})
 
-    with patch("tapeback.transcriber.WhisperModel") as mock_model_cls:
+    with patch("tapeback._fw_backend.WhisperModel") as mock_model_cls:
         instance = mock_model_cls.return_value
         instance.transcribe.side_effect = [
             # Monitor: plenty of speech, confident Russian.
@@ -57,7 +57,7 @@ def test_explicit_language_is_still_honoured_for_both_channels(settings):
     """A configured language must not be overridden by detection."""
     s = settings.model_copy(update={"device": "cpu", "language": "de"})
 
-    with patch("tapeback.transcriber.WhisperModel") as mock_model_cls:
+    with patch("tapeback._fw_backend.WhisperModel") as mock_model_cls:
         instance = mock_model_cls.return_value
         instance.transcribe.side_effect = [
             (iter([_segment(0.0, 5.0, "text")]), _info("de", 0.9)),
@@ -75,7 +75,7 @@ def test_mic_still_transcribed_when_monitor_detects_nothing(settings):
     """An empty monitor channel must not pin the mic to a bogus language."""
     s = settings.model_copy(update={"device": "cpu", "language": "auto"})
 
-    with patch("tapeback.transcriber.WhisperModel") as mock_model_cls:
+    with patch("tapeback._fw_backend.WhisperModel") as mock_model_cls:
         instance = mock_model_cls.return_value
         instance.transcribe.side_effect = [
             (iter([]), _info("", 0.0)),
@@ -91,3 +91,29 @@ def test_mic_still_transcribed_when_monitor_detects_nothing(settings):
     # Nothing detected on the monitor -> the mic falls back to detecting for itself.
     assert calls[1].kwargs["language"] is None
     assert len(mic) == 1
+
+
+def test_empty_configured_language_is_treated_as_unset(settings):
+    """TAPEBACK_LANGUAGE="" must behave exactly like "auto" on every backend.
+
+    Bug: _fw_backend pinned language="" (configured != "auto" is true for ""),
+    while the facade's resume-identity normalization and the Lemonade backend
+    both treat "" as falsy/unset — so a "" run decoded with a pinned empty
+    string on faster-whisper but could be stored and served under a lang=auto
+    identity, and the two backends disagreed with each other.
+    """
+    s = settings.model_copy(update={"device": "cpu", "language": ""})
+
+    with patch("tapeback._fw_backend.WhisperModel") as mock_model_cls:
+        instance = mock_model_cls.return_value
+        instance.transcribe.return_value = (
+            iter([_segment(0.0, 5.0, "text")]),
+            _info("en", 0.9),
+        )
+
+        Transcriber(s).transcribe(Path("/fake/audio.wav"))
+
+        kwargs = instance.transcribe.call_args.kwargs
+
+    # Detection enabled — identical to what the Lemonade backend does with "".
+    assert kwargs["language"] is None
